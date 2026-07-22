@@ -40,6 +40,17 @@ def fetch_investor_flow(code: str, days: int = 20):
     todate = today.strftime("%Y%m%d")
 
     df = stock.get_market_trading_value_by_date(fromdate, todate, code, detail=True)
+
+    # 디버그용: Render 대시보드 Logs 탭에서 이 출력을 확인할 수 있음
+    print(f"[investor_flow] code={code} fromdate={fromdate} todate={todate} rows={len(df)}")
+    print(f"[investor_flow] columns={list(df.columns)}")
+
+    if df.empty:
+        raise ValueError(
+            f"KRX에서 {code} 데이터를 가져오지 못했습니다 (조회기간 {fromdate}~{todate}, 응답 0행). "
+            "종목코드가 맞는지, 최근 상장/거래정지 종목은 아닌지 확인해주세요."
+        )
+
     df = df.tail(days)  # 최근 N 영업일만
 
     rows = []
@@ -52,11 +63,15 @@ def fetch_investor_flow(code: str, days: int = 20):
             + row.get("은행", 0)
             + row.get("기타금융", 0)
         )
+        # pykrx 버전에 따라 '외국인' 또는 '외국인합계'로 컬럼명이 다를 수 있어 둘 다 시도
+        foreign = row.get("외국인", None)
+        if foreign is None:
+            foreign = row.get("외국인합계", 0)
         rows.append(
             {
                 "stock_code": code,
                 "trade_date": date_idx.strftime("%Y-%m-%d"),
-                "foreign_net": float(row.get("외국인", 0)),
+                "foreign_net": float(foreign),
                 "institution_net": float(institution),
                 "individual_net": float(row.get("개인", 0)),
                 "pension_net": float(row.get("연기금등", 0)),
