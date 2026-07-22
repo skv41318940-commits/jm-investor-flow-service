@@ -74,7 +74,7 @@ def fetch_investor_flow(code: str, days: int = 20):
                 "foreign_net": float(foreign),
                 "institution_net": float(institution),
                 "individual_net": float(row.get("개인", 0)),
-                "pension_net": float(row.get("연기금등", 0)),
+                "pension_net": float(row.get("연기금", 0)),
             }
         )
     return rows
@@ -91,6 +91,114 @@ def sync_investor_flow_endpoint(code: str):
         rows = fetch_investor_flow(code)
         supabase.table("stock_investor_flow").upsert(rows).execute()
         return {"ok": True, "synced": len(rows)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _latest_trading_day() -> str:
+    """오늘이 주말/공휴일이라 데이터가 없을 수 있어서, 최근 영업일을 찾아 반환 (YYYYMMDD)"""
+    from datetime import date as _date
+
+    d = datetime.now()
+    for _ in range(10):
+        ymd = d.strftime("%Y%m%d")
+        # 코스피 지수 하나로 그날 데이터가 있는지 간단히 확인
+        test = stock.get_index_ohlcv_by_date(ymd, ymd, "1001")
+        if not test.empty:
+            return ymd
+        d -= timedelta(days=1)
+    raise ValueError("최근 10일 내 KRX 영업일을 찾지 못했습니다")
+
+
+def fetch_volume_top30(limit: int = 30):
+    ymd = _latest_trading_day()
+
+    df = stock.get_market_ohlcv_by_ticker(ymd, market="ALL")
+    print(f"[volume_top30] date={ymd} rows={len(df)} columns={list(df.columns)}")
+
+    if df.empty:
+        raise ValueError(f"KRX에서 {ymd} 시세 데이터를 가져오지 못했습니다.")
+
+    df = df.sort_values("거래대금", ascending=False).head(limit)
+
+    rows = []
+    for i, (code, row) in enumerate(df.iterrows(), start=1):
+        try:
+            name = stock.get_market_ticker_name(code)
+        except Exception:
+            name = code
+        rows.append(
+            {
+                "rank": i,
+                "code": code,
+                "name": name,
+                "price": int(row.get("종가", 0)),
+                "change_pct": float(row.get("등락률", 0)),
+                # pykrx 거래대금은 '원' 단위로 나옴 → 억원으로 변환
+                "trading_value": round(float(row.get("거래대금", 0)) / 1e8, 1),
+            }
+        )
+    return rows
+
+
+def fetch_sector_volume(limit: int = 30):
+    ymd = _latest_trading_day()
+
+    all_rows = []
+    for market in ("KOSPI", "KOSDAQ"):
+        tickers = stock.get_index_ticker_list(ymd, market=market)
+        for ticker in tickers:
+            try:
+                name = stock.get_index_ticker_name(ticker)
+                ohlcv = stock.get_index_ohlcv_by_date(ymd, ymd, ticker)
+                if ohlcv.empty:
+                    continue
+                trading_value = float(ohlcv.iloc[0].get("거래대금", 0))
+                all_rows.append({"sector_name": name, "trading_value": trading_value})
+            except Exception as e:
+                print(f"[sector_volume] {market} {ticker} 스킵: {e}")
+                continue
+
+    print(f"[sector_volume] date={ymd} 업종 수={len(all_rows)}")
+
+    if not all_rows:
+        raise ValueError(f"KRX에서 {ymd} 업종별 거래대금 데이터를 가져오지 못했습니다.")
+
+    all_rows.sort(key=lambda r: r["trading_value"], reverse=True)
+    top = all_rows[:limit]
+
+    rows = []
+    for i, r in enumerate(top, start=1):
+        rows.append(
+            {
+                "rank": i,
+                "sector_name": r["sector_name"],
+                # 억원으로 변환
+                "trading_value": round(r["trading_value"] / 1e8, 1),
+            }
+        )
+    return rows
+
+
+@app.get("/api/sync-market-volume")
+def sync_market_volume_endpoint():
+    """
+    거래대금 TOP30 + 섹터별 거래대금 순위를 KRX에서 새로 가져와
+    기존 volume_top30 / sector_volume 테이블을 통째로 갱신합니다.
+    (VolumeTop30Table.tsx가 읽는 테이블과 스키마 그대로 맞춤 — 프론트엔드 수정 불필요)
+    """
+    try:
+        volume_rows = fetch_volume_top30()
+        sector_rows = fetch_sector_volume()
+
+        # 순위 기반 테이블이라, 통째로 지우고 새로 넣는 방식이 어제 순위가 남는 문제를 방지함
+        supabase.table("volume_top30").delete().neq("rank", -1).execute()
+        supabase.table("volume_top30").insert(volume_rows).execute()
+
+        supabase.table("sector_volume").delete().neq("rank", -1).execute()
+        supabase.table("sector_volume").insert(sector_rows).execute()
+
+        return {"ok": True, "volume_synced": len(volume_rows), "sector_synced": len(sector_rows)}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
