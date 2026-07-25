@@ -203,6 +203,52 @@ def sync_market_volume_endpoint():
         return {"ok": False, "error": str(e)}
 
 
+INST_TYPE_COLUMNS = ["금융투자", "보험", "투신", "사모", "은행", "기타금융", "연기금", "기타법인"]
+
+
+def fetch_institution_type_flow(code: str, days: int = 60):
+    today = datetime.now()
+    fromdate = (today - timedelta(days=days * 2)).strftime("%Y%m%d")  # 주말 감안 여유있게
+    todate = today.strftime("%Y%m%d")
+
+    df = stock.get_market_trading_value_by_date(fromdate, todate, code, detail=True)
+    print(f"[institution_type_flow] code={code} rows={len(df)} columns={list(df.columns)}")
+
+    if df.empty:
+        raise ValueError(f"KRX에서 {code} 데이터를 가져오지 못했습니다 (조회기간 {fromdate}~{todate}).")
+
+    df = df.tail(days)
+
+    rows = []
+    for date_idx, row in df.iterrows():
+        trade_date = date_idx.strftime("%Y-%m-%d")
+        for inst_type in INST_TYPE_COLUMNS:
+            rows.append(
+                {
+                    "stock_code": code,
+                    "trade_date": trade_date,
+                    "inst_type": inst_type,
+                    "amount": float(row.get(inst_type, 0)),
+                }
+            )
+    return rows
+
+
+@app.get("/api/sync-institution-type")
+def sync_institution_type_endpoint(code: str):
+    """
+    통합수급현황 탭에서 종목 검색 시 호출 — 기관 유형별(은행/보험/투신/연기금 등)
+    최근 60영업일 순매수를 institution_type_flow 테이블에 저장합니다.
+    (외국계 창구별 데이터는 pykrx로 얻을 수 없어 이 엔드포인트에 포함되지 않음)
+    """
+    try:
+        rows = fetch_institution_type_flow(code)
+        supabase.table("institution_type_flow").upsert(rows).execute()
+        return {"ok": True, "synced": len(rows)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/ping")
 def ping():
     return {"ok": True}
