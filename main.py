@@ -104,6 +104,85 @@ def kis_member_debug(code: str):
         return {"ok": False, "error": str(e)}
 
 
+def fetch_broker_flow(code: str):
+    """
+    KIS '주식현재가 회원사'(FHKST01010600)에서 매도/매수 상위 5개 회원사(증권사 창구)를 파싱.
+    같은 증권사가 매도/매수 양쪽에 다 나올 수 있는 구조라서, 순매수 하나로 합치지 않고
+    '매도 상위' / '매수 상위'를 각각 그대로 저장함.
+    """
+    data = kis_get(
+        "/uapi/domestic-stock/v1/quotations/inquire-member",
+        tr_id="FHKST01010600",
+        params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code},
+    )
+    if data.get("rt_cd") != "0":
+        raise ValueError(f"KIS API 오류: {data.get('msg1', '알 수 없는 오류')}")
+
+    output = data.get("output")
+    if not output:
+        raise ValueError("KIS 응답에 output이 없습니다.")
+    row = output[0] if isinstance(output, list) else output
+
+    # KIS 회원사 데이터엔 금액이 없어서, 현재가(종가)를 곱해 추정 거래금액을 계산 (근사치)
+    price = None
+    try:
+        ymd = _latest_trading_day()
+        ohlcv = stock.get_market_ohlcv_by_date(ymd, ymd, code)
+        if not ohlcv.empty:
+            price = float(ohlcv.iloc[-1].get("종가", 0)) or None
+    except Exception as e:
+        print(f"[fetch_broker_flow] 현재가 조회 실패, est_amount 없이 진행: {e}")
+
+    trade_date = datetime.now().strftime("%Y-%m-%d")
+    rows = []
+    for i in range(1, 6):
+        sell_qty = float(row.get(f"total_seln_qty{i}", 0) or 0)
+        rows.append(
+            {
+                "stock_code": code,
+                "trade_date": trade_date,
+                "side": "sell",
+                "rank": i,
+                "broker_name": row.get(f"seln_mbcr_name{i}", ""),
+                "qty": sell_qty,
+                "pct": float(row.get(f"seln_mbcr_rlim{i}", 0) or 0),
+                "is_foreign": row.get(f"seln_mbcr_glob_yn_{i}") == "Y",
+                "est_amount": round(sell_qty * price / 1e8, 2) if price else None,  # 억원
+            }
+        )
+        buy_qty = float(row.get(f"total_shnu_qty{i}", 0) or 0)
+        rows.append(
+            {
+                "stock_code": code,
+                "trade_date": trade_date,
+                "side": "buy",
+                "rank": i,
+                "broker_name": row.get(f"shnu_mbcr_name{i}", ""),
+                "qty": buy_qty,
+                "pct": float(row.get(f"shnu_mbcr_rlim{i}", 0) or 0),
+                "is_foreign": row.get(f"shnu_mbcr_glob_yn_{i}") == "Y",
+                "est_amount": round(buy_qty * price / 1e8, 2) if price else None,  # 억원
+            }
+        )
+    return rows
+
+
+@app.get("/api/sync-broker-flow")
+def sync_broker_flow_endpoint(code: str):
+    """
+    통합수급현황 탭에서 종목 검색 시 호출 — 오늘자 회원사별(증권사 창구) 매도/매수
+    상위 5개사를 broker_daily_flow 테이블에 저장. (한국투자증권 API 사용, 실데이터)
+    """
+    if not KIS_APP_KEY or not KIS_APP_SECRET:
+        return {"ok": False, "error": "KIS_APP_KEY / KIS_APP_SECRET 환경변수가 설정되어 있지 않습니다."}
+    try:
+        rows = fetch_broker_flow(code)
+        supabase.table("broker_daily_flow").upsert(rows).execute()
+        return {"ok": True, "synced": len(rows)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def fetch_investor_flow(code: str, days: int = 20):
     today = datetime.now()
     fromdate = (today - timedelta(days=days * 2)).strftime("%Y%m%d")  # 주말 감안 여유있게
@@ -141,10 +220,11 @@ def fetch_investor_flow(code: str, days: int = 20):
             {
                 "stock_code": code,
                 "trade_date": date_idx.strftime("%Y-%m-%d"),
-                "foreign_net": float(foreign),
-                "institution_net": float(institution),
-                "individual_net": float(row.get("개인", 0)),
-                "pension_net": float(row.get("연기금", 0)),
+                # pykrx 거래대금은 '원' 단위 → 억원으로 변환 (1억 = 1e8)
+                "foreign_net": round(float(foreign) / 1e8, 2),
+                "institution_net": round(float(institution) / 1e8, 2),
+                "individual_net": round(float(row.get("개인", 0)) / 1e8, 2),
+                "pension_net": round(float(row.get("연기금", 0)) / 1e8, 2),
             }
         )
     return rows
@@ -298,7 +378,7 @@ def fetch_institution_type_flow(code: str, days: int = 60):
                     "stock_code": code,
                     "trade_date": trade_date,
                     "inst_type": inst_type,
-                    "amount": float(row.get(inst_type, 0)),
+                    "amount": round(float(row.get(inst_type, 0)) / 1e8, 2),  # 원 → 억원
                 }
             )
     return rows
