@@ -2,4 +2,5 @@ fastapi
 uvicorn
 pykrx
 supabase
+requests
 

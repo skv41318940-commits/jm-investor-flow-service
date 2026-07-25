@@ -12,8 +12,10 @@ pykrx는 키움 OpenAPI와 무관하게 KRX 공식 데이터를 인터넷으로 
 배포 방법: 이 폴더 아래 README_배포방법.md 참고 (Render 무료 티어 기준)
 """
 import os
+import time
 from datetime import datetime, timedelta
 
+import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pykrx import stock
@@ -22,6 +24,13 @@ from supabase import create_client
 # ── 환경변수로 받음 (Render 대시보드에서 설정) ──
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]  # RLS 우회해서 쓰기 위해 service role 사용
+
+# ── 한국투자증권(KIS) API — 회원사별/프로그램매매 등 pykrx엔 없는 데이터용 ──
+KIS_APP_KEY = os.environ.get("KIS_APP_KEY")
+KIS_APP_SECRET = os.environ.get("KIS_APP_SECRET")
+KIS_CANO = os.environ.get("KIS_CANO")
+KIS_ACNT_PRDT_CD = os.environ.get("KIS_ACNT_PRDT_CD", "01")
+KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
 
 app = FastAPI(title="JM Investor Flow Cloud Service")
 app.add_middleware(
@@ -32,6 +41,67 @@ app.add_middleware(
 )
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ── KIS 접근 토큰 캐시 (하루 1회 발급이 원칙이라 메모리에 캐싱해서 재사용) ──
+_kis_token_cache = {"token": None, "expires_at": 0}
+
+
+def get_kis_token() -> str:
+    now = time.time()
+    if _kis_token_cache["token"] and now < _kis_token_cache["expires_at"] - 300:
+        return _kis_token_cache["token"]
+
+    res = requests.post(
+        f"{KIS_BASE_URL}/oauth2/tokenP",
+        json={
+            "grant_type": "client_credentials",
+            "appkey": KIS_APP_KEY,
+            "appsecret": KIS_APP_SECRET,
+        },
+        timeout=10,
+    )
+    res.raise_for_status()
+    data = res.json()
+    token = data["access_token"]
+    expires_in = int(data.get("expires_in", 86400))
+    _kis_token_cache["token"] = token
+    _kis_token_cache["expires_at"] = now + expires_in
+    return token
+
+
+def kis_get(path: str, tr_id: str, params: dict) -> dict:
+    token = get_kis_token()
+    headers = {
+        "content-type": "application/json; charset=utf-8",
+        "authorization": f"Bearer {token}",
+        "appkey": KIS_APP_KEY,
+        "appsecret": KIS_APP_SECRET,
+        "tr_id": tr_id,
+        "custtype": "P",
+    }
+    res = requests.get(f"{KIS_BASE_URL}{path}", headers=headers, params=params, timeout=10)
+    res.raise_for_status()
+    return res.json()
+
+
+@app.get("/api/kis-member-debug")
+def kis_member_debug(code: str):
+    """
+    디버그 전용: '주식현재가 회원사'(회원사별 매매동향) 원본 응답을 그대로 반환.
+    정확한 필드명을 실제로 확인한 뒤 정식 파싱 엔드포인트를 만들기 위한 용도.
+    """
+    if not KIS_APP_KEY or not KIS_APP_SECRET:
+        return {"ok": False, "error": "KIS_APP_KEY / KIS_APP_SECRET 환경변수가 설정되어 있지 않습니다."}
+    try:
+        data = kis_get(
+            "/uapi/domestic-stock/v1/quotations/inquire-member",
+            tr_id="FHKST01010600",
+            params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code},
+        )
+        print(f"[kis_member_debug] code={code} raw={data}")
+        return {"ok": True, "raw": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 def fetch_investor_flow(code: str, days: int = 20):
