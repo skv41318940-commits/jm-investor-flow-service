@@ -84,6 +84,26 @@ def kis_get(path: str, tr_id: str, params: dict) -> dict:
     return res.json()
 
 
+@app.get("/api/kis-program-debug")
+def kis_program_debug(code: str):
+    """
+    디버그 전용: '프로그램매매 종합현황(시간)' 원본 응답을 그대로 반환.
+    정확한 필드명을 실제로 확인한 뒤 정식 파싱 엔드포인트를 만들기 위한 용도.
+    """
+    if not KIS_APP_KEY or not KIS_APP_SECRET:
+        return {"ok": False, "error": "KIS_APP_KEY / KIS_APP_SECRET 환경변수가 설정되어 있지 않습니다."}
+    try:
+        data = kis_get(
+            "/uapi/domestic-stock/v1/quotations/comp-program-trade-today",
+            tr_id="FHPPG04600101",
+            params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code},
+        )
+        print(f"[kis_program_debug] code={code} raw={data}")
+        return {"ok": True, "raw": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/kis-member-debug")
 def kis_member_debug(code: str):
     """
