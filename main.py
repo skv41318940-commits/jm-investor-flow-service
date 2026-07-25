@@ -353,7 +353,7 @@ def sync_market_volume_endpoint():
         return {"ok": False, "error": str(e)}
 
 
-INST_TYPE_COLUMNS = ["금융투자", "보험", "투신", "사모", "은행", "기타금융", "연기금", "기타법인", "외국인", "기타외국인"]
+INST_TYPE_COLUMNS = ["금융투자", "보험", "투신", "사모", "은행", "기타금융", "연기금", "기타법인", "외국인", "기타외국인", "개인"]
 
 
 def fetch_institution_type_flow(code: str, days: int = 60):
