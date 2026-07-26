@@ -32,6 +32,9 @@ KIS_CANO = os.environ.get("KIS_CANO")
 KIS_ACNT_PRDT_CD = os.environ.get("KIS_ACNT_PRDT_CD", "01")
 KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
 
+# ── FRED (미국 연방준비제도 공식 경제데이터) — 美 국채금리 등 ──
+FRED_API_KEY = os.environ.get("FRED_API_KEY")
+
 app = FastAPI(title="JM Investor Flow Cloud Service")
 app.add_middleware(
     CORSMiddleware,
@@ -311,7 +314,7 @@ def fetch_daily_chart(code: str, start: str, end: str):
     return rows, data.get("output1", {})
 
 
-def fetch_minute_chart(code: str):
+def fetch_minute_chart(code: str, market: str = "J"):
     from datetime import datetime as _dt
 
     now_str = _dt.now().strftime("%H%M%S")
@@ -320,7 +323,7 @@ def fetch_minute_chart(code: str):
         tr_id="FHKST03010200",
         params={
             "FID_ETC_CLS_CODE": "",
-            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_COND_MRKT_DIV_CODE": market,  # J:KRX 정규장, NX:NXT, UN:통합
             "FID_INPUT_ISCD": code,
             "FID_INPUT_HOUR_1": now_str,
             "FID_PW_DATA_INCU_YN": "Y",
@@ -331,7 +334,7 @@ def fetch_minute_chart(code: str):
 
     output2 = data.get("output2", [])
     if not output2:
-        raise ValueError(f"{code}에 대한 분봉 데이터가 없습니다.")
+        raise ValueError(f"{code}에 대한 분봉 데이터가 없습니다. (market={market})")
 
     rows = [
         {
@@ -347,17 +350,32 @@ def fetch_minute_chart(code: str):
 
 
 @app.get("/api/query-avg-fallback")
-def query_avg_fallback_endpoint(code: str, start: str = "", end: str = "", mode: str = "daily"):
+def query_avg_fallback_endpoint(
+    code: str,
+    start: str = "",
+    end: str = "",
+    mode: str = "daily",
+    market: str = "J",
+    time_start: str = "",
+    time_end: str = "",
+):
     """
     Control/종목분석 페이지에서 PC(ngrok)가 응답 없을 때 자동으로 넘어오는 폴백 엔드포인트.
     실제 매수/매도 체결 분류가 아니라 "양봉/음봉 기반 추정"이라 세력평단은 근사치예요.
     mode="minute"이면 당일 분봉 기준 (start/end 무시, 항상 오늘/현재시각 기준).
+    market="J"(KRX 정규장, 기본값) / "NX"(NXT) — mode="minute"일 때만 의미 있음.
+    time_start/time_end: "HH:MM" 형식, 지정하면 그 구간 캔들만으로 누적평단 계산
+    (장기/단기 구간, NXT 프리마켓/애프터마켓 구분 등에 사용).
     """
     if not KIS_APP_KEY or not KIS_APP_SECRET:
         return {"error": "KIS_APP_KEY / KIS_APP_SECRET 환경변수가 설정되어 있지 않습니다."}
     try:
         if mode == "minute":
-            rows, meta = fetch_minute_chart(code)
+            rows, meta = fetch_minute_chart(code, market)
+            if time_start:
+                rows = [r for r in rows if r["date"] >= time_start]
+            if time_end:
+                rows = [r for r in rows if r["date"] <= time_end]
         else:
             rows, meta = fetch_daily_chart(code, start, end)
         candles = estimate_force_avg(rows)
@@ -543,6 +561,42 @@ def kis_shortsale_debug(code: str, start: str = "", end: str = ""):
         return {"ok": True, "raw": data}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/fred-rate")
+def fred_rate_endpoint(series_id: str = "DGS2"):
+    """
+    FRED(미국 연방준비제도 공식 데이터) — 국채금리 등. 하루 단위 갱신 데이터라
+    자주 폴링해도 부담 없음. series_id 예: DGS2(2년물), DGS10(10년물)
+    """
+    if not FRED_API_KEY:
+        return {"error": "FRED_API_KEY 환경변수가 설정되어 있지 않습니다."}
+    try:
+        res = requests.get(
+            "https://api.stlouisfed.org/fred/series/observations",
+            params={
+                "series_id": series_id,
+                "api_key": FRED_API_KEY,
+                "file_type": "json",
+                "sort_order": "desc",
+                "limit": 10,
+            },
+            timeout=10,
+        )
+        res.raise_for_status()
+        data = res.json()
+        obs = [o for o in data.get("observations", []) if o.get("value") not in (".", None)]
+        if not obs:
+            return {"error": f"{series_id}에 대한 관측치가 없습니다."}
+
+        latest = float(obs[0]["value"])
+        prev = float(obs[1]["value"]) if len(obs) > 1 else latest
+        change = round(latest - prev, 4)
+        change_pct = round((change / prev) * 100, 2) if prev else 0
+
+        return {"price": latest, "change": change, "change_pct": change_pct, "date": obs[0]["date"]}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @app.get("/api/kis-rate")
