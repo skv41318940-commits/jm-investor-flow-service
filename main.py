@@ -109,6 +109,61 @@ def kis_program_debug(code: str):
         return {"ok": False, "error": str(e)}
 
 
+def fetch_program_trade_daily(code: str):
+    """
+    KIS '종목별 프로그램매매추이(일별)' — 최근 영업일들의 프로그램매매 순매수 추이.
+    PC/키움과 무관하게 클라우드에서 바로 조회 가능 (opt10060 삽질은 폐기).
+    """
+    from datetime import datetime as _dt
+
+    today_str = _dt.now().strftime("%Y%m%d")
+    data = kis_get(
+        "/uapi/domestic-stock/v1/quotations/program-trade-by-stock-daily",
+        tr_id="FHPPG04650201",
+        params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code, "FID_INPUT_DATE_1": today_str},
+    )
+    if data.get("rt_cd") != "0":
+        raise ValueError(f"KIS API 오류: {data.get('msg1', '알 수 없는 오류')}")
+
+    output = data.get("output", [])
+    if not output:
+        raise ValueError(f"{code}에 대한 프로그램매매 데이터가 없습니다.")
+
+    rows = []
+    for r in output:
+        date = r.get("stck_bsop_date", "")
+        if len(date) != 8:
+            continue
+        rows.append(
+            {
+                "stock_code": code,
+                "trade_date": f"{date[:4]}-{date[4:6]}-{date[6:8]}",
+                # 전부 원 단위로 옴 → 억원으로 변환
+                "buy_amt": round(float(r.get("whol_smtn_shnu_tr_pbmn", 0)) / 1e8, 2),
+                "sell_amt": round(float(r.get("whol_smtn_seln_tr_pbmn", 0)) / 1e8, 2),
+                "net_amt": round(float(r.get("whol_smtn_ntby_tr_pbmn", 0)) / 1e8, 2),
+                "net_chg": round(float(r.get("whol_ntby_tr_pbmn_icdc2", 0)) / 1e8, 2),
+            }
+        )
+    return rows
+
+
+@app.get("/api/sync-program-trade-daily")
+def sync_program_trade_daily_endpoint(code: str):
+    """
+    종목분석 페이지에서 프로그램매매를 조회할 때 호출 — PC/ngrok 전혀 필요 없이
+    한국투자증권 API로 바로 가져와서 program_trade_flow 테이블에 저장.
+    """
+    if not KIS_APP_KEY or not KIS_APP_SECRET:
+        return {"ok": False, "error": "KIS_APP_KEY / KIS_APP_SECRET 환경변수가 설정되어 있지 않습니다."}
+    try:
+        rows = fetch_program_trade_daily(code)
+        supabase.table("program_trade_flow").upsert(rows).execute()
+        return {"ok": True, "synced": len(rows)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/kis-program-daily-debug")
 def kis_program_daily_debug(code: str):
     """디버그 전용: '종목별 프로그램매매추이(일별)' 원본 응답 그대로 반환."""
