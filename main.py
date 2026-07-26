@@ -243,6 +243,97 @@ def kis_program_tick_debug(code: str):
         return {"ok": False, "error": str(e)}
 
 
+def estimate_force_avg(rows):
+    """
+    data_engine.py의 load_candles() 추정 로직(매수/매도 체결량 구분이 없을 때)을 그대로 이식.
+    rows: [{"date","open","close","volume"}, ...] (오래된 순으로 정렬되어 있어야 함)
+    반환: [{"label","close","avg_price"}, ...] — avg_price는 누적 "세력매수평단" 근사치
+    """
+    buy_value = 0.0
+    buy_total = 0
+    candles = []
+    for r in rows:
+        price = r["close"]
+        open_p = r["open"] or price
+        vol = r["volume"]
+        if price <= 0 or vol <= 0:
+            continue
+
+        if open_p > 0 and price >= open_p:
+            ratio = min((price - open_p) / open_p * 5, 0.45)
+            net_buy = int(vol * ratio)
+        elif open_p > 0:
+            ratio = min((open_p - price) / open_p * 5, 0.45)
+            net_buy = -int(vol * ratio)
+        else:
+            net_buy = 0
+
+        buy_qty = max(0, (vol + net_buy) // 2)
+        if buy_qty > 0:
+            buy_value += price * buy_qty
+            buy_total += buy_qty
+
+        avg_price = round(buy_value / buy_total, 1) if buy_total > 0 else 0
+        candles.append({"label": r["date"], "close": price, "avg_price": avg_price})
+    return candles
+
+
+def fetch_daily_chart(code: str, start: str, end: str):
+    data = kis_get(
+        "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
+        tr_id="FHKST03010100",
+        params={
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": code,
+            "FID_INPUT_DATE_1": start,
+            "FID_INPUT_DATE_2": end,
+            "FID_PERIOD_DIV_CODE": "D",
+            "FID_ORG_ADJ_PRC": "0",
+        },
+    )
+    if data.get("rt_cd") != "0":
+        raise ValueError(f"KIS API 오류: {data.get('msg1', '알 수 없는 오류')}")
+
+    output2 = data.get("output2", [])
+    if not output2:
+        raise ValueError(f"{code}에 대한 일봉 데이터가 없습니다.")
+
+    rows = [
+        {
+            "date": r["stck_bsop_date"],
+            "open": float(r.get("stck_oprc", 0)),
+            "close": float(r.get("stck_clpr", 0)),
+            "volume": float(r.get("acml_vol", 0)),
+        }
+        for r in output2
+    ]
+    rows.sort(key=lambda r: r["date"])  # KIS는 최신순으로 주므로 오래된 순으로 재정렬
+    return rows, data.get("output1", {})
+
+
+@app.get("/api/query-avg-fallback")
+def query_avg_fallback_endpoint(code: str, start: str, end: str):
+    """
+    Control/종목분석 페이지에서 PC(ngrok)가 응답 없을 때 자동으로 넘어오는 폴백 엔드포인트.
+    실제 매수/매도 체결 분류가 아니라 "양봉/음봉 기반 추정"이라 세력평단은 근사치예요.
+    """
+    if not KIS_APP_KEY or not KIS_APP_SECRET:
+        return {"error": "KIS_APP_KEY / KIS_APP_SECRET 환경변수가 설정되어 있지 않습니다."}
+    try:
+        rows, meta = fetch_daily_chart(code, start, end)
+        candles = estimate_force_avg(rows)
+        return {
+            "code": code,
+            "name": meta.get("hts_kor_isnm", code),
+            "current_price": int(float(meta.get("stck_prpr", 0))),
+            "avg": candles[-1]["avg_price"] if candles else 0,
+            "candles": candles,
+            "is_estimate": True,  # 프론트에서 "근사치" 라벨 표시용
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/api/kis-daily-chart-debug")
 def kis_daily_chart_debug(code: str, start: str, end: str):
     """디버그 전용: '국내주식기간별시세(일봉)' 원본 응답 그대로 반환."""
