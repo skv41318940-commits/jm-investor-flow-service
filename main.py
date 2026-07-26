@@ -336,6 +336,11 @@ def fetch_minute_chart(code: str, market: str = "J"):
     if not output2:
         raise ValueError(f"{code}에 대한 분봉 데이터가 없습니다. (market={market})")
 
+    # ⚠️ 시:분만 보고 날짜를 구분 안 하면, 이전 거래일의 같은 시간대 데이터가 섞여 들어올 수 있음
+    # (예: 아침에 조회했는데 어제 애프터마켓 데이터가 오늘 것처럼 잡히는 문제) → 가장 최근 날짜만 사용
+    latest_date = max(r.get("stck_bsop_date", "") for r in output2)
+    output2 = [r for r in output2 if r.get("stck_bsop_date") == latest_date]
+
     rows = [
         {
             "date": f"{r['stck_cntg_hour'][:2]}:{r['stck_cntg_hour'][2:4]}",
@@ -416,7 +421,7 @@ def kis_daily_chart_debug(code: str, start: str, end: str):
 
 
 @app.get("/api/kis-minute-chart-debug")
-def kis_minute_chart_debug(code: str):
+def kis_minute_chart_debug(code: str, market: str = "J"):
     """디버그 전용: '주식당일분봉조회' 원본 응답 그대로 반환."""
     if not KIS_APP_KEY or not KIS_APP_SECRET:
         return {"ok": False, "error": "KIS_APP_KEY / KIS_APP_SECRET 환경변수가 설정되어 있지 않습니다."}
@@ -429,13 +434,13 @@ def kis_minute_chart_debug(code: str):
             tr_id="FHKST03010200",
             params={
                 "FID_ETC_CLS_CODE": "",
-                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_COND_MRKT_DIV_CODE": market,
                 "FID_INPUT_ISCD": code,
                 "FID_INPUT_HOUR_1": now_str,
                 "FID_PW_DATA_INCU_YN": "Y",
             },
         )
-        print(f"[kis_minute_chart_debug] code={code} raw={data}")
+        print(f"[kis_minute_chart_debug] code={code} market={market} raw={data}")
         return {"ok": True, "raw": data}
     except Exception as e:
         return {"ok": False, "error": str(e)}
