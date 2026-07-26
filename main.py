@@ -545,6 +545,45 @@ def kis_shortsale_debug(code: str, start: str = "", end: str = ""):
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/kis-rate")
+def kis_rate_endpoint(bcdt_code: str, div_cls: str = "0"):
+    """
+    금리 종합(국내채권/금리) — 저장 없이 그때그때 최신값 반환.
+    div_cls="0": 국내채권/금리 (예: Y0106=국고채 10년)
+    div_cls="1": 해외금리지표 (예: Y0202=미국 10년T-NOTE)
+    """
+    if not KIS_APP_KEY or not KIS_APP_SECRET:
+        return {"error": "KIS_APP_KEY / KIS_APP_SECRET 환경변수가 설정되어 있지 않습니다."}
+    try:
+        data = kis_get(
+            "/uapi/domestic-stock/v1/quotations/comp-interest",
+            tr_id="FHPST07020000",
+            params={
+                "FID_COND_MRKT_DIV_CODE": "I",
+                "FID_COND_SCR_DIV_CODE": "20702",
+                "FID_DIV_CLS_CODE": div_cls,
+                "FID_DIV_CLS_CODE1": "",
+            },
+        )
+        if data.get("rt_cd") != "0":
+            return {"error": f"KIS API 오류: {data.get('msg1', '알 수 없는 오류')}"}
+
+        output1 = data.get("output1", [])
+        row = next((r for r in output1 if r.get("bcdt_code") == bcdt_code), None)
+        if not row:
+            return {"error": f"{bcdt_code} 코드를 찾을 수 없습니다."}
+
+        price = float(row.get("bond_mnrt_prpr", 0))
+        change = float(row.get("bond_mnrt_prdy_vrss", 0))
+        sign = row.get("prdy_vrss_sign", "")
+        if sign in ("5", "4"):  # 하락 부호
+            change = -abs(change)
+        pct = float(row.get("prdy_ctrt", 0))
+        return {"name": row.get("hts_kor_isnm", bcdt_code), "price": price, "change": change, "change_pct": pct}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/api/kis-interest-debug")
 def kis_interest_debug(div_cls: str = "", div_cls1: str = ""):
     """디버그 전용: '금리 종합(국내채권/금리)' 원본 응답 그대로 반환."""
