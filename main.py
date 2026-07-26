@@ -109,6 +109,40 @@ def kis_program_debug(code: str):
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/kis-program-daily-debug")
+def kis_program_daily_debug(code: str):
+    """디버그 전용: '종목별 프로그램매매추이(일별)' 원본 응답 그대로 반환."""
+    if not KIS_APP_KEY or not KIS_APP_SECRET:
+        return {"ok": False, "error": "KIS_APP_KEY / KIS_APP_SECRET 환경변수가 설정되어 있지 않습니다."}
+    try:
+        data = kis_get(
+            "/uapi/domestic-stock/v1/quotations/program-trade-by-stock-daily",
+            tr_id="FHPPG04650201",
+            params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code, "FID_INPUT_DATE_1": ""},
+        )
+        print(f"[kis_program_daily_debug] code={code} raw={data}")
+        return {"ok": True, "raw": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/kis-program-tick-debug")
+def kis_program_tick_debug(code: str):
+    """디버그 전용: '종목별 프로그램매매추이(체결)' 원본 응답 그대로 반환."""
+    if not KIS_APP_KEY or not KIS_APP_SECRET:
+        return {"ok": False, "error": "KIS_APP_KEY / KIS_APP_SECRET 환경변수가 설정되어 있지 않습니다."}
+    try:
+        data = kis_get(
+            "/uapi/domestic-stock/v1/quotations/program-trade-by-stock",
+            tr_id="FHPPG04650101",
+            params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code},
+        )
+        print(f"[kis_program_tick_debug] code={code} raw={data}")
+        return {"ok": True, "raw": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/kis-member-debug")
 def kis_member_debug(code: str):
     """
