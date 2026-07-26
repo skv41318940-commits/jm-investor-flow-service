@@ -243,6 +243,56 @@ def kis_program_tick_debug(code: str):
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/kis-daily-chart-debug")
+def kis_daily_chart_debug(code: str, start: str, end: str):
+    """디버그 전용: '국내주식기간별시세(일봉)' 원본 응답 그대로 반환."""
+    if not KIS_APP_KEY or not KIS_APP_SECRET:
+        return {"ok": False, "error": "KIS_APP_KEY / KIS_APP_SECRET 환경변수가 설정되어 있지 않습니다."}
+    try:
+        data = kis_get(
+            "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
+            tr_id="FHKST03010100",
+            params={
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": code,
+                "FID_INPUT_DATE_1": start,
+                "FID_INPUT_DATE_2": end,
+                "FID_PERIOD_DIV_CODE": "D",
+                "FID_ORG_ADJ_PRC": "0",
+            },
+        )
+        print(f"[kis_daily_chart_debug] code={code} raw={data}")
+        return {"ok": True, "raw": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/kis-minute-chart-debug")
+def kis_minute_chart_debug(code: str):
+    """디버그 전용: '주식당일분봉조회' 원본 응답 그대로 반환."""
+    if not KIS_APP_KEY or not KIS_APP_SECRET:
+        return {"ok": False, "error": "KIS_APP_KEY / KIS_APP_SECRET 환경변수가 설정되어 있지 않습니다."}
+    try:
+        from datetime import datetime as _dt
+
+        now_str = _dt.now().strftime("%H%M%S")
+        data = kis_get(
+            "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
+            tr_id="FHKST03010200",
+            params={
+                "FID_ETC_CLS_CODE": "",
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": code,
+                "FID_INPUT_HOUR_1": now_str,
+                "FID_PW_DATA_INCU_YN": "Y",
+            },
+        )
+        print(f"[kis_minute_chart_debug] code={code} raw={data}")
+        return {"ok": True, "raw": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/kis-member-debug")
 def kis_member_debug(code: str):
     """
