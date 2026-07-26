@@ -118,7 +118,7 @@ def kis_program_daily_debug(code: str):
         data = kis_get(
             "/uapi/domestic-stock/v1/quotations/program-trade-by-stock-daily",
             tr_id="FHPPG04650201",
-            params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code, "FID_INPUT_DATE_1": ""},
+            params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code},
         )
         print(f"[kis_program_daily_debug] code={code} raw={data}")
         return {"ok": True, "raw": data}
