@@ -183,6 +183,49 @@ def kis_program_daily_debug(code: str):
         return {"ok": False, "error": str(e)}
 
 
+def fetch_program_trade_tick(code: str):
+    """
+    KIS '종목별 프로그램매매추이(체결)' — 가장 최근 체결 시점의 누적 프로그램매매.
+    저장하지 않고 매번 그 자리에서 최신값만 반환 (진짜 "지금 이 순간" 값이라 캐싱 안 함).
+    """
+    data = kis_get(
+        "/uapi/domestic-stock/v1/quotations/program-trade-by-stock",
+        tr_id="FHPPG04650101",
+        params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code},
+    )
+    if data.get("rt_cd") != "0":
+        raise ValueError(f"KIS API 오류: {data.get('msg1', '알 수 없는 오류')}")
+
+    output = data.get("output", [])
+    if not output:
+        raise ValueError(f"{code}에 대한 실시간 프로그램매매 데이터가 없습니다.")
+
+    r = output[0]  # 가장 최근 체결 시점 (첫 번째 행)
+    hour = r.get("bsop_hour", "")
+    tick_time = f"{hour[:2]}:{hour[2:4]}:{hour[4:6]}" if len(hour) == 6 else ""
+
+    return {
+        "tick_time": tick_time,
+        "buy_amt": round(float(r.get("whol_smtn_shnu_tr_pbmn", 0)) / 1e8, 2),
+        "sell_amt": round(float(r.get("whol_smtn_seln_tr_pbmn", 0)) / 1e8, 2),
+        "net_amt": round(float(r.get("whol_smtn_ntby_tr_pbmn", 0)) / 1e8, 2),
+    }
+
+
+@app.get("/api/program-trade-tick")
+def program_trade_tick_endpoint(code: str):
+    """
+    종목분석 페이지 우측 패널(실시간) 전용 — 저장 없이 매번 최신 체결 기준 값을 그대로 반환.
+    """
+    if not KIS_APP_KEY or not KIS_APP_SECRET:
+        return {"ok": False, "error": "KIS_APP_KEY / KIS_APP_SECRET 환경변수가 설정되어 있지 않습니다."}
+    try:
+        result = fetch_program_trade_tick(code)
+        return {"ok": True, **result}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/kis-program-tick-debug")
 def kis_program_tick_debug(code: str):
     """디버그 전용: '종목별 프로그램매매추이(체결)' 원본 응답 그대로 반환."""
