@@ -115,10 +115,12 @@ def kis_program_daily_debug(code: str):
     if not KIS_APP_KEY or not KIS_APP_SECRET:
         return {"ok": False, "error": "KIS_APP_KEY / KIS_APP_SECRET 환경변수가 설정되어 있지 않습니다."}
     try:
+        from datetime import datetime as _dt
+        today_str = _dt.now().strftime("%Y%m%d")
         data = kis_get(
             "/uapi/domestic-stock/v1/quotations/program-trade-by-stock-daily",
             tr_id="FHPPG04650201",
-            params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code},
+            params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code, "FID_INPUT_DATE_1": today_str},
         )
         print(f"[kis_program_daily_debug] code={code} raw={data}")
         return {"ok": True, "raw": data}
