@@ -13,11 +13,19 @@ pykrx는 키움 OpenAPI와 무관하게 KRX 공식 데이터를 인터넷으로 
 """
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+# ── Render 서버는 UTC로 돌아가서, now_kst()를 그냥 쓰면 한국시간보다 9시간
+# 느리게 나옴 (특히 자정 근처엔 날짜까지 하루 밀림). 반드시 이 함수로만 "지금"을 구함.
+KST = timezone(timedelta(hours=9))
+
+
+def now_kst() -> datetime:
+    return datetime.now(KST)
 from pykrx import stock
 from supabase import create_client
 
@@ -119,7 +127,7 @@ def fetch_program_trade_daily(code: str):
     """
     from datetime import datetime as _dt
 
-    today_str = _dt.now().strftime("%Y%m%d")
+    today_str = now_kst().strftime("%Y%m%d")
     data = kis_get(
         "/uapi/domestic-stock/v1/quotations/program-trade-by-stock-daily",
         tr_id="FHPPG04650201",
@@ -174,7 +182,7 @@ def kis_program_daily_debug(code: str):
         return {"ok": False, "error": "KIS_APP_KEY / KIS_APP_SECRET 환경변수가 설정되어 있지 않습니다."}
     try:
         from datetime import datetime as _dt
-        today_str = _dt.now().strftime("%Y%m%d")
+        today_str = now_kst().strftime("%Y%m%d")
         data = kis_get(
             "/uapi/domestic-stock/v1/quotations/program-trade-by-stock-daily",
             tr_id="FHPPG04650201",
@@ -317,7 +325,7 @@ def fetch_daily_chart(code: str, start: str, end: str):
 def fetch_minute_chart(code: str, market: str = "J"):
     from datetime import datetime as _dt
 
-    now_str = _dt.now().strftime("%H%M%S")
+    now_str = now_kst().strftime("%H%M%S")
     data = kis_get(
         "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
         tr_id="FHKST03010200",
@@ -428,7 +436,7 @@ def kis_minute_chart_debug(code: str, market: str = "J"):
     try:
         from datetime import datetime as _dt
 
-        now_str = _dt.now().strftime("%H%M%S")
+        now_str = now_kst().strftime("%H%M%S")
         data = kis_get(
             "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
             tr_id="FHKST03010200",
@@ -449,8 +457,8 @@ def kis_minute_chart_debug(code: str, market: str = "J"):
 def fetch_shortsale(code: str, days: int = 20):
     from datetime import datetime as _dt, timedelta as _td
 
-    today_str = _dt.now().strftime("%Y%m%d")
-    from_str = (_dt.now() - _td(days=days * 2)).strftime("%Y%m%d")
+    today_str = now_kst().strftime("%Y%m%d")
+    from_str = (now_kst() - _td(days=days * 2)).strftime("%Y%m%d")
 
     data = kis_get(
         "/uapi/domestic-stock/v1/quotations/daily-short-sale",
@@ -493,7 +501,7 @@ def fetch_shorting_balance(code: str, days: int = 20):
     pykrx로 가져옴 (investor_flow_fetch랑 같은 소스). 실행 후 컬럼명 확인 필요할 수 있어
     디버그 프린트를 남겨둠.
     """
-    today = datetime.now()
+    today = now_kst()
     fromdate = (today - timedelta(days=days * 2)).strftime("%Y%m%d")
     todate = today.strftime("%Y%m%d")
 
@@ -714,7 +722,7 @@ def fetch_broker_flow(code: str):
     except Exception as e:
         print(f"[fetch_broker_flow] 현재가 조회 실패, est_amount 없이 진행: {e}")
 
-    trade_date = datetime.now().strftime("%Y-%m-%d")
+    trade_date = now_kst().strftime("%Y-%m-%d")
     rows = []
     for i in range(1, 6):
         sell_qty = float(row.get(f"total_seln_qty{i}", 0) or 0)
@@ -765,7 +773,7 @@ def sync_broker_flow_endpoint(code: str):
 
 
 def fetch_investor_flow(code: str, days: int = 20):
-    today = datetime.now()
+    today = now_kst()
     fromdate = (today - timedelta(days=days * 2)).strftime("%Y%m%d")  # 주말 감안 여유있게
     todate = today.strftime("%Y%m%d")
 
@@ -830,7 +838,7 @@ def _latest_trading_day() -> str:
     """오늘이 주말/공휴일이라 데이터가 없을 수 있어서, 최근 영업일을 찾아 반환 (YYYYMMDD)"""
     from datetime import date as _date
 
-    d = datetime.now()
+    d = now_kst()
     for _ in range(10):
         ymd = d.strftime("%Y%m%d")
         # 코스피 지수 하나로 그날 데이터가 있는지 간단히 확인
@@ -938,7 +946,7 @@ INST_TYPE_COLUMNS = ["금융투자", "보험", "투신", "사모", "은행", "�
 
 
 def fetch_institution_type_flow(code: str, days: int = 60):
-    today = datetime.now()
+    today = now_kst()
     fromdate = (today - timedelta(days=days * 2)).strftime("%Y%m%d")  # 주말 감안 여유있게
     todate = today.strftime("%Y%m%d")
 
