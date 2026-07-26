@@ -311,16 +311,55 @@ def fetch_daily_chart(code: str, start: str, end: str):
     return rows, data.get("output1", {})
 
 
+def fetch_minute_chart(code: str):
+    from datetime import datetime as _dt
+
+    now_str = _dt.now().strftime("%H%M%S")
+    data = kis_get(
+        "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
+        tr_id="FHKST03010200",
+        params={
+            "FID_ETC_CLS_CODE": "",
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": code,
+            "FID_INPUT_HOUR_1": now_str,
+            "FID_PW_DATA_INCU_YN": "Y",
+        },
+    )
+    if data.get("rt_cd") != "0":
+        raise ValueError(f"KIS API 오류: {data.get('msg1', '알 수 없는 오류')}")
+
+    output2 = data.get("output2", [])
+    if not output2:
+        raise ValueError(f"{code}에 대한 분봉 데이터가 없습니다.")
+
+    rows = [
+        {
+            "date": f"{r['stck_cntg_hour'][:2]}:{r['stck_cntg_hour'][2:4]}",
+            "open": float(r.get("stck_oprc", 0)),
+            "close": float(r.get("stck_prpr", 0)),
+            "volume": float(r.get("cntg_vol", 0)),
+        }
+        for r in output2
+    ]
+    rows.reverse()  # KIS는 최신순으로 주므로 오래된 순으로 재정렬
+    return rows, data.get("output1", {})
+
+
 @app.get("/api/query-avg-fallback")
-def query_avg_fallback_endpoint(code: str, start: str, end: str):
+def query_avg_fallback_endpoint(code: str, start: str = "", end: str = "", mode: str = "daily"):
     """
     Control/종목분석 페이지에서 PC(ngrok)가 응답 없을 때 자동으로 넘어오는 폴백 엔드포인트.
     실제 매수/매도 체결 분류가 아니라 "양봉/음봉 기반 추정"이라 세력평단은 근사치예요.
+    mode="minute"이면 당일 분봉 기준 (start/end 무시, 항상 오늘/현재시각 기준).
     """
     if not KIS_APP_KEY or not KIS_APP_SECRET:
         return {"error": "KIS_APP_KEY / KIS_APP_SECRET 환경변수가 설정되어 있지 않습니다."}
     try:
-        rows, meta = fetch_daily_chart(code, start, end)
+        if mode == "minute":
+            rows, meta = fetch_minute_chart(code)
+        else:
+            rows, meta = fetch_daily_chart(code, start, end)
         candles = estimate_force_avg(rows)
         return {
             "code": code,
