@@ -545,6 +545,28 @@ def kis_shortsale_debug(code: str, start: str = "", end: str = ""):
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/kis-interest-debug")
+def kis_interest_debug(div_cls: str = "", div_cls1: str = ""):
+    """디버그 전용: '금리 종합(국내채권/금리)' 원본 응답 그대로 반환."""
+    if not KIS_APP_KEY or not KIS_APP_SECRET:
+        return {"ok": False, "error": "KIS_APP_KEY / KIS_APP_SECRET 환경변수가 설정되어 있지 않습니다."}
+    try:
+        data = kis_get(
+            "/uapi/domestic-stock/v1/quotations/comp-interest",
+            tr_id="FHPST07020000",
+            params={
+                "FID_COND_MRKT_DIV_CODE": "I",
+                "FID_COND_SCR_DIV_CODE": "20702",
+                "FID_DIV_CLS_CODE": div_cls,
+                "FID_DIV_CLS_CODE1": div_cls1,
+            },
+        )
+        print(f"[kis_interest_debug] div_cls={div_cls} div_cls1={div_cls1} raw={data}")
+        return {"ok": True, "raw": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/kis-member-debug")
 def kis_member_debug(code: str):
     """
