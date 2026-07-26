@@ -464,6 +464,49 @@ def fetch_shortsale(code: str, days: int = 20):
     return rows
 
 
+def fetch_shorting_balance(code: str, days: int = 20):
+    """
+    공매도 '잔고비중' — 아까 만든 '거래비중'(KIS)이랑 완전히 다른 데이터.
+    pykrx로 가져옴 (investor_flow_fetch랑 같은 소스). 실행 후 컬럼명 확인 필요할 수 있어
+    디버그 프린트를 남겨둠.
+    """
+    today = datetime.now()
+    fromdate = (today - timedelta(days=days * 2)).strftime("%Y%m%d")
+    todate = today.strftime("%Y%m%d")
+
+    df = stock.get_shorting_balance_by_date(fromdate, todate, code)
+    print(f"[shorting_balance] code={code} rows={len(df)} columns={list(df.columns)}")
+
+    if df.empty:
+        raise ValueError(f"{code}에 대한 공매도 잔고 데이터가 없습니다.")
+
+    df = df.tail(days)
+
+    rows = []
+    for date_idx, row in df.iterrows():
+        rows.append(
+            {
+                "stock_code": code,
+                "trade_date": date_idx.strftime("%Y-%m-%d"),
+                "balance_qty": float(row.get("공매도잔고수량", 0)),
+                "balance_amt": round(float(row.get("공매도잔고금액", 0)) / 1e8, 2),
+                "balance_pct": float(row.get("공매도잔고비중", 0)),
+            }
+        )
+    return rows
+
+
+@app.get("/api/sync-shortsale-balance")
+def sync_shortsale_balance_endpoint(code: str):
+    """종목별 공매도 잔고비중 동기화 (pykrx, PC 필요 없음)"""
+    try:
+        rows = fetch_shorting_balance(code)
+        supabase.table("stock_shortsale_balance").upsert(rows).execute()
+        return {"ok": True, "synced": len(rows)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/sync-shortsale")
 def sync_shortsale_endpoint(code: str):
     """
