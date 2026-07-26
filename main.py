@@ -423,6 +423,63 @@ def kis_minute_chart_debug(code: str):
         return {"ok": False, "error": str(e)}
 
 
+def fetch_shortsale(code: str, days: int = 20):
+    from datetime import datetime as _dt, timedelta as _td
+
+    today_str = _dt.now().strftime("%Y%m%d")
+    from_str = (_dt.now() - _td(days=days * 2)).strftime("%Y%m%d")
+
+    data = kis_get(
+        "/uapi/domestic-stock/v1/quotations/daily-short-sale",
+        tr_id="FHPST04830000",
+        params={
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": code,
+            "FID_INPUT_DATE_1": from_str,
+            "FID_INPUT_DATE_2": today_str,
+        },
+    )
+    if data.get("rt_cd") != "0":
+        raise ValueError(f"KIS API 오류: {data.get('msg1', '알 수 없는 오류')}")
+
+    output2 = data.get("output2", [])
+    if not output2:
+        raise ValueError(f"{code}에 대한 공매도 데이터가 없습니다.")
+
+    rows = []
+    for r in output2[:days]:
+        date = r.get("stck_bsop_date", "")
+        if len(date) != 8:
+            continue
+        rows.append(
+            {
+                "stock_code": code,
+                "trade_date": f"{date[:4]}-{date[4:6]}-{date[6:8]}",
+                "short_qty": float(r.get("ssts_cntg_qty", 0)),
+                "short_vol_pct": float(r.get("ssts_vol_rlim", 0)),
+                "short_amt": round(float(r.get("ssts_tr_pbmn", 0)) / 1e8, 2),
+                "short_amt_pct": float(r.get("ssts_tr_pbmn_rlim", 0)),
+            }
+        )
+    return rows
+
+
+@app.get("/api/sync-shortsale")
+def sync_shortsale_endpoint(code: str):
+    """
+    통합수급현황/종목분석 페이지에서 종목 검색 시 호출 — 최근 20영업일 공매도 추이를
+    한국투자증권 API로 가져와서 stock_shortsale_flow 테이블에 저장. PC 필요 없음.
+    """
+    if not KIS_APP_KEY or not KIS_APP_SECRET:
+        return {"ok": False, "error": "KIS_APP_KEY / KIS_APP_SECRET 환경변수가 설정되어 있지 않습니다."}
+    try:
+        rows = fetch_shortsale(code)
+        supabase.table("stock_shortsale_flow").upsert(rows).execute()
+        return {"ok": True, "synced": len(rows)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/kis-shortsale-debug")
 def kis_shortsale_debug(code: str, start: str = "", end: str = ""):
     """디버그 전용: '국내주식 공매도 일별추이' 원본 응답 그대로 반환."""
