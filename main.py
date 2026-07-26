@@ -423,6 +423,28 @@ def kis_minute_chart_debug(code: str):
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/kis-shortsale-debug")
+def kis_shortsale_debug(code: str, start: str = "", end: str = ""):
+    """디버그 전용: '국내주식 공매도 일별추이' 원본 응답 그대로 반환."""
+    if not KIS_APP_KEY or not KIS_APP_SECRET:
+        return {"ok": False, "error": "KIS_APP_KEY / KIS_APP_SECRET 환경변수가 설정되어 있지 않습니다."}
+    try:
+        data = kis_get(
+            "/uapi/domestic-stock/v1/quotations/daily-short-sale",
+            tr_id="FHPST04830000",
+            params={
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": code,
+                "FID_INPUT_DATE_1": start,
+                "FID_INPUT_DATE_2": end,
+            },
+        )
+        print(f"[kis_shortsale_debug] code={code} raw={data}")
+        return {"ok": True, "raw": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/kis-member-debug")
 def kis_member_debug(code: str):
     """
