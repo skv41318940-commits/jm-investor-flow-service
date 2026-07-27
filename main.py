@@ -913,9 +913,9 @@ def fetch_shorting_balance(code: str, days: int = 20):
             {
                 "stock_code": code,
                 "trade_date": date_idx.strftime("%Y-%m-%d"),
-                "balance_qty": float(row.get("공매도잔고수량", 0)),
-                "balance_amt": round(float(row.get("공매도잔고금액", 0)) / 1e8, 2),
-                "balance_pct": float(row.get("공매도잔고비중", 0)),
+                "balance_qty": float(row.get("공매도잔고", 0)),
+                "balance_amt": round(float(row.get("공매도금액", 0)) / 1e8, 2),
+                "balance_pct": float(row.get("비중", 0)),
             }
         )
     return rows
