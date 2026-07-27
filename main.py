@@ -13,6 +13,7 @@ pykrx는 키움 OpenAPI와 무관하게 KRX 공식 데이터를 인터넷으로 
 """
 import os
 import time
+import json
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -93,6 +94,399 @@ def kis_get(path: str, tr_id: str, params: dict) -> dict:
     res = requests.get(f"{KIS_BASE_URL}{path}", headers=headers, params=params, timeout=10)
     res.raise_for_status()
     return res.json()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 실시간 웹소켓 체결 누적기 — 정밀 세력평단용
+# ──────────────────────────────────────────────────────────────────────────
+# 근사치(양봉/음봉 추정) 대신, 실제 매수/매도 체결 구분(CCLD_DVSN)을 웹소켓으로
+# 계속 받아서 분 단위로 누적함. Render 유료(상시 실행) 플랜에서만 의미 있음
+# (무료 플랜은 잠들어서 연결이 계속 끊김).
+# ══════════════════════════════════════════════════════════════════════════
+import asyncio
+import threading
+
+try:
+    import websockets
+except ImportError:
+    websockets = None
+
+KIS_WS_URL = "ws://ops.koreainvestment.com:21000"
+
+# 넥스트레이드(NXT) 거래가능 종목 전체 목록 (2026-07-27 기준, 608종목) —
+# 사용자가 nextrade.co.kr에서 직접 확인해서 준 목록. "A" 접두어 뗀 순수 종목코드.
+# 이 목록은 NXT가 종목을 추가/제외할 때마다 바뀔 수 있어서 주기적으로 갱신 필요.
+NXT_ELIGIBLE_CODES = [
+    "000660", "005930", "035420", "009150", "402340", "017670", "042660", "010120", "005380", "018260",
+    "042700", "034020", "066570", "277810", "010060", "460930", "011070", "012330", "108860", "064350",
+    "484810", "006400", "012450", "207940", "096770", "399720", "010140", "196170", "336260", "119850",
+    "316140", "058610", "079550", "095610", "068270", "000500", "087010", "214450", "034730", "000270",
+    "298040", "086520", "486990", "272210", "278470", "352820", "000250", "005490", "307950", "082740",
+    "047810", "006800", "329180", "483650", "319660", "028260", "003230", "108490", "011200", "267260",
+    "007660", "304100", "028300", "222800", "062040", "101490", "237690", "010950", "448900", "015760",
+    "373220", "078930", "000150", "105560", "089970", "073240", "439090", "300080", "257720", "000720",
+    "200710", "402030", "016360", "009540", "086790", "055550", "267270", "090430", "000990", "047050",
+    "006260", "000100", "199430", "176750", "138040", "247540", "103590", "086280", "0126Z0", "058470",
+    "051910", "192820", "066970", "161890", "437730", "071970", "141080", "181710", "005090", "377300",
+    "004170", "003670", "090360", "005290", "071050", "011790", "095340", "298380", "281820", "466100",
+    "032830", "031980", "083450", "226950", "488280", "039490", "131970", "131290", "007390", "007810",
+    "024110", "047920", "033100", "099190", "009420", "270660", "084370", "263750", "128940", "340570",
+    "489790", "089890", "195870", "323280", "065350", "161000", "052690", "290650", "323410", "003160",
+    "017960", "267250", "039030", "218410", "004020", "476830", "171090", "007690", "102940", "456040",
+    "005940", "310210", "000880", "083650", "051900", "035900", "006110", "022100", "078600", "251970",
+    "030200", "033780", "064820", "183300", "020150", "036570", "356860", "419530", "075580", "180640",
+    "010130", "041510", "161390", "103140", "175330", "126340", "077970", "484870", "004370", "145020",
+    "420770", "069960", "166090", "001450", "458870", "000810", "476060", "003550", "229640", "008930",
+    "259960", "096530", "018670", "457190", "030520", "082920", "298020", "037710", "049070", "124500",
+    "034230", "100840", "326030", "039440", "195940", "058970", "005070", "032350", "008770", "029460",
+    "241560", "214150", "045100", "060370", "026960", "002020", "357780", "039200", "002380", "241710",
+    "439260", "443060", "074600", "001040", "090460", "017800", "456160", "023530", "475830", "120110",
+    "094170", "101160", "044490", "388720", "107640", "011210", "328130", "089860", "460860", "397030",
+    "139480", "064760", "051600", "086390", "068760", "102710", "097950", "295310", "041830", "114810",
+    "000120", "059090", "032640", "117730", "445680", "294870", "005830", "099320", "137400", "032500",
+    "036810", "086450", "112040", "348370", "168360", "445090", "021240", "388210", "287840", "001430",
+    "089010", "389650", "0009K0", "042520", "023160", "455900", "185750", "011170", "029780", "108320",
+    "018290", "127120", "033640", "139130", "161580", "025320", "079900", "036460", "348210", "138930",
+    "122870", "213420", "014680", "036200", "382900", "098070", "302440", "189300", "030000", "140860",
+    "272290", "007340", "459510", "383220", "046890", "001120", "020560", "298050", "000640", "110990",
+    "194480", "002790", "005850", "082270", "003690", "095500", "053800", "011780", "468530", "036620",
+    "009520", "035250", "214430", "042000", "079940", "214370", "000210", "085660", "271560", "452430",
+    "013030", "358570", "005180", "014620", "033500", "006280", "093320", "003540", "033240", "007070",
+    "023590", "009240", "004490", "094360", "441270", "475400", "389470", "052400", "036890", "475960",
+    "001800", "101730", "462870", "424870", "499790", "069620", "394280", "304360", "006650", "061090",
+    "001060", "190510", "092460", "121600", "251270", "361610", "078350", "015750", "108670", "004980",
+    "053610", "282330", "006120", "078520", "336370", "004000", "111770", "403850", "115180", "005440",
+    "249420", "004990", "067160", "199800", "005810", "009450", "365340", "004800", "0008Z0", "056190",
+    "248070", "114190", "104830", "225570", "012630", "084110", "035760", "000080", "178920", "002810",
+    "285130", "067080", "005420", "488900", "002960", "008060", "007310", "376300", "425420", "012750",
+    "114090", "078340", "032190", "265520", "010780", "003570", "372320", "241770", "280360", "306200",
+    "206640", "001500", "086900", "228760", "394800", "008490", "236200", "383800", "002710", "237880",
+    "009900", "194700", "194370", "378340", "039130", "031210", "469610", "064960", "014830", "035600",
+    "300720", "092730", "005300", "017940", "019170", "278280", "006040", "003240", "138610", "001720",
+    "317450", "001680", "071320", "253450", "030610", "145720", "078160", "005500", "009970", "000240",
+    "126720", "072710", "053030", "003030", "170900", "192080", "108380", "036530", "084850", "008730",
+    "0120G0", "089980", "097520", "024720", "317330", "200670", "011760", "376270", "025540", "494120",
+    "338220", "473980", "211050", "084690", "215200", "344820", "114840", "036830", "243070", "200880",
+    "020000", "081660", "095660", "025900", "005250", "017810", "069080", "064550", "036800", "200130",
+    "016610", "484120", "220100", "014820", "003850", "101360", "215000", "069260", "093520", "214320",
+    "003200", "481070", "416180", "003220", "030190", "226320", "001130", "031430", "338840", "192400",
+    "003090", "381970", "017390", "001750", "294570", "308430", "084010", "065680", "271940", "065660",
+    "026890", "472850", "286940", "137310", "035150", "284740", "475560", "004690", "005610", "054950",
+    "352480", "004360", "060980", "000070", "450950", "000670", "001530", "015360", "007160", "453340",
+    "105630", "299030", "001940", "144510", "002240", "268280", "016590", "001270", "314930", "043150",
+    "039840", "034950", "183190", "034310", "003960", "033270", "101930", "034120", "372170", "003300",
+    "267980", "003920", "007700", "002030", "002840", "000320", "003120", "013890", "104700", "448280",
+    "009680", "403550", "051500", "092230", "002320", "018310", "005710", "029530", "093050", "001630",
+    "043370", "145990", "001460", "004700", "357550", "016800", "376900", "051360",
+]
+
+
+_tick_buckets: dict = {}  # (code, market, trade_date, minute) -> {"buy_qty","buy_value","sell_qty","sell_value"}
+_tick_lock = threading.Lock()
+_ws_debug_count = 0  # 처음 몇 개 메시지만 원본 로그 남겨서 필드 위치 검증용
+
+# 문서에 나열된 실시간체결가 필드 순서 (^로 구분된 인덱스) — 여기가 틀리면 전부 틀어지니
+# 초반엔 _ws_debug_count로 원본을 찍어서 실제로 맞는지 꼭 확인할 것
+IDX_CODE = 0
+IDX_HOUR = 1
+IDX_PRICE = 2
+IDX_CNTG_VOL = 12
+IDX_CCLD_DVSN = 21
+IDX_BSOP_DATE = 33
+TICK_FIELD_COUNT = 46
+
+
+def get_ws_approval_key() -> str:
+    res = requests.post(
+        f"{KIS_BASE_URL}/oauth2/Approval",
+        json={"grant_type": "client_credentials", "appkey": KIS_APP_KEY, "secretkey": KIS_APP_SECRET},
+        timeout=10,
+    )
+    res.raise_for_status()
+    return res.json()["approval_key"]
+
+
+def _add_tick(code: str, market: str, hhmmss: str, bsop_date: str, price: float, qty: float, ccld_dvsn: str):
+    if price <= 0 or qty <= 0:
+        return
+    if len(hhmmss) < 4:
+        return
+    minute = f"{hhmmss[:2]}:{hhmmss[2:4]}"
+    if len(bsop_date) == 8:
+        trade_date = f"{bsop_date[:4]}-{bsop_date[4:6]}-{bsop_date[6:8]}"
+    else:
+        trade_date = now_kst().strftime("%Y-%m-%d")
+
+    key = (code, market, trade_date, minute)
+    with _tick_lock:
+        b = _tick_buckets.setdefault(key, {"buy_qty": 0.0, "buy_value": 0.0, "sell_qty": 0.0, "sell_value": 0.0})
+        if ccld_dvsn == "1":  # 매수
+            b["buy_qty"] += qty
+            b["buy_value"] += price * qty
+        elif ccld_dvsn == "5":  # 매도
+            b["sell_qty"] += qty
+            b["sell_value"] += price * qty
+        # "3"(장전 단일가 등)은 매수/매도 구분이 없어서 스킵
+
+
+def _parse_realtime_message(raw: str):
+    global _ws_debug_count
+    parts = raw.split("|")
+    if len(parts) < 4:
+        return
+    encrypted_flag, tr_id, count_str, body = parts[0], parts[1], parts[2], parts[3]
+    if encrypted_flag != "0":
+        return  # 체결가는 보통 비암호화라 "0"만 처리 (혹시 "1"이 오면 이번 버전에선 무시)
+
+    market = "KRX" if tr_id == "H0STCNT0" else "NXT" if tr_id == "H0NXCNT0" else None
+    if not market:
+        return
+
+    try:
+        count = int(count_str)
+    except ValueError:
+        count = 1
+
+    fields = body.split("^")
+
+    if _ws_debug_count < 5:
+        print(f"[ws_debug] tr={tr_id} count={count} first_tick_fields={fields[:TICK_FIELD_COUNT]}")
+        _ws_debug_count += 1
+
+    for i in range(max(count, 1)):
+        start = i * TICK_FIELD_COUNT
+        chunk = fields[start : start + TICK_FIELD_COUNT]
+        if len(chunk) < IDX_CCLD_DVSN + 1:
+            continue
+        try:
+            code = chunk[IDX_CODE]
+            hhmmss = chunk[IDX_HOUR]
+            price = float(chunk[IDX_PRICE])
+            cntg_vol = float(chunk[IDX_CNTG_VOL])
+            ccld_dvsn = chunk[IDX_CCLD_DVSN]
+            bsop_date = chunk[IDX_BSOP_DATE] if len(chunk) > IDX_BSOP_DATE else now_kst().strftime("%Y%m%d")
+        except (ValueError, IndexError):
+            continue
+        _add_tick(code, market, hhmmss, bsop_date, price, cntg_vol, ccld_dvsn)
+
+
+def _flush_tick_buckets():
+    """메모리에 쌓인 분 단위 누적치를 Supabase에 반영 (기존 값에 더하는 방식)"""
+    with _tick_lock:
+        if not _tick_buckets:
+            return
+        pending = dict(_tick_buckets)
+        _tick_buckets.clear()
+
+    for (code, market, trade_date, minute), delta in pending.items():
+        try:
+            existing = (
+                supabase.table("tick_minute_flow")
+                .select("*")
+                .eq("stock_code", code)
+                .eq("market", market)
+                .eq("trade_date", trade_date)
+                .eq("minute", minute)
+                .limit(1)
+                .execute()
+            )
+            row = existing.data[0] if existing.data else None
+            merged = {
+                "stock_code": code,
+                "market": market,
+                "trade_date": trade_date,
+                "minute": minute,
+                "buy_qty": (row["buy_qty"] if row else 0) + delta["buy_qty"],
+                "buy_value": (row["buy_value"] if row else 0) + delta["buy_value"],
+                "sell_qty": (row["sell_qty"] if row else 0) + delta["sell_qty"],
+                "sell_value": (row["sell_value"] if row else 0) + delta["sell_value"],
+            }
+            supabase.table("tick_minute_flow").upsert(merged).execute()
+        except Exception as e:
+            print(f"[tick_flush] {code} {market} {minute} 저장 실패: {e}")
+
+
+def _get_watchlist_codes() -> list:
+    """관심종목 + 최근 14일 이내 조회했던 종목(Control/종목분석에서 검색한 것들) 합쳐서 반환"""
+    codes = set()
+    try:
+        res = supabase.table("watchlist").select("code").execute()
+        codes |= {r["code"] for r in res.data if r.get("code")}
+    except Exception as e:
+        print(f"[watchlist] 조회 실패: {e}")
+
+    try:
+        cutoff = (now_kst() - timedelta(days=14)).isoformat()
+        res2 = supabase.table("tick_tracked_codes").select("stock_code").gte("last_requested_at", cutoff).execute()
+        codes |= {r["stock_code"] for r in res2.data if r.get("stock_code")}
+    except Exception as e:
+        print(f"[tick_tracked_codes] 조회 실패: {e}")
+
+    return sorted(codes)
+
+
+@app.get("/api/track-code")
+def track_code_endpoint(code: str):
+    """
+    Control/종목분석 페이지에서 종목을 조회할 때마다 호출 — 이 종목을 웹소켓 구독
+    목록에 추가해달라고 등록함. (등록 시점부터 정밀 데이터가 쌓이기 시작 — 소급 불가)
+    """
+    try:
+        supabase.table("tick_tracked_codes").upsert(
+            {"stock_code": code, "last_requested_at": now_kst().isoformat()}
+        ).execute()
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def _ws_worker():
+    """장중(07:50~20:10 KST)에만 웹소켓을 연결 유지하며 체결 데이터를 누적하는 백그라운드 작업"""
+    if websockets is None:
+        print("[ws_worker] websockets 패키지가 설치되어 있지 않아 실시간 누적을 건너뜁니다.")
+        return
+    if not KIS_APP_KEY or not KIS_APP_SECRET:
+        print("[ws_worker] KIS 키 미설정으로 실시간 누적을 건너뜁니다.")
+        return
+
+    while True:
+        now = now_kst()
+        start_t = now.replace(hour=7, minute=50, second=0, microsecond=0)
+        end_t = now.replace(hour=20, minute=10, second=0, microsecond=0)
+        if not (start_t <= now <= end_t) or now.weekday() >= 5:  # 주말 제외
+            await asyncio.sleep(60)
+            continue
+
+        try:
+            approval_key = get_ws_approval_key()
+            krx_codes = _get_watchlist_codes()
+            nxt_codes = NXT_ELIGIBLE_CODES
+            if not krx_codes and not nxt_codes:
+                print("[ws_worker] 구독할 종목이 없어 잠시 대기합니다.")
+                await asyncio.sleep(300)
+                continue
+
+            async with websockets.connect(KIS_WS_URL, ping_interval=None) as ws:
+                for code in krx_codes:
+                    sub = {
+                        "header": {"approval_key": approval_key, "custtype": "P", "tr_type": "1", "content-type": "utf-8"},
+                        "body": {"input": {"tr_id": "H0STCNT0", "tr_key": code}},
+                    }
+                    await ws.send(json.dumps(sub))
+                    await asyncio.sleep(0.05)
+                for code in nxt_codes:
+                    sub = {
+                        "header": {"approval_key": approval_key, "custtype": "P", "tr_type": "1", "content-type": "utf-8"},
+                        "body": {"input": {"tr_id": "H0NXCNT0", "tr_key": code}},
+                    }
+                    await ws.send(json.dumps(sub))
+                    await asyncio.sleep(0.05)
+                print(f"[ws_worker] KRX {len(krx_codes)}개(관심종목) + NXT {len(nxt_codes)}개(전체) 구독 요청 완료")
+
+                last_flush = time.time()
+                last_refresh = time.time()
+                sub_error_count = 0
+                while True:
+                    now2 = now_kst()
+                    if now2 > end_t or now2.weekday() >= 5:
+                        break
+                    try:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=5)
+                    except asyncio.TimeoutError:
+                        msg = None
+                    if msg:
+                        if msg.startswith("0") or msg.startswith("1"):
+                            _parse_realtime_message(msg)
+                        elif msg.startswith("{"):
+                            # 구독 응답(JSON) — 실패한 것만 로그로 남김 (608개 성공은 굳이 다 안 찍음)
+                            if "SUCCESS" not in msg:
+                                sub_error_count += 1
+                                if sub_error_count <= 20:  # 로그 폭주 방지
+                                    print(f"[ws_worker] 구독 응답 이상: {msg[:300]}")
+
+                    if time.time() - last_flush > 5:
+                        _flush_tick_buckets()
+                        last_flush = time.time()
+
+                    # 5분마다 관심종목 목록 갱신 (새로 추가된 종목 구독, NXT 608개는 고정이라 갱신 안 함)
+                    if time.time() - last_refresh > 300:
+                        new_krx_codes = _get_watchlist_codes()
+                        added = [c for c in new_krx_codes if c not in krx_codes]
+                        for code in added:
+                            sub = {
+                                "header": {"approval_key": approval_key, "custtype": "P", "tr_type": "1", "content-type": "utf-8"},
+                                "body": {"input": {"tr_id": "H0STCNT0", "tr_key": code}},
+                            }
+                            await ws.send(json.dumps(sub))
+                        krx_codes = new_krx_codes
+                        last_refresh = time.time()
+
+                _flush_tick_buckets()
+        except Exception as e:
+            print(f"[ws_worker] 연결 오류, 10초 후 재시도: {e}")
+            await asyncio.sleep(10)
+
+
+@app.on_event("startup")
+async def _start_ws_worker():
+    asyncio.create_task(_ws_worker())
+
+
+@app.get("/api/tick-avg")
+def tick_avg_endpoint(code: str, market: str = "KRX", date: str = "", start: str = "", end: str = ""):
+    """
+    웹소켓으로 누적된 정밀 세력평단 조회. is_estimate=False (실제 매수/매도 체결 기반).
+    market: "KRX" 또는 "NXT". date 비우면 오늘.
+    """
+    trade_date = date or now_kst().strftime("%Y-%m-%d")
+    try:
+        query = (
+            supabase.table("tick_minute_flow")
+            .select("*")
+            .eq("stock_code", code)
+            .eq("market", market)
+            .eq("trade_date", trade_date)
+            .order("minute", desc=False)
+        )
+        rows = query.execute().data
+        if start:
+            rows = [r for r in rows if r["minute"] >= start]
+        if end:
+            rows = [r for r in rows if r["minute"] <= end]
+
+        if not rows:
+            return {"error": "해당 구간에 누적된 실시간 체결 데이터가 없습니다. (웹소켓이 그 시간에 연결되어 있지 않았을 수 있음)"}
+
+        buy_qty = sum(r["buy_qty"] for r in rows)
+        buy_value = sum(r["buy_value"] for r in rows)
+        sell_qty = sum(r["sell_qty"] for r in rows)
+        sell_value = sum(r["sell_value"] for r in rows)
+
+        avg = round(buy_value / buy_qty, 1) if buy_qty > 0 else 0
+        sell_avg = round(sell_value / sell_qty, 1) if sell_qty > 0 else 0
+
+        candles = [
+            {
+                "label": r["minute"],
+                "close": None,
+                "avg_price": round(sum(x["buy_value"] for x in rows if x["minute"] <= r["minute"])
+                                    / sum(x["buy_qty"] for x in rows if x["minute"] <= r["minute"]), 1)
+                if sum(x["buy_qty"] for x in rows if x["minute"] <= r["minute"]) > 0 else 0,
+            }
+            for r in rows
+        ]
+
+        return {
+            "code": code,
+            "avg": avg,
+            "sell_avg": sell_avg,
+            "buy_qty": buy_qty,
+            "sell_qty": sell_qty,
+            "candles": candles,
+            "is_estimate": False,  # 실제 체결 구분 기반 정밀값
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @app.get("/api/kis-program-debug")
