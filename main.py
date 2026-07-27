@@ -1173,6 +1173,36 @@ def krx_fut_debug(bas_dd: str = ""):
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/kis-fut-minute-debug")
+def kis_fut_minute_debug(iscd: str = "101000", hour_cls: str = "60"):
+    """
+    디버그 전용: '선물옵션 분봉조회' 원본 응답 그대로 반환.
+    iscd 기본값 101000 = "최근월물 연속코드" 주장을 테스트해봄 (틀릴 수도 있음).
+    """
+    if not KIS_APP_KEY or not KIS_APP_SECRET:
+        return {"ok": False, "error": "KIS_APP_KEY / KIS_APP_SECRET 환경변수가 설정되어 있지 않습니다."}
+    try:
+        now_str = now_kst().strftime("%H%M%S")
+        today_str = now_kst().strftime("%Y%m%d")
+        data = kis_get(
+            "/uapi/domestic-futureoption/v1/quotations/inquire-time-fuopchartprice",
+            tr_id="FHKIF03020200",
+            params={
+                "FID_COND_MRKT_DIV_CODE": "F",
+                "FID_INPUT_ISCD": iscd,
+                "FID_HOUR_CLS_CODE": hour_cls,
+                "FID_PW_DATA_INCU_YN": "N",
+                "FID_FAKE_TICK_INCU_YN": "N",
+                "FID_INPUT_DATE_1": today_str,
+                "FID_INPUT_HOUR_1": now_str,
+            },
+        )
+        print(f"[kis_fut_minute_debug] iscd={iscd} raw={data}")
+        return {"ok": True, "raw": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/kis-member-debug")
 def kis_member_debug(code: str):
     """
