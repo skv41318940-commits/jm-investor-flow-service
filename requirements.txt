@@ -3,4 +3,6 @@ uvicorn
 pykrx
 supabase
 requests
+websockets
+tvdatafeed
 
