@@ -44,6 +44,12 @@ KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
 # ── FRED (미국 연방준비제도 공식 경제데이터) — 美 국채금리 등 ──
 FRED_API_KEY = os.environ.get("FRED_API_KEY")
 
+# ── KRX 자체 Open API (openapi.krx.co.kr) — 코스피200 선물 등 파생상품 ──
+KRX_AUTH_KEY = os.environ.get("KRX_AUTH_KEY")
+
+# ── FMP (Financial Modeling Prep) — 니켈 등 원자재 ──
+FMP_API_KEY = os.environ.get("FMP_API_KEY")
+
 app = FastAPI(title="JM Investor Flow Cloud Service")
 app.add_middleware(
     CORSMiddleware,
@@ -359,8 +365,12 @@ async def _ws_worker():
 
         try:
             approval_key = get_ws_approval_key()
-            krx_codes = _get_watchlist_codes()
+            watchlist_codes = _get_watchlist_codes()
             nxt_codes = NXT_ELIGIBLE_CODES
+            # NXT 되는 종목은 당연히 KRX 정규장에도 상장돼 있으므로, 이 608개는 KRX(H0STCNT0)도
+            # 항상 같이 구독해서 프리마켓~정규장~애프터마켓 하루 전체가 정밀하게 나오게 함.
+            # 관심종목 중 NXT 목록에 없는 것들만 KRX 단독으로 추가 구독.
+            krx_codes = sorted(set(nxt_codes) | set(watchlist_codes))
             if not krx_codes and not nxt_codes:
                 print("[ws_worker] 구독할 종목이 없어 잠시 대기합니다.")
                 await asyncio.sleep(300)
@@ -381,7 +391,7 @@ async def _ws_worker():
                     }
                     await ws.send(json.dumps(sub))
                     await asyncio.sleep(0.05)
-                print(f"[ws_worker] KRX {len(krx_codes)}개(관심종목) + NXT {len(nxt_codes)}개(전체) 구독 요청 완료")
+                print(f"[ws_worker] KRX {len(krx_codes)}개(NXT608+관심종목) + NXT {len(nxt_codes)}개(전체) 구독 요청 완료")
 
                 last_flush = time.time()
                 last_refresh = time.time()
@@ -410,7 +420,8 @@ async def _ws_worker():
 
                     # 5분마다 관심종목 목록 갱신 (새로 추가된 종목 구독, NXT 608개는 고정이라 갱신 안 함)
                     if time.time() - last_refresh > 300:
-                        new_krx_codes = _get_watchlist_codes()
+                        new_watchlist = _get_watchlist_codes()
+                        new_krx_codes = sorted(set(nxt_codes) | set(new_watchlist))
                         added = [c for c in new_krx_codes if c not in krx_codes]
                         for code in added:
                             sub = {
@@ -1063,6 +1074,59 @@ def kis_interest_debug(div_cls: str = "", div_cls1: str = ""):
         )
         print(f"[kis_interest_debug] div_cls={div_cls} div_cls1={div_cls1} raw={data}")
         return {"ok": True, "raw": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/fmp-commodities-debug")
+def fmp_commodities_debug():
+    """디버그 전용: FMP 지원 원자재 심볼 목록 (니켈 심볼 확인용)."""
+    if not FMP_API_KEY:
+        return {"ok": False, "error": "FMP_API_KEY 환경변수가 설정되어 있지 않습니다."}
+    try:
+        res = requests.get(
+            "https://financialmodelingprep.com/api/v3/symbol/available-commodities",
+            params={"apikey": FMP_API_KEY},
+            timeout=10,
+        )
+        print(f"[fmp_commodities_debug] status={res.status_code} body={res.text[:2000]}")
+        return {"ok": True, "status": res.status_code, "raw": res.text[:3000]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/fmp-nickel-debug")
+def fmp_nickel_debug(symbol: str = "NIUSD"):
+    """디버그 전용: FMP 니켈 시세 조회 시도 (심볼 확실치 않아 파라미터로 바꿔볼 수 있게 함)."""
+    if not FMP_API_KEY:
+        return {"ok": False, "error": "FMP_API_KEY 환경변수가 설정되어 있지 않습니다."}
+    try:
+        res = requests.get(
+            f"https://financialmodelingprep.com/api/v3/quote/{symbol}",
+            params={"apikey": FMP_API_KEY},
+            timeout=10,
+        )
+        print(f"[fmp_nickel_debug] symbol={symbol} status={res.status_code} body={res.text[:1000]}")
+        return {"ok": True, "status": res.status_code, "raw": res.text[:2000]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/krx-fut-debug")
+def krx_fut_debug(bas_dd: str = ""):
+    """디버그 전용: KRX Open API '선물 일별매매정보' 원본 응답 그대로 반환."""
+    if not KRX_AUTH_KEY:
+        return {"ok": False, "error": "KRX_AUTH_KEY 환경변수가 설정되어 있지 않습니다."}
+    try:
+        bas_dd = bas_dd or now_kst().strftime("%Y%m%d")
+        res = requests.get(
+            "http://data-dbg.krx.co.kr/svc/apis/drv/fut_bydd_trd",
+            headers={"AUTH_KEY": KRX_AUTH_KEY},
+            params={"basDd": bas_dd},
+            timeout=10,
+        )
+        print(f"[krx_fut_debug] status={res.status_code} bas_dd={bas_dd} body={res.text[:2000]}")
+        return {"ok": True, "status": res.status_code, "raw": res.text[:3000]}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
