@@ -1085,7 +1085,7 @@ def fmp_commodities_debug():
         return {"ok": False, "error": "FMP_API_KEY 환경변수가 설정되어 있지 않습니다."}
     try:
         res = requests.get(
-            "https://financialmodelingprep.com/api/v3/symbol/available-commodities",
+            "https://financialmodelingprep.com/stable/commodities-list",
             params={"apikey": FMP_API_KEY},
             timeout=10,
         )
@@ -1102,14 +1102,56 @@ def fmp_nickel_debug(symbol: str = "NIUSD"):
         return {"ok": False, "error": "FMP_API_KEY 환경변수가 설정되어 있지 않습니다."}
     try:
         res = requests.get(
-            f"https://financialmodelingprep.com/api/v3/quote/{symbol}",
-            params={"apikey": FMP_API_KEY},
+            "https://financialmodelingprep.com/stable/quote",
+            params={"symbol": symbol, "apikey": FMP_API_KEY},
             timeout=10,
         )
         print(f"[fmp_nickel_debug] symbol={symbol} status={res.status_code} body={res.text[:1000]}")
         return {"ok": True, "status": res.status_code, "raw": res.text[:2000]}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/krx-fut-price")
+def krx_fut_price_endpoint(prod_name: str = "코스피200 선물"):
+    """
+    KRX Open API '선물 일별매매정보'에서 지정 상품(기본: 코스피200 선물)의
+    정규장 데이터 중 거래량이 가장 많은(=근월물) 계약을 골라 반환.
+    저장 없이 매번 그 자리에서 조회 (하루 10,000회 한도라 30초 폴링에도 넉넉함).
+    """
+    if not KRX_AUTH_KEY:
+        return {"error": "KRX_AUTH_KEY 환경변수가 설정되어 있지 않습니다."}
+    try:
+        rows = []
+        for back in range(5):  # 주말/공휴일 대비 최대 5일 소급
+            bas_dd = (now_kst() - timedelta(days=back)).strftime("%Y%m%d")
+            res = requests.get(
+                "https://data-dbg.krx.co.kr/svc/apis/drv/fut_bydd_trd",
+                headers={"AUTH_KEY": KRX_AUTH_KEY},
+                params={"basDd": bas_dd},
+                timeout=10,
+            )
+            res.raise_for_status()
+            rows = res.json().get("OutBlock_1", [])
+            if rows:
+                break
+
+        candidates = [
+            r for r in rows
+            if r.get("PROD_NM") == prod_name and r.get("MKT_NM") == "정규" and r.get("TDD_CLSPRC")
+        ]
+        if not candidates:
+            return {"error": f"{prod_name} 데이터를 찾을 수 없습니다."}
+
+        best = max(candidates, key=lambda r: float(r.get("ACC_TRDVOL", 0) or 0))
+        price = float(best["TDD_CLSPRC"])
+        change = float(best["CMPPREVDD_PRC"] or 0)
+        prev_price = price - change
+        change_pct = round((change / prev_price) * 100, 2) if prev_price else 0
+
+        return {"price": price, "change": change, "change_pct": change_pct, "name": best.get("ISU_NM", prod_name)}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @app.get("/api/krx-fut-debug")
