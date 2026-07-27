@@ -4,5 +4,4 @@ pykrx
 supabase
 requests
 websockets
-tvdatafeed
 

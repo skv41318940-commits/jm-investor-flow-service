@@ -1220,37 +1220,6 @@ def kis_fut_price_endpoint(iscd: str = "101000"):
         return {"error": str(e)}
 
 
-_tv_client = None  # 지연 초기화 — 앱 시작할 때 미리 연결 시도하면 실패 시 전체 서버가 안 뜰 수 있어서
-
-
-def _get_tv_client():
-    global _tv_client
-    if _tv_client is None:
-        from tvdatafeed import TvDatafeed
-        _tv_client = TvDatafeed()
-    return _tv_client
-
-
-@app.get("/api/tv-nickel-debug")
-def tv_nickel_debug(symbol: str = "NI", exchange: str = "LME"):
-    """
-    디버그 전용: tvDatafeed(비공식 트레이딩뷰 스크래핑 라이브러리)로 니켈 시세 조회 시도.
-    실패하면(Render IP 차단, 라이브러리 깨짐 등) 에러 메시지 그대로 반환.
-    """
-    try:
-        from tvdatafeed import Interval as TvInterval
-
-        tv = _get_tv_client()
-        df = tv.get_hist(symbol=symbol, exchange=exchange, interval=TvInterval.in_1_minute, n_bars=5)
-        if df is None or df.empty:
-            return {"ok": False, "error": "빈 데이터가 반환되었습니다."}
-        print(f"[tv_nickel_debug] symbol={symbol} exchange={exchange} tail=\n{df.tail()}")
-        return {"ok": True, "raw": df.tail().to_dict(orient="records")}
-    except Exception as e:
-        print(f"[tv_nickel_debug] 실패: {e}")
-        return {"ok": False, "error": str(e)}
-
-
 @app.get("/api/kis-fut-minute-debug")
 def kis_fut_minute_debug(iscd: str = "101000", hour_cls: str = "60"):
     """
