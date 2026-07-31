@@ -365,33 +365,24 @@ async def _ws_worker():
 
         try:
             approval_key = get_ws_approval_key()
-            watchlist_codes = _get_watchlist_codes()
-            nxt_codes = NXT_ELIGIBLE_CODES
-            # NXT 되는 종목은 당연히 KRX 정규장에도 상장돼 있으므로, 이 608개는 KRX(H0STCNT0)도
-            # 항상 같이 구독해서 프리마켓~정규장~애프터마켓 하루 전체가 정밀하게 나오게 함.
-            # 관심종목 중 NXT 목록에 없는 것들만 KRX 단독으로 추가 구독.
-            krx_codes = sorted(set(nxt_codes) | set(watchlist_codes))
-            if not krx_codes and not nxt_codes:
+            # ⚠️ NXT 608개 전체 구독은 한투 웹소켓 실제 한도(MAX SUBSCRIBE OVER)를 넘어서
+            # 연결이 계속 끊기는 문제가 있어 되돌림. 관심종목 + 최근 조회한 종목만 구독.
+            codes = _get_watchlist_codes()
+            if not codes:
                 print("[ws_worker] 구독할 종목이 없어 잠시 대기합니다.")
                 await asyncio.sleep(300)
                 continue
 
             async with websockets.connect(KIS_WS_URL, ping_interval=None) as ws:
-                for code in krx_codes:
-                    sub = {
-                        "header": {"approval_key": approval_key, "custtype": "P", "tr_type": "1", "content-type": "utf-8"},
-                        "body": {"input": {"tr_id": "H0STCNT0", "tr_key": code}},
-                    }
-                    await ws.send(json.dumps(sub))
-                    await asyncio.sleep(0.05)
-                for code in nxt_codes:
-                    sub = {
-                        "header": {"approval_key": approval_key, "custtype": "P", "tr_type": "1", "content-type": "utf-8"},
-                        "body": {"input": {"tr_id": "H0NXCNT0", "tr_key": code}},
-                    }
-                    await ws.send(json.dumps(sub))
-                    await asyncio.sleep(0.05)
-                print(f"[ws_worker] KRX {len(krx_codes)}개(NXT608+관심종목) + NXT {len(nxt_codes)}개(전체) 구독 요청 완료")
+                for code in codes:
+                    for tr_id in ("H0STCNT0", "H0NXCNT0"):
+                        sub = {
+                            "header": {"approval_key": approval_key, "custtype": "P", "tr_type": "1", "content-type": "utf-8"},
+                            "body": {"input": {"tr_id": tr_id, "tr_key": code}},
+                        }
+                        await ws.send(json.dumps(sub))
+                        await asyncio.sleep(0.1)
+                print(f"[ws_worker] {len(codes)}개 종목 구독 요청 완료 (KRX+NXT, 관심종목+최근조회)")
 
                 last_flush = time.time()
                 last_refresh = time.time()
@@ -420,16 +411,16 @@ async def _ws_worker():
 
                     # 5분마다 관심종목 목록 갱신 (새로 추가된 종목 구독, NXT 608개는 고정이라 갱신 안 함)
                     if time.time() - last_refresh > 300:
-                        new_watchlist = _get_watchlist_codes()
-                        new_krx_codes = sorted(set(nxt_codes) | set(new_watchlist))
-                        added = [c for c in new_krx_codes if c not in krx_codes]
+                        new_codes = _get_watchlist_codes()
+                        added = [c for c in new_codes if c not in codes]
                         for code in added:
-                            sub = {
-                                "header": {"approval_key": approval_key, "custtype": "P", "tr_type": "1", "content-type": "utf-8"},
-                                "body": {"input": {"tr_id": "H0STCNT0", "tr_key": code}},
-                            }
-                            await ws.send(json.dumps(sub))
-                        krx_codes = new_krx_codes
+                            for tr_id in ("H0STCNT0", "H0NXCNT0"):
+                                sub = {
+                                    "header": {"approval_key": approval_key, "custtype": "P", "tr_type": "1", "content-type": "utf-8"},
+                                    "body": {"input": {"tr_id": tr_id, "tr_key": code}},
+                                }
+                                await ws.send(json.dumps(sub))
+                        codes = new_codes
                         last_refresh = time.time()
 
                 _flush_tick_buckets()
