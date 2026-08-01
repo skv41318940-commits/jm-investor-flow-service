@@ -1241,6 +1241,38 @@ def kis_fut_minute_debug(iscd: str = "101000", hour_cls: str = "60"):
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/kis-updown-debug")
+def kis_updown_debug(mkop_cls: str = "0", sort_cls: str = "6"):
+    """
+    디버그 전용: '국내주식 예상체결 상승/하락상위' 원본 응답 그대로 반환.
+    mkop_cls: 0=장전예상, 1=장마감예상 (평일 08:30~09:00 / 15:20~15:30에 테스트해야 의미 있음)
+    sort_cls: 6=거래대금 기준 정렬 (기본값)
+    """
+    if not KIS_APP_KEY or not KIS_APP_SECRET:
+        return {"ok": False, "error": "KIS_APP_KEY / KIS_APP_SECRET 환경변수가 설정되어 있지 않습니다."}
+    try:
+        data = kis_get(
+            "/uapi/domestic-stock/v1/ranking/exp-trans-updown",
+            tr_id="FHPST01820000",
+            params={
+                "fid_rank_sort_cls_code": sort_cls,
+                "fid_cond_mrkt_div_code": "J",
+                "fid_cond_scr_div_code": "20182",
+                "fid_input_iscd": "0000",
+                "fid_div_cls_code": "0",
+                "fid_aply_rang_prc_1": "",
+                "fid_vol_cnt": "",
+                "fid_pbmn": "",
+                "fid_blng_cls_code": "0",
+                "fid_mkop_cls_code": mkop_cls,
+            },
+        )
+        print(f"[kis_updown_debug] mkop_cls={mkop_cls} raw={data}")
+        return {"ok": True, "raw": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/kis-member-debug")
 def kis_member_debug(code: str):
     """
