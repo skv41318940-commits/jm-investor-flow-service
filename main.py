@@ -812,6 +812,100 @@ def tick_avg_endpoint(code: str, market: str = "KRX", date: str = "", start: str
         return {"error": str(e)}
 
 
+# ── 프리마켓(NXT) → 정규장(KRX) → 애프터마켓(NXT) 세 구간의 경계 시각.
+# NXT는 08:00~20:00 사이 계속 열려있고 KRX 정규장(09:00~15:30)과 겹치지만, 이 프로젝트는
+# 정규장 시간대엔 KRX를 대표 데이터로 쓰기로 했으므로 그 구간의 NXT 체결은 통합 곡선에서
+# 제외함. 15:30 정각은 KRX 정규장 마감 틱으로 간주하고, NXT 애프터마켓은 15:31부터로
+# 나눠서 같은 분(minute)이 두 시장에 중복으로 잡히는 걸 막음.
+_NXT_PRE_START, _NXT_PRE_END = "08:00", "08:50"
+_KRX_REGULAR_START, _KRX_REGULAR_END = "09:00", "15:30"
+_NXT_AFTER_START, _NXT_AFTER_END = "15:31", "20:00"
+
+
+def _in_combined_session(row: dict) -> bool:
+    m, mkt = row.get("minute", ""), row.get("market", "")
+    if mkt == "NXT" and _NXT_PRE_START <= m <= _NXT_PRE_END:
+        return True
+    if mkt == "KRX" and _KRX_REGULAR_START <= m <= _KRX_REGULAR_END:
+        return True
+    if mkt == "NXT" and _NXT_AFTER_START <= m <= _NXT_AFTER_END:
+        return True
+    return False
+
+
+@app.get("/api/tick-avg-combined")
+def tick_avg_combined_endpoint(code: str, date: str = ""):
+    """
+    프리마켓(NXT 08:00~08:50) → 정규장(KRX 09:00~15:30) → 애프터마켓(NXT 15:31~20:00)을
+    하나로 이어붙인 "하루 전체 통합 세력평단". tick_minute_flow에 market 컬럼으로 이미
+    KRX/NXT가 같이 저장돼있어서, 시간대로만 구간을 나눠 순서대로 누적함 — 기존 KRX
+    정밀 세력평단(/api/tick-avg)이나 NXT 세력평단과 별개로, 이 셋을 하나로 합친 값.
+    date 비우면 오늘. 그날 하루치가 다 없으면(예: 아직 정규장 진행 중) 있는 구간까지만 계산.
+    """
+    trade_date = date or now_kst().strftime("%Y-%m-%d")
+    try:
+        res = (
+            supabase.table("tick_minute_flow")
+            .select("*")
+            .eq("stock_code", code)
+            .eq("trade_date", trade_date)
+            .order("minute", desc=False)
+            .execute()
+        )
+        rows = [r for r in res.data if _in_combined_session(r)]
+        if not rows:
+            return {
+                "error": "해당 날짜의 프리마켓·정규장·애프터마켓 구간에 누적된 정밀 데이터가 없습니다."
+            }
+
+        rows.sort(key=lambda r: (r["minute"], r["market"]))
+
+        buy_qty_total = sum(r["buy_qty"] for r in rows)
+        buy_value_total = sum(r["buy_value"] for r in rows)
+        sell_qty_total = sum(r["sell_qty"] for r in rows)
+        sell_value_total = sum(r["sell_value"] for r in rows)
+
+        avg = round(buy_value_total / buy_qty_total, 1) if buy_qty_total > 0 else 0
+        sell_avg = round(sell_value_total / sell_qty_total, 1) if sell_qty_total > 0 else 0
+
+        candles = []
+        cum_buy_qty = 0.0
+        cum_buy_value = 0.0
+        cum_sell_qty = 0.0
+        cum_sell_value = 0.0
+        for r in rows:
+            cum_buy_qty += r["buy_qty"]
+            cum_buy_value += r["buy_value"]
+            cum_sell_qty += r["sell_qty"]
+            cum_sell_value += r["sell_value"]
+            session = (
+                "premarket" if r["market"] == "NXT" and r["minute"] <= _NXT_PRE_END else
+                "aftermarket" if r["market"] == "NXT" else
+                "regular"
+            )
+            candles.append(
+                {
+                    "label": r["minute"],
+                    "session": session,
+                    "avg_price": round(cum_buy_value / cum_buy_qty, 1) if cum_buy_qty > 0 else 0,
+                    "sell_avg_price": round(cum_sell_value / cum_sell_qty, 1) if cum_sell_qty > 0 else 0,
+                }
+            )
+
+        return {
+            "code": code,
+            "trade_date": trade_date,
+            "avg": avg,
+            "sell_avg": sell_avg,
+            "buy_qty": buy_qty_total,
+            "sell_qty": sell_qty_total,
+            "candles": candles,
+            "is_estimate": False,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/api/kis-program-debug")
 def kis_program_debug(code: str):
     """
