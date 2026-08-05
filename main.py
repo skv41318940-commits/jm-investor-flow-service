@@ -187,6 +187,16 @@ NXT_ELIGIBLE_CODES = [
 ]
 
 
+# ⚠️ 한투 실시간 등록 한도는 "실시간체결가+호가+예상체결+체결통보 합산 41건" —
+# (TR ID, 종목코드) 조합 하나하나를 1건으로 셈. 지금 코드는 종목 1개당
+# H0STCNT0(KRX)+H0NXCNT0(NXT) 2건을 쓰므로, 실제 최대 종목 수는 41 ÷ 2 = 20개.
+# 이 숫자를 넘기면 MAX SUBSCRIBE OVER로 웹소켓 연결이 계속 끊기니 절대 건드리지 말 것.
+NXT_WS_SUBSCRIBE_LIMIT = 20
+
+# NXT 608종목 자동 스캔을 하루 1번만 돌리는 기준 시각 (정규장 마감 직후, KST)
+NXT_SCAN_HOUR = 15
+NXT_SCAN_MINUTE = 35
+
 _tick_buckets: dict = {}  # (code, market, trade_date, minute) -> {"buy_qty","buy_value","sell_qty","sell_value"}
 _tick_lock = threading.Lock()
 _ws_debug_count = 0  # 처음 몇 개 메시지만 원본 로그 남겨서 필드 위치 검증용
@@ -312,29 +322,156 @@ def _flush_tick_buckets():
             print(f"[tick_flush] {code} {market} {minute} 저장 실패: {e}")
 
 
-def _get_watchlist_codes() -> list:
-    """관심종목 + 최근 14일 이내 조회했던 종목(Control/종목분석에서 검색한 것들) 합쳐서 반환"""
-    codes = set()
+def fetch_nxt_scan_scores(limit: int = 30):
+    """
+    NXT 거래가능 608종목(NXT_ELIGIBLE_CODES) 전체를 당일 일봉 기준으로 스캔해서
+    점수 = 거래대금(억원) × (1 + |등락률(%)| ÷ 10) 상위 종목을 추려냄.
+    fetch_volume_top30()과 같은 패턴 — ALL 마켓을 한 번에 불러온 뒤 NXT 대상만 필터링해서
+    608종목 각각을 따로 조회하지 않음 (API 호출 1번으로 끝).
+    """
+    ymd = _latest_trading_day()
+    df = stock.get_market_ohlcv_by_ticker(ymd, market="ALL")
+    print(f"[nxt_scan] date={ymd} rows={len(df)}")
+
+    if df.empty:
+        raise ValueError(f"KRX에서 {ymd} 시세 데이터를 가져오지 못했습니다.")
+
+    eligible = set(NXT_ELIGIBLE_CODES)
+    df = df[df.index.isin(eligible)]
+    if df.empty:
+        raise ValueError("NXT 대상종목과 매칭되는 시세 데이터가 없습니다. NXT_ELIGIBLE_CODES 목록이 오래됐을 수 있습니다.")
+
+    scored = []
+    for code, row in df.iterrows():
+        trading_value_eok = round(float(row.get("거래대금", 0)) / 1e8, 1)  # 억원
+        change_pct = float(row.get("등락률", 0))
+        score = trading_value_eok * (1 + abs(change_pct) / 10)
+        scored.append({"code": code, "trading_value": trading_value_eok, "change_pct": change_pct, "score": score})
+
+    scored.sort(key=lambda r: r["score"], reverse=True)
+    trade_date = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}"
+
+    rows = []
+    for i, r in enumerate(scored[:limit], start=1):
+        try:
+            name = stock.get_market_ticker_name(r["code"])
+        except Exception:
+            name = r["code"]
+        rows.append(
+            {
+                "scan_date": trade_date,
+                "rank": i,
+                "stock_code": r["code"],
+                "stock_name": name,
+                "score": round(r["score"], 2),
+                "trading_value": r["trading_value"],
+                "change_pct": r["change_pct"],
+            }
+        )
+    return rows
+
+
+def _ensure_nxt_ranking_cached():
+    """
+    오늘자 NXT 스캔 캐시(nxt_daily_ranking)가 이미 있으면 아무것도 안 함.
+    없고 지금이 스캔 기준시각(15:35) 이후면 그때 딱 1번 스캔해서 채워둠.
+    (스캔 기준시각 전이거나 주말이면 조용히 넘어감 — ws_worker가 5분마다 다시 확인)
+    """
+    today_str = now_kst().strftime("%Y-%m-%d")
     try:
-        res = supabase.table("watchlist").select("code").execute()
-        codes |= {r["code"] for r in res.data if r.get("code")}
+        existing = (
+            supabase.table("nxt_daily_ranking").select("stock_code").eq("scan_date", today_str).limit(1).execute()
+        )
+        if existing.data:
+            return
+    except Exception as e:
+        print(f"[nxt_ranking] 캐시 확인 실패: {e}")
+        return
+
+    now = now_kst()
+    if now.weekday() >= 5:
+        return
+    scan_time = now.replace(hour=NXT_SCAN_HOUR, minute=NXT_SCAN_MINUTE, second=0, microsecond=0)
+    if now < scan_time:
+        return
+
+    try:
+        rows = fetch_nxt_scan_scores(limit=30)
+        supabase.table("nxt_daily_ranking").delete().eq("scan_date", today_str).execute()
+        supabase.table("nxt_daily_ranking").insert(rows).execute()
+        print(f"[nxt_ranking] {today_str} 스캔 완료, {len(rows)}종목 캐싱")
+    except Exception as e:
+        print(f"[nxt_ranking] 스캔 실패: {e}")
+
+
+def _get_nxt_ranking_codes(limit: int) -> list:
+    """오늘자 NXT 스캔 캐시에서 점수 상위 종목코드만 필요한 개수만큼 반환 (없으면 빈 리스트)"""
+    if limit <= 0:
+        return []
+    today_str = now_kst().strftime("%Y-%m-%d")
+    try:
+        res = (
+            supabase.table("nxt_daily_ranking")
+            .select("stock_code")
+            .eq("scan_date", today_str)
+            .order("rank")
+            .limit(limit)
+            .execute()
+        )
+        return [r["stock_code"] for r in res.data]
+    except Exception as e:
+        print(f"[nxt_ranking] 조회 실패: {e}")
+        return []
+
+
+def _get_watchlist_codes() -> list:
+    """
+    웹소켓 구독 목록을 NXT_WS_SUBSCRIBE_LIMIT(20개) 상한 안에서 우선순위대로 채움:
+      1) NXT 전용 관심종목 (최대 10개) — 무조건 포함
+      2) 일반 관심종목(watchlist)
+      3) 최근 14일 이내 조회한 종목(Control/종목분석 검색 이력) — 최근 조회일 순
+      4) 그래도 남는 슬롯 — 오늘자 NXT 608종목 자동 스캔 점수 상위로 채움
+         (당일 15:35 스캔 전이면 캐시가 없어서 이 단계는 빈 목록 → 3번까지만 채워짐)
+    """
+    codes: list = []
+    seen = set()
+
+    def add(new_codes):
+        for c in new_codes:
+            if c and c not in seen and len(codes) < NXT_WS_SUBSCRIBE_LIMIT:
+                seen.add(c)
+                codes.append(c)
+
+    try:
+        res0 = supabase.table("nxt_watchlist").select("stock_code").order("added_at").execute()
+        add([r["stock_code"] for r in res0.data])
+    except Exception as e:
+        print(f"[nxt_watchlist] 조회 실패: {e}")
+
+    try:
+        res1 = supabase.table("watchlist").select("code").execute()
+        add([r["code"] for r in res1.data])
     except Exception as e:
         print(f"[watchlist] 조회 실패: {e}")
 
     try:
         cutoff = (now_kst() - timedelta(days=14)).isoformat()
-        res2 = supabase.table("tick_tracked_codes").select("stock_code").gte("last_requested_at", cutoff).execute()
-        codes |= {r["stock_code"] for r in res2.data if r.get("stock_code")}
+        res2 = (
+            supabase.table("tick_tracked_codes")
+            .select("stock_code")
+            .gte("last_requested_at", cutoff)
+            .order("last_requested_at", desc=True)
+            .execute()
+        )
+        add([r["stock_code"] for r in res2.data])
     except Exception as e:
         print(f"[tick_tracked_codes] 조회 실패: {e}")
 
-    try:
-        res3 = supabase.table("nxt_watchlist").select("stock_code").execute()
-        codes |= {r["stock_code"] for r in res3.data if r.get("stock_code")}
-    except Exception as e:
-        print(f"[nxt_watchlist] 조회 실패: {e}")
+    remaining = NXT_WS_SUBSCRIBE_LIMIT - len(codes)
+    if remaining > 0:
+        add(_get_nxt_ranking_codes(remaining))
 
-    return sorted(codes)
+    return codes
 
 
 @app.get("/api/nxt-watchlist")
@@ -373,6 +510,42 @@ def nxt_watchlist_remove(code: str):
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/sync-nxt-ranking")
+def sync_nxt_ranking_endpoint(limit: int = 30, force: bool = False):
+    """
+    NXT 608종목 자동 스캔을 지금 바로 실행 (디버그/수동 트리거용).
+    평소엔 ws_worker가 15:35 이후 자동으로 1회만 실행하므로 이 엔드포인트를 직접 부를 일은
+    거의 없지만, 그날 결과를 미리 확인하거나 재스캔하고 싶을 때 사용. force=true면
+    오늘자 캐시가 있어도 덮어씀.
+    """
+    try:
+        today_str = now_kst().strftime("%Y-%m-%d")
+        if not force:
+            existing = (
+                supabase.table("nxt_daily_ranking").select("stock_code").eq("scan_date", today_str).limit(1).execute()
+            )
+            if existing.data:
+                return {"ok": True, "skipped": True, "message": "오늘자 스캔이 이미 있습니다 (force=true로 재스캔 가능)"}
+
+        rows = fetch_nxt_scan_scores(limit=limit)
+        supabase.table("nxt_daily_ranking").delete().eq("scan_date", today_str).execute()
+        supabase.table("nxt_daily_ranking").insert(rows).execute()
+        return {"ok": True, "synced": len(rows), "scan_date": today_str}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/nxt-ranking")
+def nxt_ranking_endpoint(date: str = ""):
+    """오늘자(또는 지정 날짜, YYYY-MM-DD) NXT 스캔 순위 조회 — 프론트엔드 표시용"""
+    trade_date = date or now_kst().strftime("%Y-%m-%d")
+    try:
+        res = supabase.table("nxt_daily_ranking").select("*").eq("scan_date", trade_date).order("rank").execute()
+        return {"ok": True, "scan_date": trade_date, "items": res.data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/track-code")
 def track_code_endpoint(code: str):
     """
@@ -407,8 +580,11 @@ async def _ws_worker():
 
         try:
             approval_key = get_ws_approval_key()
-            # ⚠️ NXT 608개 전체 구독은 한투 웹소켓 실제 한도(MAX SUBSCRIBE OVER)를 넘어서
-            # 연결이 계속 끊기는 문제가 있어 되돌림. 관심종목 + 최근 조회한 종목만 구독.
+            # ⚠️ NXT 608개 전체 구독은 한투 웹소켓 실제 한도(등록 41건 = 종목 20개, KRX+NXT
+            # 2건씩)를 훌쩍 넘어서 MAX SUBSCRIBE OVER로 계속 끊기는 문제가 있어 되돌림.
+            # NXT 관심종목(무조건) + 일반 관심종목 + 최근 조회종목 + NXT 자동 스캔 상위로
+            # 20개를 채움 — 자세한 우선순위는 _get_watchlist_codes() 참고.
+            _ensure_nxt_ranking_cached()
             codes = _get_watchlist_codes()
             if not codes:
                 print("[ws_worker] 구독할 종목이 없어 잠시 대기합니다.")
@@ -424,7 +600,7 @@ async def _ws_worker():
                         }
                         await ws.send(json.dumps(sub))
                         await asyncio.sleep(0.1)
-                print(f"[ws_worker] {len(codes)}개 종목 구독 요청 완료 (KRX+NXT, 관심종목+최근조회)")
+                print(f"[ws_worker] {len(codes)}개 종목({NXT_WS_SUBSCRIBE_LIMIT}개 상한) 구독 요청 완료 (KRX+NXT)")
 
                 last_flush = time.time()
                 last_refresh = time.time()
@@ -451,8 +627,10 @@ async def _ws_worker():
                         _flush_tick_buckets()
                         last_flush = time.time()
 
-                    # 5분마다 관심종목 목록 갱신 (새로 추가된 종목 구독, NXT 608개는 고정이라 갱신 안 함)
+                    # 5분마다 관심종목 목록 갱신 — 이때 NXT 스캔 캐시도 같이 확인해서,
+                    # 장중에 15:35를 넘기는 순간 자동으로 스캔 상위 종목이 채워지게 함
                     if time.time() - last_refresh > 300:
+                        _ensure_nxt_ranking_cached()
                         new_codes = _get_watchlist_codes()
                         added = [c for c in new_codes if c not in codes]
                         for code in added:
