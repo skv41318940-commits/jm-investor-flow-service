@@ -193,6 +193,10 @@ NXT_ELIGIBLE_CODES = [
 # 이 숫자를 넘기면 MAX SUBSCRIBE OVER로 웹소켓 연결이 계속 끊기니 절대 건드리지 말 것.
 NXT_WS_SUBSCRIBE_LIMIT = 20
 
+# NXT 608종목 스캔 결과를 캐시에 몇 개까지 저장해둘지 — 상한(20)보다 넉넉하게 잡아둬야
+# 상위권이 이미 일반 관심종목/최근추적과 겹쳐도 다음 순위로 자리를 채울 여지가 생김
+NXT_RANKING_POOL_SIZE = 30
+
 # NXT 608종목 자동 스캔을 하루 1번만 돌리는 기준 시각 (정규장 마감 직후, KST)
 NXT_SCAN_HOUR = 15
 NXT_SCAN_MINUTE = 35
@@ -322,7 +326,7 @@ def _flush_tick_buckets():
             print(f"[tick_flush] {code} {market} {minute} 저장 실패: {e}")
 
 
-def fetch_nxt_scan_scores(limit: int = 30):
+def fetch_nxt_scan_scores(limit: int = NXT_RANKING_POOL_SIZE):
     """
     NXT 거래가능 608종목(NXT_ELIGIBLE_CODES) 전체를 당일 일봉 기준으로 스캔해서
     점수 = 거래대금(억원) × (1 + |등락률(%)| ÷ 10) 상위 종목을 추려냄.
@@ -412,7 +416,7 @@ def _ensure_nxt_ranking_cached():
         return
 
     try:
-        rows = fetch_nxt_scan_scores(limit=30)
+        rows = fetch_nxt_scan_scores(limit=NXT_RANKING_POOL_SIZE)
         supabase.table("nxt_daily_ranking").delete().eq("scan_date", trade_date).execute()
         supabase.table("nxt_daily_ranking").insert(rows).execute()
         print(f"[nxt_ranking] {trade_date} 스캔 완료, {len(rows)}종목 캐싱")
@@ -494,9 +498,11 @@ def _get_watchlist_codes() -> list:
     except Exception as e:
         print(f"[tick_tracked_codes] 조회 실패: {e}")
 
-    remaining = NXT_WS_SUBSCRIBE_LIMIT - len(codes)
-    if remaining > 0:
-        add(_get_nxt_ranking_codes(remaining))
+    # remaining 개수만 요청하면, 상위권이 이미 관심종목/최근추적과 겹칠 때 자리가
+    # 남아도 다음 순위를 못 가져와서 슬롯이 낭비됨 — 캐시 전체(30개)를 넘겨서
+    # add()가 중복 제외하며 남는 자리를 끝까지 채우게 함
+    if len(codes) < NXT_WS_SUBSCRIBE_LIMIT:
+        add(_get_nxt_ranking_codes(NXT_RANKING_POOL_SIZE))
 
     return codes
 
@@ -538,7 +544,7 @@ def nxt_watchlist_remove(code: str):
 
 
 @app.get("/api/sync-nxt-ranking")
-def sync_nxt_ranking_endpoint(limit: int = 30, force: bool = False):
+def sync_nxt_ranking_endpoint(limit: int = NXT_RANKING_POOL_SIZE, force: bool = False):
     """
     NXT 608종목 자동 스캔을 지금 바로 실행 (디버그/수동 트리거용).
     평소엔 ws_worker가 15:35 이후 자동으로 1회만 실행하므로 이 엔드포인트를 직접 부를 일은
@@ -620,9 +626,9 @@ def _get_watchlist_codes_with_source() -> list:
     except Exception as e:
         print(f"[tick_tracked_codes] 조회 실패: {e}")
 
-    remaining = NXT_WS_SUBSCRIBE_LIMIT - len(codes)
-    if remaining > 0:
-        add(_get_nxt_ranking_codes(remaining), "nxt_scan_ranking")
+    # 위와 같은 이유로 remaining이 아니라 캐시 전체를 넘겨서 자리 낭비 방지
+    if len(codes) < NXT_WS_SUBSCRIBE_LIMIT:
+        add(_get_nxt_ranking_codes(NXT_RANKING_POOL_SIZE), "nxt_scan_ranking")
 
     return codes
 
