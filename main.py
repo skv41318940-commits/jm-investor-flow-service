@@ -371,23 +371,23 @@ def fetch_nxt_scan_scores(limit: int = 30):
     return rows
 
 
+def _resolve_nxt_scan_trade_date() -> str:
+    """
+    지금 스캔하면 실제로 어느 거래일자(YYYY-MM-DD)로 기록될지 미리 계산.
+    ⚠️ now_kst()의 달력상 "오늘"과 다를 수 있음 — 예를 들어 정규장 마감(15:30) 전에
+    테스트하면 KRX에 아직 오늘자 일봉이 없어서 _latest_trading_day()가 어제로 잡힘.
+    저장/삭제/dedupe 체크를 이 값 하나로 통일해서 "오늘 날짜"와 "실제 스캔된 날짜"가
+    어긋나 중복 키 에러나 나거나 조회했을 때 텅 비어 보이는 문제를 막음.
+    """
+    ymd = _latest_trading_day()
+    return f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}"
+
+
 def _ensure_nxt_ranking_cached():
     """
-    오늘자 NXT 스캔 캐시(nxt_daily_ranking)가 이미 있으면 아무것도 안 함.
-    없고 지금이 스캔 기준시각(15:35) 이후면 그때 딱 1번 스캔해서 채워둠.
-    (스캔 기준시각 전이거나 주말이면 조용히 넘어감 — ws_worker가 5분마다 다시 확인)
+    스캔 기준시각(15:35) 이후, 그날 거래일 캐시가 아직 없으면 딱 1번 스캔해서 채워둠.
+    (기준시각 전이거나 주말이면 조용히 넘어감 — ws_worker가 5분마다 다시 확인)
     """
-    today_str = now_kst().strftime("%Y-%m-%d")
-    try:
-        existing = (
-            supabase.table("nxt_daily_ranking").select("stock_code").eq("scan_date", today_str).limit(1).execute()
-        )
-        if existing.data:
-            return
-    except Exception as e:
-        print(f"[nxt_ranking] 캐시 확인 실패: {e}")
-        return
-
     now = now_kst()
     if now.weekday() >= 5:
         return
@@ -396,24 +396,50 @@ def _ensure_nxt_ranking_cached():
         return
 
     try:
+        trade_date = _resolve_nxt_scan_trade_date()
+    except Exception as e:
+        print(f"[nxt_ranking] 거래일 확인 실패: {e}")
+        return
+
+    try:
+        existing = (
+            supabase.table("nxt_daily_ranking").select("stock_code").eq("scan_date", trade_date).limit(1).execute()
+        )
+        if existing.data:
+            return
+    except Exception as e:
+        print(f"[nxt_ranking] 캐시 확인 실패: {e}")
+        return
+
+    try:
         rows = fetch_nxt_scan_scores(limit=30)
-        supabase.table("nxt_daily_ranking").delete().eq("scan_date", today_str).execute()
+        supabase.table("nxt_daily_ranking").delete().eq("scan_date", trade_date).execute()
         supabase.table("nxt_daily_ranking").insert(rows).execute()
-        print(f"[nxt_ranking] {today_str} 스캔 완료, {len(rows)}종목 캐싱")
+        print(f"[nxt_ranking] {trade_date} 스캔 완료, {len(rows)}종목 캐싱")
     except Exception as e:
         print(f"[nxt_ranking] 스캔 실패: {e}")
 
 
 def _get_nxt_ranking_codes(limit: int) -> list:
-    """오늘자 NXT 스캔 캐시에서 점수 상위 종목코드만 필요한 개수만큼 반환 (없으면 빈 리스트)"""
+    """
+    가장 최근에 스캔된 NXT 순위에서 점수 상위 종목코드를 반환.
+    ⚠️ "오늘 날짜"로 정확히 맞추지 않고 "가장 최근 scan_date"를 찾음 — 그래야 그날
+    애프터마켓뿐 아니라 다음날 프리마켓(그 다음 스캔이 아직 안 돈 시점)에도 어제
+    캐시를 그대로 재사용할 수 있음.
+    """
     if limit <= 0:
         return []
-    today_str = now_kst().strftime("%Y-%m-%d")
     try:
+        latest = (
+            supabase.table("nxt_daily_ranking").select("scan_date").order("scan_date", desc=True).limit(1).execute()
+        )
+        if not latest.data:
+            return []
+        latest_date = latest.data[0]["scan_date"]
         res = (
             supabase.table("nxt_daily_ranking")
             .select("stock_code")
-            .eq("scan_date", today_str)
+            .eq("scan_date", latest_date)
             .order("rank")
             .limit(limit)
             .execute()
@@ -422,6 +448,7 @@ def _get_nxt_ranking_codes(limit: int) -> list:
     except Exception as e:
         print(f"[nxt_ranking] 조회 실패: {e}")
         return []
+
 
 
 def _get_watchlist_codes() -> list:
@@ -516,21 +543,28 @@ def sync_nxt_ranking_endpoint(limit: int = 30, force: bool = False):
     NXT 608종목 자동 스캔을 지금 바로 실행 (디버그/수동 트리거용).
     평소엔 ws_worker가 15:35 이후 자동으로 1회만 실행하므로 이 엔드포인트를 직접 부를 일은
     거의 없지만, 그날 결과를 미리 확인하거나 재스캔하고 싶을 때 사용. force=true면
-    오늘자 캐시가 있어도 덮어씀.
+    해당 거래일 캐시가 있어도 덮어씀.
+    ⚠️ 정규장 마감(15:30) 전에 테스트하면 KRX에 아직 오늘자 일봉이 없어서, scan_date가
+    "오늘"이 아니라 "가장 최근 완결된 거래일"(보통 어제)로 찍힐 수 있음 — 정상 동작.
     """
     try:
-        today_str = now_kst().strftime("%Y-%m-%d")
+        trade_date = _resolve_nxt_scan_trade_date()
         if not force:
             existing = (
-                supabase.table("nxt_daily_ranking").select("stock_code").eq("scan_date", today_str).limit(1).execute()
+                supabase.table("nxt_daily_ranking").select("stock_code").eq("scan_date", trade_date).limit(1).execute()
             )
             if existing.data:
-                return {"ok": True, "skipped": True, "message": "오늘자 스캔이 이미 있습니다 (force=true로 재스캔 가능)"}
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "scan_date": trade_date,
+                    "message": "이 거래일 스캔이 이미 있습니다 (force=true로 재스캔 가능)",
+                }
 
         rows = fetch_nxt_scan_scores(limit=limit)
-        supabase.table("nxt_daily_ranking").delete().eq("scan_date", today_str).execute()
+        supabase.table("nxt_daily_ranking").delete().eq("scan_date", trade_date).execute()
         supabase.table("nxt_daily_ranking").insert(rows).execute()
-        return {"ok": True, "synced": len(rows), "scan_date": today_str}
+        return {"ok": True, "synced": len(rows), "scan_date": trade_date}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
