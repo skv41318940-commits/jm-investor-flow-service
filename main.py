@@ -328,7 +328,49 @@ def _get_watchlist_codes() -> list:
     except Exception as e:
         print(f"[tick_tracked_codes] 조회 실패: {e}")
 
+    try:
+        res3 = supabase.table("nxt_watchlist").select("stock_code").execute()
+        codes |= {r["stock_code"] for r in res3.data if r.get("stock_code")}
+    except Exception as e:
+        print(f"[nxt_watchlist] 조회 실패: {e}")
+
     return sorted(codes)
+
+
+@app.get("/api/nxt-watchlist")
+def nxt_watchlist_list():
+    """NXT 전용 관심종목(최대 10개) 목록 조회"""
+    try:
+        res = supabase.table("nxt_watchlist").select("*").order("added_at").execute()
+        return {"ok": True, "items": res.data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/nxt-watchlist/add")
+def nxt_watchlist_add(code: str, name: str):
+    """NXT 전용 관심종목 추가 — 최대 10개까지만"""
+    try:
+        existing = supabase.table("nxt_watchlist").select("stock_code").execute()
+        codes = {r["stock_code"] for r in existing.data}
+        if code in codes:
+            return {"ok": True, "message": "이미 등록되어 있습니다."}
+        if len(codes) >= 10:
+            return {"ok": False, "error": "NXT 관심종목은 최대 10개까지만 등록할 수 있습니다."}
+        supabase.table("nxt_watchlist").insert({"stock_code": code, "stock_name": name}).execute()
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/nxt-watchlist/remove")
+def nxt_watchlist_remove(code: str):
+    """NXT 전용 관심종목 제거"""
+    try:
+        supabase.table("nxt_watchlist").delete().eq("stock_code", code).execute()
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/api/track-code")
