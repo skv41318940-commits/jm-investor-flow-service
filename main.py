@@ -546,6 +546,67 @@ def nxt_ranking_endpoint(date: str = ""):
         return {"ok": False, "error": str(e)}
 
 
+def _get_watchlist_codes_with_source() -> list:
+    """
+    _get_watchlist_codes()와 완전히 같은 우선순위 로직이지만, 각 종목이 어느 소스에서
+    왔는지(source)까지 같이 반환 — "왜 이 종목이 포함/제외됐는지" 확인용 디버그 전용.
+    실제 ws_worker는 이 함수가 아니라 _get_watchlist_codes()를 씀 (로직은 100% 동일).
+    """
+    codes: list = []
+    seen = set()
+
+    def add(new_codes, source):
+        for c in new_codes:
+            if c and c not in seen and len(codes) < NXT_WS_SUBSCRIBE_LIMIT:
+                seen.add(c)
+                codes.append({"code": c, "source": source})
+
+    try:
+        res0 = supabase.table("nxt_watchlist").select("stock_code").order("added_at").execute()
+        add([r["stock_code"] for r in res0.data], "nxt_watchlist")
+    except Exception as e:
+        print(f"[nxt_watchlist] 조회 실패: {e}")
+
+    try:
+        res1 = supabase.table("watchlist").select("code").execute()
+        add([r["code"] for r in res1.data], "watchlist")
+    except Exception as e:
+        print(f"[watchlist] 조회 실패: {e}")
+
+    try:
+        cutoff = (now_kst() - timedelta(days=14)).isoformat()
+        res2 = (
+            supabase.table("tick_tracked_codes")
+            .select("stock_code")
+            .gte("last_requested_at", cutoff)
+            .order("last_requested_at", desc=True)
+            .execute()
+        )
+        add([r["stock_code"] for r in res2.data], "recent_tracked_14d")
+    except Exception as e:
+        print(f"[tick_tracked_codes] 조회 실패: {e}")
+
+    remaining = NXT_WS_SUBSCRIBE_LIMIT - len(codes)
+    if remaining > 0:
+        add(_get_nxt_ranking_codes(remaining), "nxt_scan_ranking")
+
+    return codes
+
+
+@app.get("/api/ws-subscribe-preview")
+def ws_subscribe_preview_endpoint():
+    """
+    지금 이 순간 _get_watchlist_codes()가 만들어낼 실제 웹소켓 구독 목록(최대 20개)을
+    종목이 어느 소스(nxt_watchlist/watchlist/recent_tracked_14d/nxt_scan_ranking)에서
+    왔는지까지 보여주는 디버그 엔드포인트. "왜 이 종목만 됐지?" 확인할 때 이걸 쓰면 됨.
+    """
+    try:
+        items = _get_watchlist_codes_with_source()
+        return {"ok": True, "limit": NXT_WS_SUBSCRIBE_LIMIT, "count": len(items), "items": items}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/track-code")
 def track_code_endpoint(code: str):
     """
