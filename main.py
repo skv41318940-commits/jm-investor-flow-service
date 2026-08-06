@@ -223,6 +223,42 @@ _tick_buckets: dict = {}  # (code, market, trade_date, minute) -> {"buy_qty","bu
 _tick_lock = threading.Lock()
 _ws_debug_count = 0  # 처음 몇 개 메시지만 원본 로그 남겨서 필드 위치 검증용
 
+# ── 해외주식 정밀 세력평단 (HDFSCNT0, 2026-08-06 필드 분석으로 확정) ──────────────
+# 필드는 "^"로 구분된 26개, 0-index 기준:
+#   0 RSYM(실시간종목코드) 1 SYMB(종목코드) 2 ZDIV 3 TYMD(현지영업일자) 4 XYMD(현지일자)
+#   5 XHMS(현지시간) 6 KYMD(한국일자) 7 KHMS(한국시간) 8 OPEN 9 HIGH 10 LOW 11 LAST(현재가)
+#   12 SIGN 13 DIFF 14 RATE 15 PBID 16 PASK 17~19 (호가잔량 등)
+#   20 누적거래량(TVOL) 21 누적거래대금(TAMT)
+#   22 누적 매도체결량  23 누적 매수체결량  ← 실제 데이터로 직접 검증 완료 (체결강도=23/22*100 일치)
+#   24 체결강도 25 (고정값, 미상)
+# 한투가 이미 "누적" 값을 주기 때문에, 국내(H0STCNT0)처럼 매수/매도를 직접 분류할 필요 없이
+# 직전에 본 누적값과의 차이(delta)만 계산하면 이번 체결이 매수/매도 중 어느 쪽인지, 얼마나
+# 체결됐는지 바로 알 수 있음.
+OVERSEAS_FIELDS = 26
+IDX_OS_SYMB = 1
+IDX_OS_TYMD = 3  # 현지영업일자 — 이걸 trade_date로 씀 (한국일자 아님, 미국 거래일 기준)
+IDX_OS_LAST = 11  # 현재가
+IDX_OS_CUM_SELL = 22  # 누적 매도체결량
+IDX_OS_CUM_BUY = 23  # 누적 매수체결량
+
+# 해외주식은 608종목 스캔 같은 자동선별 없이, 사용자가 등록한 관심종목만 정밀 추적함.
+# 국내처럼 41건 등록 한도가 있는지 해외 쪽은 아직 확인 안 됐어서, 일단 국내와 별개로
+# 넉넉하지 않게 20개로 제한해둠 (문제 생기면 낮추기).
+OVERSEAS_WS_SUBSCRIBE_LIMIT = 20
+
+# 미국 주요 거래소 정규장 시간을 한국시간(KST) 기준으로 넉넉하게 잡은 창(자정을 넘어감).
+# 서머타임에 따라 1시간씩 밀리는데, 정확한 계산 대신 좀 여유있게 잡아서 놓치는 것보단
+# 낫게 함 (프리마켓~애프터마켓 포함해서 대략 이 시간대에 체결이 있음).
+OVERSEAS_WS_START_HOUR = 21  # 21:00 KST부터
+OVERSEAS_WS_END_HOUR = 7  # 다음날 07:00 KST까지
+
+# (symbol, market, trade_date) -> {"buy_qty","buy_value","sell_qty","sell_value","last_price"}
+_overseas_tick_buckets: dict = {}
+_overseas_tick_lock = threading.Lock()
+# (symbol, market, trade_date) -> (직전에 본 누적매도량, 직전에 본 누적매수량) — delta 계산용
+_overseas_last_cum: dict = {}
+
+
 # 문서에 나열된 실시간체결가 필드 순서 (^로 구분된 인덱스) — 여기가 틀리면 전부 틀어지니
 # 초반엔 _ws_debug_count로 원본을 찍어서 실제로 맞는지 꼭 확인할 것
 IDX_CODE = 0
@@ -369,7 +405,133 @@ def _flush_tick_buckets():
                     b["last_price"] = delta["last_price"]
 
 
-def fetch_nxt_scan_scores(limit: int = NXT_RANKING_POOL_SIZE):
+def _add_overseas_tick(symbol: str, market: str, trade_date: str, price: float, cum_sell: float, cum_buy: float):
+    """
+    HDFSCNT0 한 틱 처리. 한투가 이미 "누적" 매수/매도체결량을 주기 때문에, 직전에 저장해둔
+    누적값과 비교해서 이번에 새로 늘어난 만큼(delta)만 buy_qty/sell_qty에 더함.
+    직전 값이 없으면(이 세션 첫 틱) delta 계산을 스킵하고 기준값만 저장 — 안 그러면 첫 틱에
+    "누적값 전체"가 델타로 잡혀서 그날 하루치가 첫 틱에 몰빵되는 오류가 생김.
+    """
+    if price <= 0:
+        return
+    key = (symbol, market, trade_date)
+
+    with _overseas_tick_lock:
+        prev = _overseas_last_cum.get(key)
+        _overseas_last_cum[key] = (cum_sell, cum_buy)
+        if prev is None:
+            return  # 기준값만 세팅하고 이번 틱은 델타 계산 안 함
+
+        prev_sell, prev_buy = prev
+        delta_sell = cum_sell - prev_sell
+        delta_buy = cum_buy - prev_buy
+        # 자정 넘어가면서 한투 쪽에서 누적을 리셋하는 경우 delta가 음수로 나올 수 있음 —
+        # 그럴 땐 그냥 스킵 (다음 틱부터 새 기준으로 다시 정상 추적됨)
+        if delta_sell < 0 or delta_buy < 0:
+            return
+
+        b = _overseas_tick_buckets.setdefault(
+            key, {"buy_qty": 0.0, "buy_value": 0.0, "sell_qty": 0.0, "sell_value": 0.0, "last_price": None}
+        )
+        b["last_price"] = price
+        if delta_buy > 0:
+            b["buy_qty"] += delta_buy
+            b["buy_value"] += price * delta_buy
+        if delta_sell > 0:
+            b["sell_qty"] += delta_sell
+            b["sell_value"] += price * delta_sell
+
+
+def _parse_overseas_realtime_message(raw: str):
+    """HDFSCNT0(해외주식 실시간 지연 체결가) 원본 메시지 파싱 — 필드 26개, 위 상수 참고"""
+    parts = raw.split("|", 3)
+    if len(parts) < 4:
+        return
+    encrypted_flag, tr_id, count_str, body = parts
+    if encrypted_flag != "0" or tr_id != "HDFSCNT0":
+        return
+
+    try:
+        count = int(count_str)
+    except ValueError:
+        count = 1
+
+    fields = body.split("^")
+    n_complete = (len(fields) // OVERSEAS_FIELDS) * OVERSEAS_FIELDS
+    fields = fields[:n_complete]  # 메시지가 중간에 잘려서 마지막 레코드가 불완전하면 버림
+
+    for i in range(0, len(fields), OVERSEAS_FIELDS):
+        chunk = fields[i : i + OVERSEAS_FIELDS]
+        try:
+            rsym = chunk[0]  # 예: "DNASAAPL" — D(지연) + NAS(시장) + AAPL(종목코드)
+            symbol = chunk[IDX_OS_SYMB]
+            tymd = chunk[IDX_OS_TYMD]
+            price = float(chunk[IDX_OS_LAST])
+            cum_sell = float(chunk[IDX_OS_CUM_SELL])
+            cum_buy = float(chunk[IDX_OS_CUM_BUY])
+        except (ValueError, IndexError):
+            continue
+        if len(tymd) != 8 or len(rsym) < 4:
+            continue
+        market = rsym[1:4]  # RSYM에서 시장코드만 추출 (NAS/NYS/AMS)
+        trade_date = f"{tymd[:4]}-{tymd[4:6]}-{tymd[6:8]}"
+        _add_overseas_tick(symbol, market, trade_date, price, cum_sell, cum_buy)
+
+
+def _flush_overseas_tick_buckets():
+    """
+    메모리에 쌓인 해외주식 하루치 누적 매수/매도를 Supabase(overseas_daily_flow)에 반영.
+    국내 _flush_tick_buckets와 동일하게, 저장 실패한 건 버리지 않고 다음 주기에 재시도함.
+    """
+    with _overseas_tick_lock:
+        if not _overseas_tick_buckets:
+            return
+        pending = dict(_overseas_tick_buckets)
+        _overseas_tick_buckets.clear()
+
+    failed = {}
+    for (symbol, market, trade_date), delta in pending.items():
+        try:
+            existing = (
+                supabase.table("overseas_daily_flow")
+                .select("*")
+                .eq("symbol", symbol)
+                .eq("market", market)
+                .eq("trade_date", trade_date)
+                .limit(1)
+                .execute()
+            )
+            row = existing.data[0] if existing.data else None
+            merged = {
+                "symbol": symbol,
+                "market": market,
+                "trade_date": trade_date,
+                "buy_qty": (row["buy_qty"] if row else 0) + delta["buy_qty"],
+                "buy_value": (row["buy_value"] if row else 0) + delta["buy_value"],
+                "sell_qty": (row["sell_qty"] if row else 0) + delta["sell_qty"],
+                "sell_value": (row["sell_value"] if row else 0) + delta["sell_value"],
+                "last_price": delta.get("last_price") if delta.get("last_price") is not None else (row["last_price"] if row else None),
+            }
+            supabase.table("overseas_daily_flow").upsert(merged).execute()
+        except Exception as e:
+            print(f"[overseas_tick_flush] {symbol} {market} {trade_date} 저장 실패 (다음 주기에 재시도): {e}")
+            failed[(symbol, market, trade_date)] = delta
+
+    if failed:
+        with _overseas_tick_lock:
+            for key, delta in failed.items():
+                b = _overseas_tick_buckets.setdefault(
+                    key, {"buy_qty": 0.0, "buy_value": 0.0, "sell_qty": 0.0, "sell_value": 0.0, "last_price": None}
+                )
+                b["buy_qty"] += delta["buy_qty"]
+                b["buy_value"] += delta["buy_value"]
+                b["sell_qty"] += delta["sell_qty"]
+                b["sell_value"] += delta["sell_value"]
+                if delta.get("last_price") is not None:
+                    b["last_price"] = delta["last_price"]
+
+
+
     """
     NXT 거래가능 608종목(NXT_ELIGIBLE_CODES) 전체를 당일 일봉 기준으로 스캔해서
     점수 = 거래대금(억원) × (1 + |등락률(%)| ÷ 10) 상위 종목을 추려냄.
@@ -548,6 +710,121 @@ def _get_watchlist_codes() -> list:
         add(_get_nxt_ranking_codes(NXT_RANKING_POOL_SIZE))
 
     return codes
+
+
+@app.get("/api/overseas-watchlist")
+def overseas_watchlist_list():
+    """해외주식 정밀 추적 관심종목 목록 조회"""
+    try:
+        res = supabase.table("overseas_watchlist").select("*").order("added_at").execute()
+        return {"ok": True, "items": res.data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/overseas-watchlist/add")
+def overseas_watchlist_add(symbol: str, name: str, market: str = "NAS"):
+    """
+    해외주식 관심종목 추가 — 최대 OVERSEAS_WS_SUBSCRIBE_LIMIT개까지만.
+    market: NAS(나스닥)/NYS(뉴욕)/AMS(아멕스)
+    """
+    try:
+        market = market.upper()
+        if market not in ("NAS", "NYS", "AMS"):
+            return {"ok": False, "error": "market은 NAS/NYS/AMS 중 하나여야 해요."}
+        existing = supabase.table("overseas_watchlist").select("symbol,market").execute()
+        pairs = {(r["symbol"], r["market"]) for r in existing.data}
+        if (symbol, market) in pairs:
+            return {"ok": True, "message": "이미 등록되어 있습니다."}
+        if len(pairs) >= OVERSEAS_WS_SUBSCRIBE_LIMIT:
+            return {"ok": False, "error": f"해외주식 관심종목은 최대 {OVERSEAS_WS_SUBSCRIBE_LIMIT}개까지만 등록할 수 있습니다."}
+        supabase.table("overseas_watchlist").insert({"symbol": symbol, "name": name, "market": market}).execute()
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/overseas-watchlist/remove")
+def overseas_watchlist_remove(symbol: str, market: str = "NAS"):
+    """해외주식 관심종목 제거"""
+    try:
+        supabase.table("overseas_watchlist").delete().eq("symbol", symbol).eq("market", market.upper()).execute()
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/overseas-avg")
+def overseas_avg_endpoint(symbol: str, market: str = "NAS", start: str = "", end: str = ""):
+    """
+    해외주식 기간별 정밀 세력평단 — overseas_daily_flow에 쌓인 일별 누적 매수/매도를
+    구간 합산해서 계산. 국내처럼 분봉이 아니라 하루 단위라 계산이 훨씬 단순함.
+    start/end 비우면 최근 90일. 그 구간에 정밀 데이터가 하나도 없으면 에러 반환
+    (이 프로젝트는 해외주식에 근사치 폴백을 안 두기로 함 — 관심종목으로 등록해서
+    직접 추적한 기간만 정밀하게 볼 수 있음).
+    """
+    market = market.upper()
+    end = end or now_kst().strftime("%Y-%m-%d")
+    if not start:
+        start_dt = now_kst() - timedelta(days=90)
+        start = start_dt.strftime("%Y-%m-%d")
+
+    try:
+        res = (
+            supabase.table("overseas_daily_flow")
+            .select("*")
+            .eq("symbol", symbol)
+            .eq("market", market)
+            .gte("trade_date", start)
+            .lte("trade_date", end)
+            .order("trade_date")
+            .execute()
+        )
+        rows = res.data
+        if not rows:
+            return {
+                "error": f"{start}~{end} 구간에 정밀 추적 데이터가 없어요. 이 종목을 해외주식 관심종목에 등록해서 추적한 기간만 조회할 수 있어요."
+            }
+
+        buy_qty_total = sum(r["buy_qty"] for r in rows)
+        buy_value_total = sum(r["buy_value"] for r in rows)
+        sell_qty_total = sum(r["sell_qty"] for r in rows)
+        sell_value_total = sum(r["sell_value"] for r in rows)
+
+        avg = round(buy_value_total / buy_qty_total, 2) if buy_qty_total > 0 else 0
+        sell_avg = round(sell_value_total / sell_qty_total, 2) if sell_qty_total > 0 else 0
+
+        candles = []
+        cum_buy_qty = cum_buy_value = cum_sell_qty = cum_sell_value = 0.0
+        for r in rows:
+            cum_buy_qty += r["buy_qty"]
+            cum_buy_value += r["buy_value"]
+            cum_sell_qty += r["sell_qty"]
+            cum_sell_value += r["sell_value"]
+            candles.append(
+                {
+                    "date": r["trade_date"],
+                    "close": r.get("last_price"),
+                    "avg_price": round(cum_buy_value / cum_buy_qty, 2) if cum_buy_qty > 0 else 0,
+                    "sell_avg_price": round(cum_sell_value / cum_sell_qty, 2) if cum_sell_qty > 0 else 0,
+                }
+            )
+
+        return {
+            "symbol": symbol,
+            "market": market,
+            "start": start,
+            "end": end,
+            "current_price": rows[-1].get("last_price"),
+            "force_buy_avg": avg,
+            "force_sell_avg": sell_avg,
+            "buy_qty": buy_qty_total,
+            "sell_qty": sell_qty_total,
+            "candles": candles,
+            "is_estimate": False,
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @app.get("/api/nxt-watchlist")
@@ -816,9 +1093,120 @@ async def _ws_worker():
             await asyncio.sleep(10)
 
 
+def _in_overseas_window(now: datetime) -> bool:
+    """미국 거래소 체결이 있을 만한 시간대(KST, 자정을 넘어가는 창)인지 확인"""
+    h = now.hour
+    if OVERSEAS_WS_START_HOUR <= OVERSEAS_WS_END_HOUR:
+        return OVERSEAS_WS_START_HOUR <= h < OVERSEAS_WS_END_HOUR
+    return h >= OVERSEAS_WS_START_HOUR or h < OVERSEAS_WS_END_HOUR
+
+
+def _get_overseas_watchlist_symbols() -> list:
+    """해외주식 정밀 추적 대상 (overseas_watchlist 테이블) — [(symbol, market), ...]"""
+    try:
+        res = (
+            supabase.table("overseas_watchlist")
+            .select("symbol,market")
+            .order("added_at")
+            .limit(OVERSEAS_WS_SUBSCRIBE_LIMIT)
+            .execute()
+        )
+        return [(r["symbol"], r["market"]) for r in res.data]
+    except Exception as e:
+        print(f"[overseas_watchlist] 조회 실패: {e}")
+        return []
+
+
+async def _overseas_ws_worker():
+    """
+    미국 거래소 체결이 있을 시간대(KST 21:00~다음날 07:00, 넉넉하게 잡음)에만 웹소켓을 연결
+    유지하며 해외주식 관심종목의 실시간(지연) 체결가를 누적하는 백그라운드 작업.
+    국내 _ws_worker와 구조는 동일하고, 종목당 TR 1개(HDFSCNT0)만 구독하면 되는 점이 다름
+    (국내는 KRX+NXT 2개 구독).
+    """
+    if websockets is None or not KIS_APP_KEY or not KIS_APP_SECRET:
+        print("[overseas_ws_worker] websockets 미설치 또는 KIS 키 미설정으로 건너뜁니다.")
+        return
+
+    while True:
+        now = now_kst()
+        if not _in_overseas_window(now) or now.weekday() >= 5:
+            await asyncio.sleep(60)
+            continue
+
+        try:
+            approval_key = get_ws_approval_key()
+            watch = await asyncio.to_thread(_get_overseas_watchlist_symbols)
+            if not watch:
+                print("[overseas_ws_worker] 구독할 해외주식 관심종목이 없어 잠시 대기합니다.")
+                await asyncio.sleep(300)
+                continue
+
+            async with websockets.connect(KIS_WS_URL, ping_interval=None) as ws:
+                for symbol, market in watch:
+                    sub = {
+                        "header": {"approval_key": approval_key, "custtype": "P", "tr_type": "1", "content-type": "utf-8"},
+                        "body": {"input": {"tr_id": "HDFSCNT0", "tr_key": f"D{market}{symbol}"}},
+                    }
+                    await ws.send(json.dumps(sub))
+                    await asyncio.sleep(0.1)
+                print(f"[overseas_ws_worker] {len(watch)}개 종목 구독 요청 완료 (HDFSCNT0)")
+
+                last_flush = time.time()
+                last_refresh = time.time()
+                sub_error_count = 0
+                while True:
+                    now2 = now_kst()
+                    if not _in_overseas_window(now2) or now2.weekday() >= 5:
+                        break
+                    try:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=5)
+                    except asyncio.TimeoutError:
+                        msg = None
+
+                    if msg:
+                        if msg.startswith("0"):
+                            _parse_overseas_realtime_message(msg)
+                        elif msg.startswith("{"):
+                            try:
+                                parsed = json.loads(msg)
+                            except Exception:
+                                parsed = {}
+                            tr_id = parsed.get("header", {}).get("tr_id")
+                            if tr_id == "PINGPONG":
+                                await ws.send(msg)
+                            elif "SUCCESS" not in msg:
+                                sub_error_count += 1
+                                if sub_error_count <= 20:
+                                    print(f"[overseas_ws_worker] 구독 응답 이상: {msg[:300]}")
+
+                    if time.time() - last_flush > 15:
+                        await asyncio.to_thread(_flush_overseas_tick_buckets)
+                        last_flush = time.time()
+
+                    # 5분마다 관심종목 갱신 — 새로 등록된 종목이 있으면 재연결 없이 바로 구독 추가
+                    if time.time() - last_refresh > 300:
+                        new_watch = await asyncio.to_thread(_get_overseas_watchlist_symbols)
+                        added = [w for w in new_watch if w not in watch]
+                        for symbol, market in added:
+                            sub = {
+                                "header": {"approval_key": approval_key, "custtype": "P", "tr_type": "1", "content-type": "utf-8"},
+                                "body": {"input": {"tr_id": "HDFSCNT0", "tr_key": f"D{market}{symbol}"}},
+                            }
+                            await ws.send(json.dumps(sub))
+                        watch = new_watch
+                        last_refresh = time.time()
+
+                await asyncio.to_thread(_flush_overseas_tick_buckets)
+        except Exception as e:
+            print(f"[overseas_ws_worker] 연결 오류, 10초 후 재시도: {e}")
+            await asyncio.sleep(10)
+
+
 @app.on_event("startup")
 async def _start_ws_worker():
     asyncio.create_task(_ws_worker())
+    asyncio.create_task(_overseas_ws_worker())
 
 
 @app.get("/api/tick-avg")
