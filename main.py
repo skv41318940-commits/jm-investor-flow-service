@@ -291,13 +291,19 @@ def _parse_realtime_message(raw: str):
 
 
 def _flush_tick_buckets():
-    """메모리에 쌓인 분 단위 누적치를 Supabase에 반영 (기존 값에 더하는 방식)"""
+    """
+    메모리에 쌓인 분 단위 누적치를 Supabase에 반영 (기존 값에 더하는 방식).
+    ⚠️ 저장이 실패한 건(예: 테이블이 없거나 Supabase가 잠깐 불안정할 때) 그냥 버리지 않고
+    메모리에 되돌려서 다음 주기에 다시 시도함 — 안 그러면 그 순간 체결 데이터가 영구 유실됨
+    (2026-08-06 프리마켓 때 tick_minute_flow 테이블이 없어서 전부 유실됐던 사고 재발 방지).
+    """
     with _tick_lock:
         if not _tick_buckets:
             return
         pending = dict(_tick_buckets)
         _tick_buckets.clear()
 
+    failed = {}
     for (code, market, trade_date, minute), delta in pending.items():
         try:
             existing = (
@@ -323,7 +329,17 @@ def _flush_tick_buckets():
             }
             supabase.table("tick_minute_flow").upsert(merged).execute()
         except Exception as e:
-            print(f"[tick_flush] {code} {market} {minute} 저장 실패: {e}")
+            print(f"[tick_flush] {code} {market} {minute} 저장 실패 (다음 주기에 재시도): {e}")
+            failed[(code, market, trade_date, minute)] = delta
+
+    if failed:
+        with _tick_lock:
+            for key, delta in failed.items():
+                b = _tick_buckets.setdefault(key, {"buy_qty": 0.0, "buy_value": 0.0, "sell_qty": 0.0, "sell_value": 0.0})
+                b["buy_qty"] += delta["buy_qty"]
+                b["buy_value"] += delta["buy_value"]
+                b["sell_qty"] += delta["sell_qty"]
+                b["sell_value"] += delta["sell_value"]
 
 
 def fetch_nxt_scan_scores(limit: int = NXT_RANKING_POOL_SIZE):
