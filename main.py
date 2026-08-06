@@ -975,6 +975,57 @@ def tick_avg_combined_endpoint(code: str, date: str = ""):
         return {"error": str(e)}
 
 
+@app.get("/api/overseas-ws-debug")
+async def overseas_ws_debug(symbol: str = "AAPL", market: str = "NAS", seconds: int = 20):
+    """
+    디버그 전용 — 해외주식 실시간(지연) 체결가(TR: HDFSCNT0) 원본 메시지를 그대로 수집해서 반환.
+    매수/매도 구분 필드가 실제로 있는지 등, 정밀 계산 가능 여부를 눈으로 확인하려고 만든 용도.
+    몇 초만 구독했다가 바로 끊음 (상시 실행 아님).
+
+    market: NAS(나스닥), NYS(뉴욕), AMS(아멕스) — tr_key는 "D"(지연) + market + symbol 조합
+    (예: 애플 나스닥 → DNASAAPL).
+
+    ⚠️ 미국 거래소 정규장 시간에만 체결이 발생해서 데이터가 옴 (한국시간 기준 대략 22:30~05:00,
+    서머타임에 따라 1시간 당겨짐). 그 시간 밖에 호출하면 count가 0으로 나오는 게 정상.
+    """
+    try:
+        approval_key = get_ws_approval_key()
+        tr_key = f"D{market}{symbol}"
+        raw_messages = []
+
+        async with websockets.connect(KIS_WS_URL, ping_interval=None) as ws:
+            sub = {
+                "header": {"approval_key": approval_key, "custtype": "P", "tr_type": "1", "content-type": "utf-8"},
+                "body": {"input": {"tr_id": "HDFSCNT0", "tr_key": tr_key}},
+            }
+            await ws.send(json.dumps(sub))
+
+            end_time = time.time() + seconds
+            while time.time() < end_time:
+                remaining = end_time - time.time()
+                if remaining <= 0:
+                    break
+                try:
+                    msg = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+
+                if msg.startswith("{"):
+                    try:
+                        parsed = json.loads(msg)
+                        if parsed.get("header", {}).get("tr_id") == "PINGPONG":
+                            await ws.send(msg)  # 여기도 PINGPONG은 그대로 되돌려줘야 연결 유지됨
+                            continue
+                    except Exception:
+                        pass
+
+                raw_messages.append(msg[:1000])  # 너무 길면 잘라서 저장
+
+        return {"ok": True, "tr_key": tr_key, "count": len(raw_messages), "messages": raw_messages}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/kis-program-debug")
 def kis_program_debug(code: str):
     """
