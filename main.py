@@ -272,8 +272,13 @@ def _normalize_overseas_market(market: str) -> str:
 # 미국 주요 거래소 정규장 시간을 한국시간(KST) 기준으로 넉넉하게 잡은 창(자정을 넘어감).
 # 서머타임에 따라 1시간씩 밀리는데, 정확한 계산 대신 좀 여유있게 잡아서 놓치는 것보단
 # 낫게 함 (프리마켓~애프터마켓 포함해서 대략 이 시간대에 체결이 있음).
-OVERSEAS_WS_START_HOUR = 21  # 21:00 KST부터
-OVERSEAS_WS_END_HOUR = 7  # 다음날 07:00 KST까지
+# ⚠️ 미국 거래소만 생각하고 21:00~07:00(KST) 창 하나만 뒀었는데, 도쿄/홍콩/상해/심천/
+# 호치민/하노이는 한국 낮 시간대(대략 08:00~16:00 KST)에 열려서 이 창 밖이라 웹소켓이
+# 아예 안 깨어있었음 (2026-08-07 285A 추적 안 되던 사고). 그래서 "이 시간대엔 어차피
+# 아무 거래소도 안 열림"이라고 확신할 수 있는 구간(16:00~21:00 KST)만 쉬고, 나머진 항상
+# 깨어있게 바꿈 — 아시아 낮 시간대 + 미국 저녁/새벽 시간대를 합치면 거의 하루 종일임.
+OVERSEAS_WS_IDLE_START_HOUR = 16  # 16:00 KST부터
+OVERSEAS_WS_IDLE_END_HOUR = 21  # 21:00 KST까지는 쉼 (그 사이엔 지원 거래소 전부 휴장)
 
 # (symbol, market, trade_date) -> {"buy_qty","buy_value","sell_qty","sell_value","last_price"}
 _overseas_tick_buckets: dict = {}
@@ -1199,11 +1204,14 @@ async def _ws_worker():
 
 
 def _in_overseas_window(now: datetime) -> bool:
-    """미국 거래소 체결이 있을 만한 시간대(KST, 자정을 넘어가는 창)인지 확인"""
+    """
+    해외 거래소 체결이 있을 만한 시간대인지 확인 — "언제 여는지" 대신 "언제 확실히 다
+    닫혀있는지"(16:00~21:00 KST)만 걸러내는 방식. 아시아 거래소(도쿄/홍콩/상해/심천/
+    호치민/하노이, 대략 08:00~16:00 KST)와 미국 거래소(대략 21:00~07:00 KST)를 합치면
+    이 구간 빼고는 거의 항상 어딘가는 열려있음.
+    """
     h = now.hour
-    if OVERSEAS_WS_START_HOUR <= OVERSEAS_WS_END_HOUR:
-        return OVERSEAS_WS_START_HOUR <= h < OVERSEAS_WS_END_HOUR
-    return h >= OVERSEAS_WS_START_HOUR or h < OVERSEAS_WS_END_HOUR
+    return not (OVERSEAS_WS_IDLE_START_HOUR <= h < OVERSEAS_WS_IDLE_END_HOUR)
 
 
 def _get_overseas_watchlist_symbols() -> list:
@@ -1249,7 +1257,7 @@ def _get_overseas_watchlist_symbols() -> list:
 
 async def _overseas_ws_worker():
     """
-    미국 거래소 체결이 있을 시간대(KST 21:00~다음날 07:00, 넉넉하게 잡음)에만 웹소켓을 연결
+    해외 거래소가 열려있을 시간대(=16:00~21:00 KST 휴장 구간만 제외)에 웹소켓을 연결
     유지하며 해외주식 관심종목의 실시간(지연) 체결가를 누적하는 백그라운드 작업.
     국내 _ws_worker와 구조는 동일하고, 종목당 TR 1개(HDFSCNT0)만 구독하면 되는 점이 다름
     (국내는 KRX+NXT 2개 구독).
