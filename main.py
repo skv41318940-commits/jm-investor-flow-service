@@ -246,6 +246,20 @@ IDX_OS_CUM_BUY = 23  # 누적 매수체결량
 # 넉넉하지 않게 20개로 제한해둠 (문제 생기면 낮추기).
 OVERSEAS_WS_SUBSCRIBE_LIMIT = 20
 
+# 프론트(OverseasStockPanel.tsx)가 "NASDAQ"/"NYSE"/"AMEX" 같은 긴 이름을 보내는데,
+# 한투 API(tr_key, HDFSCNT0)는 짧은 코드(NAS/NYS/AMS)를 기대함 — 여기서 흡수해서 어느 쪽
+# 형식이 와도 항상 짧은 코드로 통일함 (2026-08-07 새벽에 이거 안 맞아서 구독 자체가
+# 잘못된 tr_key로 나갔던 사고 재발 방지).
+_OVERSEAS_MARKET_ALIASES = {
+    "NASDAQ": "NAS", "NAS": "NAS",
+    "NYSE": "NYS", "NYS": "NYS",
+    "AMEX": "AMS", "AMS": "AMS",
+}
+
+
+def _normalize_overseas_market(market: str) -> str:
+    return _OVERSEAS_MARKET_ALIASES.get((market or "").upper(), (market or "").upper())
+
 # 미국 주요 거래소 정규장 시간을 한국시간(KST) 기준으로 넉넉하게 잡은 창(자정을 넘어감).
 # 서머타임에 따라 1시간씩 밀리는데, 정확한 계산 대신 좀 여유있게 잡아서 놓치는 것보단
 # 낫게 함 (프리마켓~애프터마켓 포함해서 대략 이 시간대에 체결이 있음).
@@ -531,7 +545,7 @@ def _flush_overseas_tick_buckets():
                     b["last_price"] = delta["last_price"]
 
 
-
+def fetch_nxt_scan_scores(limit: int = NXT_RANKING_POOL_SIZE):
     """
     NXT 거래가능 608종목(NXT_ELIGIBLE_CODES) 전체를 당일 일봉 기준으로 스캔해서
     점수 = 거래대금(억원) × (1 + |등락률(%)| ÷ 10) 상위 종목을 추려냄.
@@ -729,9 +743,9 @@ def overseas_watchlist_add(symbol: str, name: str, market: str = "NAS"):
     market: NAS(나스닥)/NYS(뉴욕)/AMS(아멕스)
     """
     try:
-        market = market.upper()
+        market = _normalize_overseas_market(market)
         if market not in ("NAS", "NYS", "AMS"):
-            return {"ok": False, "error": "market은 NAS/NYS/AMS 중 하나여야 해요."}
+            return {"ok": False, "error": "market은 NAS/NYS/AMS(또는 NASDAQ/NYSE/AMEX) 중 하나여야 해요."}
         existing = supabase.table("overseas_watchlist").select("symbol,market").execute()
         pairs = {(r["symbol"], r["market"]) for r in existing.data}
         if (symbol, market) in pairs:
@@ -748,7 +762,7 @@ def overseas_watchlist_add(symbol: str, name: str, market: str = "NAS"):
 def overseas_watchlist_remove(symbol: str, market: str = "NAS"):
     """해외주식 관심종목 제거"""
     try:
-        supabase.table("overseas_watchlist").delete().eq("symbol", symbol).eq("market", market.upper()).execute()
+        supabase.table("overseas_watchlist").delete().eq("symbol", symbol).eq("market", _normalize_overseas_market(market)).execute()
         return {"ok": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -763,7 +777,7 @@ def overseas_avg_endpoint(symbol: str, market: str = "NAS", start: str = "", end
     (이 프로젝트는 해외주식에 근사치 폴백을 안 두기로 함 — 관심종목으로 등록해서
     직접 추적한 기간만 정밀하게 볼 수 있음).
     """
-    market = market.upper()
+    market = _normalize_overseas_market(market)
     end = end or now_kst().strftime("%Y-%m-%d")
     if not start:
         start_dt = now_kst() - timedelta(days=90)
@@ -1004,7 +1018,7 @@ def overseas_track_code_endpoint(symbol: str, market: str = "NAS", name: str = "
     """
     try:
         supabase.table("overseas_tracked_codes").upsert(
-            {"symbol": symbol, "market": market.upper(), "name": name or symbol, "last_requested_at": now_kst().isoformat()}
+            {"symbol": symbol, "market": _normalize_overseas_market(market), "name": name or symbol, "last_requested_at": now_kst().isoformat()}
         ).execute()
         return {"ok": True}
     except Exception as e:
@@ -1133,7 +1147,7 @@ def _get_overseas_watchlist_symbols() -> list:
 
     def add(rows, key_symbol="symbol", key_market="market"):
         for r in rows:
-            k = (r[key_symbol], r[key_market])
+            k = (r[key_symbol], _normalize_overseas_market(r[key_market]))
             if k not in seen and len(pairs) < OVERSEAS_WS_SUBSCRIBE_LIMIT:
                 seen.add(k)
                 pairs.append(k)
