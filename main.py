@@ -783,7 +783,7 @@ def overseas_avg_endpoint(symbol: str, market: str = "NAS", start: str = "", end
         rows = res.data
         if not rows:
             return {
-                "error": f"{start}~{end} 구간에 정밀 추적 데이터가 없어요. 이 종목을 해외주식 관심종목에 등록해서 추적한 기간만 조회할 수 있어요."
+                "error": f"{start}~{end} 구간에 정밀 추적 데이터가 없어요. 이 종목을 검색하면 자동으로 추적이 시작되니, 다음 미국장부터 데이터가 쌓이는 대로 다시 조회해보세요."
             }
 
         buy_qty_total = sum(r["buy_qty"] for r in rows)
@@ -993,6 +993,24 @@ def track_code_endpoint(code: str):
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/overseas-track-code")
+def overseas_track_code_endpoint(symbol: str, market: str = "NAS", name: str = ""):
+    """
+    해외주식 패널에서 종목을 검색/조회할 때마다 호출 — 관심종목으로 명시적으로 등록 안 해도
+    "최근 조회 종목"으로 자동 등록해서, 남는 구독 슬롯이 있으면 다음 웹소켓 갱신 주기(최대 5분)
+    부터 정밀 추적을 시작함. 국내 /api/track-code와 완전히 같은 방식.
+    ⚠️ 등록 시점부터 쌓이기 시작하는 거라 소급 적용은 안 됨 — 검색한다고 과거 데이터가
+    갑자기 정밀로 바뀌진 않음.
+    """
+    try:
+        supabase.table("overseas_tracked_codes").upsert(
+            {"symbol": symbol, "market": market.upper(), "name": name or symbol, "last_requested_at": now_kst().isoformat()}
+        ).execute()
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 async def _ws_worker():
     """장중(07:50~20:10 KST)에만 웹소켓을 연결 유지하며 체결 데이터를 누적하는 백그라운드 작업"""
     if websockets is None:
@@ -1102,19 +1120,44 @@ def _in_overseas_window(now: datetime) -> bool:
 
 
 def _get_overseas_watchlist_symbols() -> list:
-    """해외주식 정밀 추적 대상 (overseas_watchlist 테이블) — [(symbol, market), ...]"""
+    """
+    해외주식 정밀 추적 대상 — [(symbol, market), ...] 최대 OVERSEAS_WS_SUBSCRIBE_LIMIT개.
+    국내 _get_watchlist_codes()와 같은 우선순위 방식:
+      1) overseas_watchlist (명시적으로 등록한 관심종목) — 무조건 포함
+      2) overseas_tracked_codes (최근 14일 이내 검색/조회한 종목) — 남는 슬롯 채움
+    검색만 해도 자동으로 2번에 들어가서, 명시적으로 관심종목 추가 안 해도 몇 번 계속
+    찾아보면 자연스럽게 정밀 추적이 시작됨 (국내 "최근 조회 종목"과 동일한 경험).
+    """
+    pairs: list = []
+    seen = set()
+
+    def add(rows, key_symbol="symbol", key_market="market"):
+        for r in rows:
+            k = (r[key_symbol], r[key_market])
+            if k not in seen and len(pairs) < OVERSEAS_WS_SUBSCRIBE_LIMIT:
+                seen.add(k)
+                pairs.append(k)
+
     try:
-        res = (
-            supabase.table("overseas_watchlist")
-            .select("symbol,market")
-            .order("added_at")
-            .limit(OVERSEAS_WS_SUBSCRIBE_LIMIT)
-            .execute()
-        )
-        return [(r["symbol"], r["market"]) for r in res.data]
+        res1 = supabase.table("overseas_watchlist").select("symbol,market").order("added_at").execute()
+        add(res1.data)
     except Exception as e:
         print(f"[overseas_watchlist] 조회 실패: {e}")
-        return []
+
+    try:
+        cutoff = (now_kst() - timedelta(days=14)).isoformat()
+        res2 = (
+            supabase.table("overseas_tracked_codes")
+            .select("symbol,market")
+            .gte("last_requested_at", cutoff)
+            .order("last_requested_at", desc=True)
+            .execute()
+        )
+        add(res2.data)
+    except Exception as e:
+        print(f"[overseas_tracked_codes] 조회 실패: {e}")
+
+    return pairs
 
 
 async def _overseas_ws_worker():
