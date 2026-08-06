@@ -804,6 +804,43 @@ def overseas_subscribe_preview_endpoint():
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/overseas-resolve")
+def overseas_resolve_endpoint(symbol: str):
+    """
+    "통합 검색" 지원용 — 특정 종목코드가 9개 해외거래소 중 어디 상장인지 자동으로 찾아줌.
+    한투에 해외주식 "종목명" 검색 API가 따로 없어서(마스터파일 다운로드 방식만 있음),
+    대신 "해외주식 현재가"(HHDFS00000300)를 거래소별로 순서대로 호출해보고 실제 값이
+    있는 곳을 찾는 방식 — 종목코드만 정확하면 국가/거래소를 몰라도 바로 조회 가능함.
+    ⚠️ 아직 실제 응답 필드(특히 종목명)를 실전 데이터로 검증 안 해서, 이름이 안 나오면
+    일단 종목코드를 그대로 이름으로 씀 — 다음에 실제 응답 보고 다듬을 것.
+    """
+    symbol = symbol.strip().upper()
+    if not symbol:
+        return {"ok": False, "error": "종목코드를 입력해주세요."}
+
+    for market in OVERSEAS_MARKETS:
+        try:
+            data = kis_get(
+                "/uapi/overseas-price/v1/quotations/price",
+                "HHDFS00000300",
+                {"AUTH": "", "EXCD": market, "SYMB": symbol},
+            )
+            output = data.get("output") or {}
+            last = output.get("last")
+            if data.get("rt_cd") == "0" and last not in (None, "", "0", "0.00"):
+                return {
+                    "ok": True,
+                    "symbol": symbol,
+                    "market": market,
+                    "name": output.get("name") or symbol,
+                    "last": last,
+                }
+        except Exception:
+            continue
+
+    return {"ok": False, "error": f"'{symbol}' 종목을 9개 거래소 어디에서도 찾지 못했어요. 코드가 정확한지 확인해주세요."}
+
+
 @app.get("/api/overseas-avg")
 def overseas_avg_endpoint(symbol: str, market: str = "NAS", start: str = "", end: str = ""):
     """
