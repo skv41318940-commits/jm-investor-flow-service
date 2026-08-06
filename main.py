@@ -777,6 +777,33 @@ def overseas_watchlist_remove(symbol: str, market: str = "NAS"):
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/overseas-subscribe-preview")
+def overseas_subscribe_preview_endpoint():
+    """
+    지금 이 순간 실제로 웹소켓에 구독될 해외주식 목록(최대 OVERSEAS_WS_SUBSCRIBE_LIMIT개)을
+    소스별(watchlist/tracked)로 보여줌 — 국내 /api/ws-subscribe-preview와 같은 용도.
+    ⚠️ 한투 해외주식 실시간 등록 한도가 국내(41건)와 별개인지 공식 문서로 확인이 안 돼서,
+    일단 보수적으로 20개로 잡아뒀음 — 이 엔드포인트로 지금 몇 개 쓰고 있는지 눈으로 보면서
+    관리할 것.
+    """
+    try:
+        pairs = _get_overseas_watchlist_symbols()
+        try:
+            watchlist_pairs = {
+                (r["symbol"], _normalize_overseas_market(r["market"]))
+                for r in supabase.table("overseas_watchlist").select("symbol,market").execute().data
+            }
+        except Exception:
+            watchlist_pairs = set()
+        items = [
+            {"symbol": s, "market": m, "source": "overseas_watchlist" if (s, m) in watchlist_pairs else "overseas_tracked_codes"}
+            for s, m in pairs
+        ]
+        return {"ok": True, "limit": OVERSEAS_WS_SUBSCRIBE_LIMIT, "count": len(items), "items": items}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/overseas-avg")
 def overseas_avg_endpoint(symbol: str, market: str = "NAS", start: str = "", end: str = ""):
     """
