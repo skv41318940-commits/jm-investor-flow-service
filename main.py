@@ -246,14 +246,23 @@ IDX_OS_CUM_BUY = 23  # 누적 매수체결량
 # 넉넉하지 않게 20개로 제한해둠 (문제 생기면 낮추기).
 OVERSEAS_WS_SUBSCRIBE_LIMIT = 20
 
-# 프론트(OverseasStockPanel.tsx)가 "NASDAQ"/"NYSE"/"AMEX" 같은 긴 이름을 보내는데,
-# 한투 API(tr_key, HDFSCNT0)는 짧은 코드(NAS/NYS/AMS)를 기대함 — 여기서 흡수해서 어느 쪽
+# 한투가 지원하는 해외 거래소 전체 코드 (해외주식 실시간체결가 HDFSCNT0 기준)
+OVERSEAS_MARKETS = ("NAS", "NYS", "AMS", "TSE", "HKS", "SHS", "SZS", "HSX", "HNX")
+
+# 프론트가 "NASDAQ"/"NYSE"/"AMEX" 같은 긴 이름을 보내는데,
+# 한투 API(tr_key, HDFSCNT0)는 짧은 코드(NAS/NYS/AMS 등)를 기대함 — 여기서 흡수해서 어느 쪽
 # 형식이 와도 항상 짧은 코드로 통일함 (2026-08-07 새벽에 이거 안 맞아서 구독 자체가
 # 잘못된 tr_key로 나갔던 사고 재발 방지).
 _OVERSEAS_MARKET_ALIASES = {
     "NASDAQ": "NAS", "NAS": "NAS",
     "NYSE": "NYS", "NYS": "NYS",
     "AMEX": "AMS", "AMS": "AMS",
+    "TOKYO": "TSE", "TSE": "TSE",
+    "HONGKONG": "HKS", "HONG KONG": "HKS", "HKS": "HKS",
+    "SHANGHAI": "SHS", "SHS": "SHS",
+    "SHENZHEN": "SZS", "SZS": "SZS",
+    "HOCHIMINH": "HSX", "HO CHI MINH": "HSX", "HSX": "HSX",
+    "HANOI": "HNX", "HNX": "HNX",
 }
 
 
@@ -740,12 +749,12 @@ def overseas_watchlist_list():
 def overseas_watchlist_add(symbol: str, name: str, market: str = "NAS"):
     """
     해외주식 관심종목 추가 — 최대 OVERSEAS_WS_SUBSCRIBE_LIMIT개까지만.
-    market: NAS(나스닥)/NYS(뉴욕)/AMS(아멕스)
+    market: NAS(나스닥)/NYS(뉴욕)/AMS(아멕스)/TSE(도쿄)/HKS(홍콩)/SHS(상해)/SZS(심천)/HSX(호치민)/HNX(하노이)
     """
     try:
         market = _normalize_overseas_market(market)
-        if market not in ("NAS", "NYS", "AMS"):
-            return {"ok": False, "error": "market은 NAS/NYS/AMS(또는 NASDAQ/NYSE/AMEX) 중 하나여야 해요."}
+        if market not in OVERSEAS_MARKETS:
+            return {"ok": False, "error": f"market은 {'/'.join(OVERSEAS_MARKETS)} 중 하나여야 해요."}
         existing = supabase.table("overseas_watchlist").select("symbol,market").execute()
         pairs = {(r["symbol"], r["market"]) for r in existing.data}
         if (symbol, market) in pairs:
@@ -1427,7 +1436,8 @@ async def overseas_ws_debug(symbol: str = "AAPL", market: str = "NAS", seconds: 
     매수/매도 구분 필드가 실제로 있는지 등, 정밀 계산 가능 여부를 눈으로 확인하려고 만든 용도.
     몇 초만 구독했다가 바로 끊음 (상시 실행 아님).
 
-    market: NAS(나스닥), NYS(뉴욕), AMS(아멕스) — tr_key는 "D"(지연) + market + symbol 조합
+    market: NAS(나스닥)/NYS(뉴욕)/AMS(아멕스)/TSE(도쿄)/HKS(홍콩)/SHS(상해)/SZS(심천)/HSX(호치민)/HNX(하노이) —
+    tr_key는 "D"(지연) + market + symbol 조합
     (예: 애플 나스닥 → DNASAAPL).
 
     ⚠️ 미국 거래소 정규장 시간에만 체결이 발생해서 데이터가 옴 (한국시간 기준 대략 22:30~05:00,
