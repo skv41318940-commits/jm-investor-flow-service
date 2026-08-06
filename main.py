@@ -239,14 +239,17 @@ def _add_tick(code: str, market: str, hhmmss: str, bsop_date: str, price: float,
 
     key = (code, market, trade_date, minute)
     with _tick_lock:
-        b = _tick_buckets.setdefault(key, {"buy_qty": 0.0, "buy_value": 0.0, "sell_qty": 0.0, "sell_value": 0.0})
+        b = _tick_buckets.setdefault(
+            key, {"buy_qty": 0.0, "buy_value": 0.0, "sell_qty": 0.0, "sell_value": 0.0, "last_price": None}
+        )
+        b["last_price"] = price  # 매수/매도 구분과 무관하게 이 분(minute)의 마지막 체결가로 계속 덮어씀
         if ccld_dvsn == "1":  # 매수
             b["buy_qty"] += qty
             b["buy_value"] += price * qty
         elif ccld_dvsn == "5":  # 매도
             b["sell_qty"] += qty
             b["sell_value"] += price * qty
-        # "3"(장전 단일가 등)은 매수/매도 구분이 없어서 스킵
+        # "3"(장전 단일가 등)은 매수/매도 구분이 없어서 수량 누적은 스킵 (가격은 위에서 이미 반영)
 
 
 def _parse_realtime_message(raw: str):
@@ -326,6 +329,8 @@ def _flush_tick_buckets():
                 "buy_value": (row["buy_value"] if row else 0) + delta["buy_value"],
                 "sell_qty": (row["sell_qty"] if row else 0) + delta["sell_qty"],
                 "sell_value": (row["sell_value"] if row else 0) + delta["sell_value"],
+                # 이번 주기에 새로 들어온 체결이 있으면 그 마지막가로, 없으면 기존 값 유지
+                "last_price": delta.get("last_price") if delta.get("last_price") is not None else (row["last_price"] if row else None),
             }
             supabase.table("tick_minute_flow").upsert(merged).execute()
         except Exception as e:
@@ -335,11 +340,15 @@ def _flush_tick_buckets():
     if failed:
         with _tick_lock:
             for key, delta in failed.items():
-                b = _tick_buckets.setdefault(key, {"buy_qty": 0.0, "buy_value": 0.0, "sell_qty": 0.0, "sell_value": 0.0})
+                b = _tick_buckets.setdefault(
+                    key, {"buy_qty": 0.0, "buy_value": 0.0, "sell_qty": 0.0, "sell_value": 0.0, "last_price": None}
+                )
                 b["buy_qty"] += delta["buy_qty"]
                 b["buy_value"] += delta["buy_value"]
                 b["sell_qty"] += delta["sell_qty"]
                 b["sell_value"] += delta["sell_value"]
+                if delta.get("last_price") is not None:
+                    b["last_price"] = delta["last_price"]
 
 
 def fetch_nxt_scan_scores(limit: int = NXT_RANKING_POOL_SIZE):
@@ -701,8 +710,11 @@ async def _ws_worker():
             # 2건씩)를 훌쩍 넘어서 MAX SUBSCRIBE OVER로 계속 끊기는 문제가 있어 되돌림.
             # NXT 관심종목(무조건) + 일반 관심종목 + 최근 조회종목 + NXT 자동 스캔 상위로
             # 20개를 채움 — 자세한 우선순위는 _get_watchlist_codes() 참고.
-            _ensure_nxt_ranking_cached()
-            codes = _get_watchlist_codes()
+            # ⚠️ 아래 두 함수는 Supabase/pykrx 네트워크 호출을 동기(블로킹) 방식으로 하기 때문에,
+            # asyncio.to_thread로 별도 스레드에서 돌려야 이 작업이 진행되는 동안 다른 API 요청
+            # (예: Control 페이지의 PC 조회 프록시)이 이벤트 루프에서 막히지 않음
+            await asyncio.to_thread(_ensure_nxt_ranking_cached)
+            codes = await asyncio.to_thread(_get_watchlist_codes)
             if not codes:
                 print("[ws_worker] 구독할 종목이 없어 잠시 대기합니다.")
                 await asyncio.sleep(300)
@@ -741,14 +753,14 @@ async def _ws_worker():
                                     print(f"[ws_worker] 구독 응답 이상: {msg[:300]}")
 
                     if time.time() - last_flush > 5:
-                        _flush_tick_buckets()
+                        await asyncio.to_thread(_flush_tick_buckets)
                         last_flush = time.time()
 
                     # 5분마다 관심종목 목록 갱신 — 이때 NXT 스캔 캐시도 같이 확인해서,
                     # 장중에 15:35를 넘기는 순간 자동으로 스캔 상위 종목이 채워지게 함
                     if time.time() - last_refresh > 300:
-                        _ensure_nxt_ranking_cached()
-                        new_codes = _get_watchlist_codes()
+                        await asyncio.to_thread(_ensure_nxt_ranking_cached)
+                        new_codes = await asyncio.to_thread(_get_watchlist_codes)
                         added = [c for c in new_codes if c not in codes]
                         for code in added:
                             for tr_id in ("H0STCNT0", "H0NXCNT0"):
@@ -807,7 +819,7 @@ def tick_avg_endpoint(code: str, market: str = "KRX", date: str = "", start: str
         candles = [
             {
                 "label": r["minute"],
-                "close": None,
+                "close": r.get("last_price"),
                 "avg_price": round(sum(x["buy_value"] for x in rows if x["minute"] <= r["minute"])
                                     / sum(x["buy_qty"] for x in rows if x["minute"] <= r["minute"]), 1)
                 if sum(x["buy_qty"] for x in rows if x["minute"] <= r["minute"]) > 0 else 0,
@@ -821,6 +833,7 @@ def tick_avg_endpoint(code: str, market: str = "KRX", date: str = "", start: str
             "sell_avg": sell_avg,
             "buy_qty": buy_qty,
             "sell_qty": sell_qty,
+            "current_price": rows[-1].get("last_price"),
             "candles": candles,
             "is_estimate": False,  # 실제 체결 구분 기반 정밀값
         }
@@ -903,6 +916,7 @@ def tick_avg_combined_endpoint(code: str, date: str = ""):
                 {
                     "label": r["minute"],
                     "session": session,
+                    "close": r.get("last_price"),
                     "avg_price": round(cum_buy_value / cum_buy_qty, 1) if cum_buy_qty > 0 else 0,
                     "sell_avg_price": round(cum_sell_value / cum_sell_qty, 1) if cum_sell_qty > 0 else 0,
                 }
@@ -915,6 +929,7 @@ def tick_avg_combined_endpoint(code: str, date: str = ""):
             "sell_avg": sell_avg,
             "buy_qty": buy_qty_total,
             "sell_qty": sell_qty_total,
+            "current_price": rows[-1].get("last_price"),
             "candles": candles,
             "is_estimate": False,
         }
