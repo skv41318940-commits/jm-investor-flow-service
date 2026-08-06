@@ -542,10 +542,21 @@ def nxt_watchlist_list():
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/nxt-eligible")
+def nxt_eligible_endpoint(code: str):
+    """이 종목이 NXT 거래가능 608종목에 포함되는지 확인 (관심종목 추가 전 프론트에서 미리 검증할 때 사용)"""
+    return {"ok": True, "eligible": code in NXT_ELIGIBLE_CODES}
+
+
 @app.get("/api/nxt-watchlist/add")
 def nxt_watchlist_add(code: str, name: str):
-    """NXT 전용 관심종목 추가 — 최대 10개까지만"""
+    """NXT 전용 관심종목 추가 — 최대 10개까지만, NXT 거래가능 608종목만 허용"""
     try:
+        if code not in NXT_ELIGIBLE_CODES:
+            return {
+                "ok": False,
+                "error": f"{name}({code})은(는) NXT에서 거래되지 않는 종목이라 정밀 세력평단을 쌓을 수 없어요.",
+            }
         existing = supabase.table("nxt_watchlist").select("stock_code").execute()
         codes = {r["stock_code"] for r in existing.data}
         if code in codes:
@@ -746,8 +757,17 @@ async def _ws_worker():
                         if msg.startswith("0") or msg.startswith("1"):
                             _parse_realtime_message(msg)
                         elif msg.startswith("{"):
-                            # 구독 응답(JSON) — 실패한 것만 로그로 남김 (608개 성공은 굳이 다 안 찍음)
-                            if "SUCCESS" not in msg:
+                            try:
+                                parsed = json.loads(msg)
+                            except Exception:
+                                parsed = {}
+                            tr_id = parsed.get("header", {}).get("tr_id")
+                            if tr_id == "PINGPONG":
+                                # ⚠️ 한투 API는 서버가 주기적으로 PINGPONG을 보내고, 클라이언트가 그대로
+                                # 되돌려주지 않으면 서버가 연결을 강제로 끊음(no close frame received or
+                                # sent 에러의 원인이었음). 그대로 echo 해줘야 연결이 안정적으로 유지됨.
+                                await ws.send(msg)
+                            elif "SUCCESS" not in msg:
                                 sub_error_count += 1
                                 if sub_error_count <= 20:  # 로그 폭주 방지
                                     print(f"[ws_worker] 구독 응답 이상: {msg[:300]}")
