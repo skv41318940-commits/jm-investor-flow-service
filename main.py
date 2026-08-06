@@ -27,7 +27,25 @@ KST = timezone(timedelta(hours=9))
 
 def now_kst() -> datetime:
     return datetime.now(KST)
-from pykrx import stock
+
+
+# ⚠️ pykrx는 import되는 순간 내부적으로 KRX 웹사이트에 자동 로그인을 시도함
+# (KRX_ID/KRX_PW 환경변수 사용). KRX 서버가 그 순간 잠깐이라도 이상한 응답(빈 응답,
+# 오류 페이지 등)을 주면 pykrx가 예외 처리 없이 그대로 죽는데, 이게 import 시점에
+# 터지면 uvicorn이 앱을 아예 못 띄우고 서비스 전체가 죽어버림 (2026-08-06 저녁에 실제
+# 발생한 장애). 이런 일시적 KRX 쪽 문제로 서비스 전체가 죽지 않도록 몇 번 재시도함.
+_PYKRX_IMPORT_RETRIES = 5
+for _pykrx_attempt in range(1, _PYKRX_IMPORT_RETRIES + 1):
+    try:
+        from pykrx import stock
+
+        break
+    except Exception as _pykrx_err:
+        print(f"[pykrx import] {_pykrx_attempt}/{_PYKRX_IMPORT_RETRIES}번째 시도 실패: {_pykrx_err}")
+        if _pykrx_attempt == _PYKRX_IMPORT_RETRIES:
+            raise
+        time.sleep(5)
+
 from supabase import create_client
 
 # ── 환경변수로 받음 (Render 대시보드에서 설정) ──
