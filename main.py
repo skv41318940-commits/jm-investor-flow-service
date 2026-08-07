@@ -898,7 +898,7 @@ def kis_overseas_daily_debug(symbol: str = "AAPL", market: str = "NAS"):
         data = kis_get(
             "/uapi/overseas-price/v1/quotations/dailyprice",
             "HHDFS76240000",
-            {"AUTH": "", "EXCD": market, "SYMB": symbol, "GUBN": "0", "BYMD": "", "MODP": "0"},
+            {"AUTH": "", "EXCD": market, "SYMB": symbol, "GUBN": "0", "BYMD": now_kst().strftime("%Y%m%d"), "MODP": "0"},
         )
         return {"ok": True, "raw": data}
     except Exception as e:
@@ -950,27 +950,34 @@ def _estimate_overseas_daily_avg(symbol: str, market: str, start: str, end: str)
     실제 매수/매도 체결 구분이 아니라 "추정"이라 항상 근사치.
 
     ⚠️ 이 API가 가끔 output2가 비어있는 등 일시적으로 이상한 응답을 줄 때가 있어서
-    (2026-08-07 확인됨 — 같은 종목을 몇 분 뒤 다시 부르면 정상 응답), 최대 2번 재시도함.
+    (2026-08-07~08 확인됨), 최대 3번 재시도하되 매번 BYMD(기준일자)를 다르게
+    시도함 — 오늘 날짜, 어제 날짜, 빈 값(한투 기본 동작) 순서로 시도해서 뭐가
+    먹히는지 확인. 특히 주말/휴장일엔 "오늘"이 거래일이 아니라서 빈 응답이 나오는
+    걸로 의심됨.
     """
+    now = now_kst()
+    yesterday = now - timedelta(days=1)
+    bymd_attempts = [now.strftime("%Y%m%d"), yesterday.strftime("%Y%m%d"), ""]
+
     rows = []
     last_error = None
-    for attempt in range(3):
+    for attempt, bymd in enumerate(bymd_attempts):
         try:
             data = kis_get(
                 "/uapi/overseas-price/v1/quotations/dailyprice",
                 "HHDFS76240000",
-                {"AUTH": "", "EXCD": market, "SYMB": symbol, "GUBN": "0", "BYMD": "", "MODP": "0"},
+                {"AUTH": "", "EXCD": market, "SYMB": symbol, "GUBN": "0", "BYMD": bymd, "MODP": "0"},
             )
             rows = data.get("output2") or []
             if rows:
                 break
-            last_error = f"output2가 비어있음 (rt_cd={data.get('rt_cd')}, msg={data.get('msg1')})"
+            last_error = f"output2가 비어있음 (BYMD={bymd or '(빈값)'}, rt_cd={data.get('rt_cd')}, msg={data.get('msg1')})"
         except Exception as e:
             last_error = str(e)
-        if attempt < 2:
+        if attempt < len(bymd_attempts) - 1:
             time.sleep(1.5)
     if not rows:
-        raise ValueError(f"해외 일봉 데이터를 가져오지 못했어요 (3번 재시도 후에도 실패: {last_error}).")
+        raise ValueError(f"해외 일봉 데이터를 가져오지 못했어요 ({len(bymd_attempts)}번 재시도 후에도 실패: {last_error}).")
 
     # 최신순으로 오니 오래된 순으로 뒤집고, 요청한 기간(start~end)만 필터링
     rows = sorted(rows, key=lambda r: r["xymd"])
