@@ -832,23 +832,49 @@ def overseas_subscribe_preview_endpoint():
 @app.get("/api/overseas-search")
 def overseas_search_endpoint(q: str, limit: int = 8):
     """
-    해외주식 종목 마스터(overseas_stock_master)에서 검색 — 나스닥 스크리너 7205종목 +
-    다우30(거래소 확인됨) 등이 들어있음. 한글 이름 검색은 아직 지원 안 함(이 테이블엔
-    영문명만 있음) — 티커나 영문 회사명으로 검색됨. market이 이미 알려진 종목은 그대로
-    쓰면 되고, market이 null이면 프론트에서 /api/overseas-resolve로 자동 감지해서 이어감.
+    해외주식 종목 검색 — 두 테이블을 합쳐서 검색함:
+      1) overseas_name_aliases_kr — 사람이 직접 큐레이션한 한글 별칭(종목명 한글→티커+거래소).
+         한글 검색은 이 테이블에 있는 것만 됨(자동 번역 아님) — 매칭되면 거래소까지 바로 확정됨.
+      2) overseas_stock_master — 나스닥 스크리너 7205종목 + 다우30 등, 티커/영문명 검색용.
+    한글 별칭 결과를 먼저 붙이고, 그다음 영문/티커 검색 결과를 이어붙임 (중복 제거).
     """
     q = q.strip()
     if not q:
         return {"ok": True, "items": []}
     try:
-        res = (
-            supabase.table("overseas_stock_master")
-            .select("symbol,name,market")
-            .or_(f"symbol.ilike.%{q}%,name.ilike.%{q}%")
-            .limit(limit)
-            .execute()
-        )
-        return {"ok": True, "items": res.data}
+        items = []
+        seen = set()
+
+        try:
+            alias_res = (
+                supabase.table("overseas_name_aliases_kr")
+                .select("keyword_kr,symbol,market,name_en")
+                .ilike("keyword_kr", f"%{q}%")
+                .limit(limit)
+                .execute()
+            )
+            for r in alias_res.data:
+                if r["symbol"] not in seen:
+                    seen.add(r["symbol"])
+                    items.append({"symbol": r["symbol"], "name": r.get("name_en") or r["keyword_kr"], "market": r["market"]})
+        except Exception as e:
+            print(f"[overseas_search] 한글 별칭 검색 실패: {e}")
+
+        remaining = limit - len(items)
+        if remaining > 0:
+            res = (
+                supabase.table("overseas_stock_master")
+                .select("symbol,name,market")
+                .or_(f"symbol.ilike.%{q}%,name.ilike.%{q}%")
+                .limit(remaining)
+                .execute()
+            )
+            for r in res.data:
+                if r["symbol"] not in seen:
+                    seen.add(r["symbol"])
+                    items.append(r)
+
+        return {"ok": True, "items": items}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
