@@ -948,15 +948,29 @@ def _estimate_overseas_daily_avg(symbol: str, market: str, start: str, end: str)
     한투 해외주식 기간별시세(HHDFS76240000)의 일봉으로, 국내 근사치랑 같은 방식
     (시가 대비 종가 움직임 크기로 그날 거래량을 매수/매도로 추정 배분)으로 계산함.
     실제 매수/매도 체결 구분이 아니라 "추정"이라 항상 근사치.
+
+    ⚠️ 이 API가 가끔 output2가 비어있는 등 일시적으로 이상한 응답을 줄 때가 있어서
+    (2026-08-07 확인됨 — 같은 종목을 몇 분 뒤 다시 부르면 정상 응답), 최대 2번 재시도함.
     """
-    data = kis_get(
-        "/uapi/overseas-price/v1/quotations/dailyprice",
-        "HHDFS76240000",
-        {"AUTH": "", "EXCD": market, "SYMB": symbol, "GUBN": "0", "BYMD": "", "MODP": "0"},
-    )
-    rows = data.get("output2") or []
+    rows = []
+    last_error = None
+    for attempt in range(3):
+        try:
+            data = kis_get(
+                "/uapi/overseas-price/v1/quotations/dailyprice",
+                "HHDFS76240000",
+                {"AUTH": "", "EXCD": market, "SYMB": symbol, "GUBN": "0", "BYMD": "", "MODP": "0"},
+            )
+            rows = data.get("output2") or []
+            if rows:
+                break
+            last_error = f"output2가 비어있음 (rt_cd={data.get('rt_cd')}, msg={data.get('msg1')})"
+        except Exception as e:
+            last_error = str(e)
+        if attempt < 2:
+            time.sleep(1.5)
     if not rows:
-        raise ValueError("해외 일봉 데이터를 가져오지 못했어요.")
+        raise ValueError(f"해외 일봉 데이터를 가져오지 못했어요 (3번 재시도 후에도 실패: {last_error}).")
 
     # 최신순으로 오니 오래된 순으로 뒤집고, 요청한 기간(start~end)만 필터링
     rows = sorted(rows, key=lambda r: r["xymd"])
