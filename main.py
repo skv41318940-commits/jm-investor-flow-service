@@ -298,14 +298,31 @@ IDX_BSOP_DATE = 33
 TICK_FIELD_COUNT = 46
 
 
+_approval_key_cache: dict = {"key": None, "issued_at": 0.0}
+_approval_key_lock = threading.Lock()
+
+
 def get_ws_approval_key() -> str:
-    res = requests.post(
-        f"{KIS_BASE_URL}/oauth2/Approval",
-        json={"grant_type": "client_credentials", "appkey": KIS_APP_KEY, "secretkey": KIS_APP_SECRET},
-        timeout=10,
-    )
-    res.raise_for_status()
-    return res.json()["approval_key"]
+    """
+    실시간 웹소켓용 승인키 발급. ⚠️ 한투는 이 발급 API를 너무 자주 부르면 제한이 걸리는데,
+    국내(_ws_worker)+해외(_overseas_ws_worker) 두 워커가 각자 재연결할 때마다 매번 새로
+    발급받고 있었던 게 실제 원인으로 의심됨(2026-08-07 NXT 정밀 재발 장애). 그래서
+    캐싱해서 일정 시간(6시간) 안에는 새로 발급 안 받고 재사용하게 함.
+    """
+    with _approval_key_lock:
+        if _approval_key_cache["key"] and (time.time() - _approval_key_cache["issued_at"]) < 6 * 3600:
+            return _approval_key_cache["key"]
+
+        res = requests.post(
+            f"{KIS_BASE_URL}/oauth2/Approval",
+            json={"grant_type": "client_credentials", "appkey": KIS_APP_KEY, "secretkey": KIS_APP_SECRET},
+            timeout=10,
+        )
+        res.raise_for_status()
+        key = res.json()["approval_key"]
+        _approval_key_cache["key"] = key
+        _approval_key_cache["issued_at"] = time.time()
+        return key
 
 
 def _add_tick(code: str, market: str, hhmmss: str, bsop_date: str, price: float, qty: float, ccld_dvsn: str):
