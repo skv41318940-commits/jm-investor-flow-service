@@ -302,6 +302,15 @@ _approval_key_cache: dict = {}  # purpose -> {"key": ..., "issued_at": ...}
 _approval_key_lock = threading.Lock()
 
 
+def invalidate_ws_approval_key(purpose: str):
+    """
+    연결이 계속 실패하면(정확한 만료 시간을 몰라도) "이 키가 상했다"고 보고 캐시를 지워서,
+    다음 get_ws_approval_key() 호출 때 강제로 새 키를 발급받게 함.
+    """
+    with _approval_key_lock:
+        _approval_key_cache.pop(purpose, None)
+
+
 def get_ws_approval_key(purpose: str = "domestic") -> str:
     """
     실시간 웹소켓용 승인키 발급.
@@ -1194,6 +1203,7 @@ async def _ws_worker():
         print("[ws_worker] KIS 키 미설정으로 실시간 누적을 건너뜁니다.")
         return
 
+    consecutive_failures = 0
     while True:
         now = now_kst()
         start_t = now.replace(hour=7, minute=50, second=0, microsecond=0)
@@ -1228,6 +1238,7 @@ async def _ws_worker():
                         await ws.send(json.dumps(sub))
                         await asyncio.sleep(0.1)
                 print(f"[ws_worker] {len(codes)}개 종목({NXT_WS_SUBSCRIBE_LIMIT}개 상한) 구독 요청 완료 (KRX+NXT)")
+                consecutive_failures = 0  # 연결/구독까지 성공했으니 실패 카운트 초기화
 
                 last_flush = time.time()
                 last_refresh = time.time()
@@ -1281,7 +1292,14 @@ async def _ws_worker():
 
                 _flush_tick_buckets()
         except Exception as e:
-            print(f"[ws_worker] 연결 오류, 10초 후 재시도: {e}")
+            consecutive_failures += 1
+            print(f"[ws_worker] 연결 오류({consecutive_failures}번째), 10초 후 재시도: {e}")
+            if consecutive_failures >= 3:
+                # 정확한 만료 시간을 몰라서 6시간으로 캐싱해뒀는데, 실제로는 더 일찍 상했을 수
+                # 있음 — 연속으로 계속 실패하면 캐시된 키가 문제라고 보고 강제로 새로 발급받음
+                # (2026-08-07 국내장 애프터마켓 중 계속 재연결 실패하던 장애의 원인으로 추정됨)
+                print("[ws_worker] 연속 실패 3회 이상 — 승인키를 강제로 재발급받습니다.")
+                invalidate_ws_approval_key("domestic")
             await asyncio.sleep(10)
 
 
@@ -1348,6 +1366,7 @@ async def _overseas_ws_worker():
         print("[overseas_ws_worker] websockets 미설치 또는 KIS 키 미설정으로 건너뜁니다.")
         return
 
+    consecutive_failures = 0
     while True:
         now = now_kst()
         if not _in_overseas_window(now) or now.weekday() >= 5:
@@ -1371,6 +1390,7 @@ async def _overseas_ws_worker():
                     await ws.send(json.dumps(sub))
                     await asyncio.sleep(0.1)
                 print(f"[overseas_ws_worker] {len(watch)}개 종목 구독 요청 완료 (HDFSCNT0)")
+                consecutive_failures = 0
 
                 last_flush = time.time()
                 last_refresh = time.time()
@@ -1419,7 +1439,11 @@ async def _overseas_ws_worker():
 
                 await asyncio.to_thread(_flush_overseas_tick_buckets)
         except Exception as e:
-            print(f"[overseas_ws_worker] 연결 오류, 10초 후 재시도: {e}")
+            consecutive_failures += 1
+            print(f"[overseas_ws_worker] 연결 오류({consecutive_failures}번째), 10초 후 재시도: {e}")
+            if consecutive_failures >= 3:
+                print("[overseas_ws_worker] 연속 실패 3회 이상 — 승인키를 강제로 재발급받습니다.")
+                invalidate_ws_approval_key("overseas")
             await asyncio.sleep(10)
 
 
