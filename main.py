@@ -1041,9 +1041,21 @@ def sync_nxt_ranking_endpoint(limit: int = NXT_RANKING_POOL_SIZE, force: bool = 
 
 @app.get("/api/nxt-ranking")
 def nxt_ranking_endpoint(date: str = ""):
-    """오늘자(또는 지정 날짜, YYYY-MM-DD) NXT 스캔 순위 조회 — 프론트엔드 표시용"""
-    trade_date = date or now_kst().strftime("%Y-%m-%d")
+    """
+    NXT 스캔 순위 조회 — 프론트엔드 표시용.
+    date를 명시하면 그 날짜만 정확히 조회(과거 복습용). 비워두면 "오늘 날짜"가 아니라
+    "가장 최근에 스캔된 날짜"를 보여줌 — 안 그러면 그날 15:35 스캔 전엔 매번 텅 비어
+    보이는 문제가 있었음(구독 로직은 이미 이렇게 되어 있었는데 이 조회용 API만 안 맞춰져 있었음).
+    """
     try:
+        if date:
+            trade_date = date
+        else:
+            latest = (
+                supabase.table("nxt_daily_ranking").select("scan_date").order("scan_date", desc=True).limit(1).execute()
+            )
+            trade_date = latest.data[0]["scan_date"] if latest.data else now_kst().strftime("%Y-%m-%d")
+
         res = supabase.table("nxt_daily_ranking").select("*").eq("scan_date", trade_date).order("rank").execute()
         return {"ok": True, "scan_date": trade_date, "items": res.data}
     except Exception as e:
