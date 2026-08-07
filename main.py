@@ -942,14 +942,93 @@ def overseas_resolve_endpoint(symbol: str):
     return {"ok": False, "error": f"'{symbol}' 종목을 9개 거래소 어디에서도 찾지 못했어요. 코드가 정확한지 확인해주세요."}
 
 
+def _estimate_overseas_daily_avg(symbol: str, market: str, start: str, end: str) -> dict:
+    """
+    해외주식 근사치 세력평단 — 정밀 추적 데이터가 없을 때 쓰는 폴백.
+    한투 해외주식 기간별시세(HHDFS76240000)의 일봉으로, 국내 근사치랑 같은 방식
+    (시가 대비 종가 움직임 크기로 그날 거래량을 매수/매도로 추정 배분)으로 계산함.
+    실제 매수/매도 체결 구분이 아니라 "추정"이라 항상 근사치.
+    """
+    data = kis_get(
+        "/uapi/overseas-price/v1/quotations/dailyprice",
+        "HHDFS76240000",
+        {"AUTH": "", "EXCD": market, "SYMB": symbol, "GUBN": "0", "BYMD": "", "MODP": "0"},
+    )
+    rows = data.get("output2") or []
+    if not rows:
+        raise ValueError("해외 일봉 데이터를 가져오지 못했어요.")
+
+    # 최신순으로 오니 오래된 순으로 뒤집고, 요청한 기간(start~end)만 필터링
+    rows = sorted(rows, key=lambda r: r["xymd"])
+    rows = [
+        r
+        for r in rows
+        if start.replace("-", "") <= r["xymd"] <= end.replace("-", "")
+    ]
+    if not rows:
+        raise ValueError(f"{start}~{end} 구간에 해당하는 일봉 데이터가 없어요.")
+
+    candles = []
+    cum_buy_qty = cum_buy_value = cum_sell_qty = cum_sell_value = 0.0
+    for r in rows:
+        try:
+            open_p = float(r["open"])
+            close_p = float(r["clos"])
+            vol = float(r["tvol"])
+        except (KeyError, ValueError):
+            continue
+        if open_p <= 0 or vol <= 0:
+            continue
+
+        if close_p >= open_p:
+            ratio = min(((close_p - open_p) / open_p) * 5, 0.45)
+            net_buy = vol * ratio
+        else:
+            ratio = min(((open_p - close_p) / open_p) * 5, 0.45)
+            net_buy = -vol * ratio
+        buy_qty = max(0.0, (vol + net_buy) / 2)
+        sell_qty = max(0.0, (vol - net_buy) / 2)
+
+        cum_buy_qty += buy_qty
+        cum_buy_value += close_p * buy_qty
+        cum_sell_qty += sell_qty
+        cum_sell_value += close_p * sell_qty
+
+        trade_date = f"{r['xymd'][:4]}-{r['xymd'][4:6]}-{r['xymd'][6:8]}"
+        candles.append(
+            {
+                "date": trade_date,
+                "close": close_p,
+                "avg_price": round(cum_buy_value / cum_buy_qty, 2) if cum_buy_qty > 0 else 0,
+                "sell_avg_price": round(cum_sell_value / cum_sell_qty, 2) if cum_sell_qty > 0 else 0,
+            }
+        )
+
+    if not candles:
+        raise ValueError("근사치를 계산할 유효한 일봉이 없어요.")
+
+    return {
+        "symbol": symbol,
+        "market": market,
+        "start": start,
+        "end": end,
+        "current_price": candles[-1]["close"],
+        "force_buy_avg": round(cum_buy_value / cum_buy_qty, 2) if cum_buy_qty > 0 else 0,
+        "force_sell_avg": round(cum_sell_value / cum_sell_qty, 2) if cum_sell_qty > 0 else 0,
+        "buy_qty": round(cum_buy_qty),
+        "sell_qty": round(cum_sell_qty),
+        "candles": candles,
+        "is_estimate": True,
+    }
+
+
 @app.get("/api/overseas-avg")
 def overseas_avg_endpoint(symbol: str, market: str = "NAS", start: str = "", end: str = ""):
     """
-    해외주식 기간별 정밀 세력평단 — overseas_daily_flow에 쌓인 일별 누적 매수/매도를
-    구간 합산해서 계산. 국내처럼 분봉이 아니라 하루 단위라 계산이 훨씬 단순함.
-    start/end 비우면 최근 90일. 그 구간에 정밀 데이터가 하나도 없으면 에러 반환
-    (이 프로젝트는 해외주식에 근사치 폴백을 안 두기로 함 — 관심종목으로 등록해서
-    직접 추적한 기간만 정밀하게 볼 수 있음).
+    해외주식 기간별 세력평단 — overseas_daily_flow에 쌓인 일별 누적 매수/매도가 있으면
+    정밀(is_estimate:false)로, 없으면 한투 해외 일봉 API 기반 근사치(is_estimate:true)로
+    자동 폴백함. 국내(queryAvg)와 같은 2단 구조 — 관심종목/최근조회로 추적을 시작한
+    기간만 정밀이고, 나머지는 항상 근사치로라도 값을 보여줌.
     """
     market = _normalize_overseas_market(market)
     end = end or now_kst().strftime("%Y-%m-%d")
@@ -970,9 +1049,15 @@ def overseas_avg_endpoint(symbol: str, market: str = "NAS", start: str = "", end
         )
         rows = res.data
         if not rows:
-            return {
-                "error": f"{start}~{end} 구간에 정밀 추적 데이터가 없어요. 이 종목을 검색하면 자동으로 추적이 시작되니, 다음 미국장부터 데이터가 쌓이는 대로 다시 조회해보세요."
-            }
+            # 정밀 데이터가 없으면 근사치로 자동 폴백 (국내와 동일한 2단 구조)
+            try:
+                fallback = _estimate_overseas_daily_avg(symbol, market, start, end)
+                fallback["note"] = "이 종목을 검색하면 자동으로 추적이 시작되니, 다음 미국장부터는 정밀 데이터로 바뀌어요."
+                return fallback
+            except Exception as e:
+                return {
+                    "error": f"{start}~{end} 구간에 정밀 추적 데이터가 없고, 근사치 계산도 실패했어요: {e}"
+                }
 
         buy_qty_total = sum(r["buy_qty"] for r in rows)
         buy_value_total = sum(r["buy_value"] for r in rows)
