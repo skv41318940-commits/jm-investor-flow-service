@@ -298,20 +298,24 @@ IDX_BSOP_DATE = 33
 TICK_FIELD_COUNT = 46
 
 
-_approval_key_cache: dict = {"key": None, "issued_at": 0.0}
+_approval_key_cache: dict = {}  # purpose -> {"key": ..., "issued_at": ...}
 _approval_key_lock = threading.Lock()
 
 
-def get_ws_approval_key() -> str:
+def get_ws_approval_key(purpose: str = "domestic") -> str:
     """
-    실시간 웹소켓용 승인키 발급. ⚠️ 한투는 이 발급 API를 너무 자주 부르면 제한이 걸리는데,
-    국내(_ws_worker)+해외(_overseas_ws_worker) 두 워커가 각자 재연결할 때마다 매번 새로
-    발급받고 있었던 게 실제 원인으로 의심됨(2026-08-07 NXT 정밀 재발 장애). 그래서
-    캐싱해서 일정 시간(6시간) 안에는 새로 발급 안 받고 재사용하게 함.
+    실시간 웹소켓용 승인키 발급.
+    ⚠️ 한투 실시간 웹소켓은 승인키 하나당 접속을 하나만 허용하는 것으로 보임 — 국내/해외
+    워커가 승인키를 "공유"해서 캐싱했더니, 국내가 이미 그 키로 접속해있는 상태에서 해외가
+    같은 키로 또 접속을 시도하면서 계속 튕겨나가는 장애가 있었음(2026-08-07). 그래서
+    purpose(domestic/overseas)별로 완전히 별도의 승인키를 발급·캐싱하도록 분리함.
+    (발급 API 자체를 너무 자주 부르면 제한 걸리는 문제는 여전히 있어서, 각 purpose 안에서는
+    6시간 캐싱 유지)
     """
     with _approval_key_lock:
-        if _approval_key_cache["key"] and (time.time() - _approval_key_cache["issued_at"]) < 6 * 3600:
-            return _approval_key_cache["key"]
+        cached = _approval_key_cache.get(purpose)
+        if cached and (time.time() - cached["issued_at"]) < 6 * 3600:
+            return cached["key"]
 
         res = requests.post(
             f"{KIS_BASE_URL}/oauth2/Approval",
@@ -320,8 +324,7 @@ def get_ws_approval_key() -> str:
         )
         res.raise_for_status()
         key = res.json()["approval_key"]
-        _approval_key_cache["key"] = key
-        _approval_key_cache["issued_at"] = time.time()
+        _approval_key_cache[purpose] = {"key": key, "issued_at": time.time()}
         return key
 
 
@@ -1326,7 +1329,7 @@ async def _overseas_ws_worker():
             continue
 
         try:
-            approval_key = get_ws_approval_key()
+            approval_key = get_ws_approval_key("overseas")
             watch = await asyncio.to_thread(_get_overseas_watchlist_symbols)
             if not watch:
                 print("[overseas_ws_worker] 구독할 해외주식 관심종목이 없어 잠시 대기합니다.")
@@ -1569,7 +1572,7 @@ async def overseas_ws_debug(symbol: str = "AAPL", market: str = "NAS", seconds: 
     서머타임에 따라 1시간 당겨짐). 그 시간 밖에 호출하면 count가 0으로 나오는 게 정상.
     """
     try:
-        approval_key = get_ws_approval_key()
+        approval_key = get_ws_approval_key("overseas")
         tr_key = f"D{market}{symbol}"
         raw_messages = []
 
