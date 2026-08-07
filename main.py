@@ -888,6 +888,23 @@ def overseas_search_endpoint(q: str, limit: int = 8):
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/kis-overseas-daily-debug")
+def kis_overseas_daily_debug(symbol: str = "AAPL", market: str = "NAS"):
+    """
+    디버그 전용 — 해외주식 기간별시세(일봉, HHDFS76240000) 원본 응답을 그대로 반환.
+    근사치(양봉/음봉 기반) 폴백을 만들기 전에 output2 필드명이 정확히 뭔지 확인하려는 용도.
+    """
+    try:
+        data = kis_get(
+            "/uapi/overseas-price/v1/quotations/dailyprice",
+            "HHDFS76240000",
+            {"AUTH": "", "EXCD": market, "SYMB": symbol, "GUBN": "0", "BYMD": "", "MODP": "0"},
+        )
+        return {"ok": True, "raw": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/overseas-resolve")
 def overseas_resolve_endpoint(symbol: str):
     """
