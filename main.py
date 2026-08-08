@@ -744,6 +744,125 @@ def _get_krx_etf_codes() -> set:
         return set()
 
 
+def _naver_headers():
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Referer": "https://finance.naver.com/",
+        "Accept-Language": "ko-KR,ko;q=0.9",
+    }
+
+
+def fetch_naver_theme_list(limit: int = 25):
+    """
+    "업종분석" 국내 탭용 — 네이버 증권 "테마별 시세"(https://finance.naver.com/sise/theme.naver)
+    인기 테마 목록. 2026-08-08 필드 확인 완료: 링크에서 no=(테마ID), 첫 번째 %가 등락률.
+    """
+    if BeautifulSoup is None:
+        raise RuntimeError("beautifulsoup4가 설치되어 있지 않습니다.")
+
+    res = requests.get("https://finance.naver.com/sise/theme.naver", headers=_naver_headers(), timeout=10)
+    soup = BeautifulSoup(res.content.decode("euc-kr", errors="replace"), "html.parser")
+    table = soup.find("table", class_="type_1")
+    if table is None:
+        raise ValueError("페이지에서 테마 목록 테이블을 찾지 못했어요 — 네이버 쪽 구조가 바뀌었을 수 있어요.")
+
+    def to_num(s):
+        if not s:
+            return 0.0
+        s = s.replace(",", "").replace("%", "").replace("+", "")
+        try:
+            return float(s)
+        except ValueError:
+            return 0.0
+
+    rows = []
+    for tr in table.find_all("tr"):
+        link = tr.find("a", href=re.compile(r"sise_group_detail\.naver\?type=theme"))
+        if link is None:
+            continue
+        no_match = re.search(r"no=(\d+)", link["href"])
+        if not no_match:
+            continue
+        theme_no = no_match.group(1)
+        theme_name = link.get_text(strip=True)
+        cell_texts = [td.get_text(strip=True) for td in tr.find_all("td")]
+        change_pct = to_num(cell_texts[1]) if len(cell_texts) > 1 else 0.0
+
+        rows.append({"rank": len(rows) + 1, "theme_no": theme_no, "theme_name": theme_name, "change_pct": change_pct})
+        if len(rows) >= limit:
+            break
+
+    if not rows:
+        raise ValueError("테마 행을 하나도 못 뽑았어요 — 컬럼 구조를 다시 확인해야 해요.")
+    return rows
+
+
+def fetch_naver_theme_detail(theme_no: str, limit: int = 30):
+    """
+    테마 하나를 클릭했을 때 보여줄 구성 종목 — NXT 스크래핑 때와 같은 방식(헤더를 직접
+    읽어서 컬럼 매핑, 순서 하드코딩 안 함)으로 견고하게 만듦.
+    """
+    if BeautifulSoup is None:
+        raise RuntimeError("beautifulsoup4가 설치되어 있지 않습니다.")
+
+    url = f"https://finance.naver.com/sise/sise_group_detail.naver?type=theme&no={theme_no}"
+    res = requests.get(url, headers=_naver_headers(), timeout=10)
+    soup = BeautifulSoup(res.content.decode("euc-kr", errors="replace"), "html.parser")
+    table = soup.find("table", class_="type_5")
+    if table is None:
+        raise ValueError("테마 상세 페이지에서 종목 테이블(table.type_5)을 찾지 못했어요.")
+
+    header_ths = table.find_all("th")
+    col_names = [th.get_text(strip=True) for th in header_ths]
+
+    etf_codes = _get_krx_etf_codes()
+
+    def to_num(s):
+        if not s:
+            return 0.0
+        s = s.replace(",", "").replace("%", "").replace("+", "")
+        try:
+            return float(s)
+        except ValueError:
+            return 0.0
+
+    rows = []
+    for tr in table.find_all("tr"):
+        link = tr.find("a", href=re.compile(r"code=\d{6}"))
+        if link is None:
+            continue
+        code_match = re.search(r"code=(\d{6})", link["href"])
+        if not code_match:
+            continue
+        code = code_match.group(1)
+        name = link.get_text(strip=True)
+        if code in etf_codes or _is_preferred_stock_name(name):
+            continue
+
+        cell_texts = [td.get_text(strip=True) for td in tr.find_all("td")]
+        value_map = {}
+        for i, col in enumerate(col_names):
+            if i < len(cell_texts):
+                value_map[col] = cell_texts[i]
+
+        rows.append(
+            {
+                "rank": len(rows) + 1,
+                "stock_code": code,
+                "stock_name": name,
+                "price": to_num(value_map.get("현재가", "0")),
+                "change_pct": to_num(value_map.get("등락률", "0")),
+                "volume": to_num(value_map.get("거래량", "0")),
+                "trading_value": to_num(value_map.get("거래대금", "0")),
+            }
+        )
+        if len(rows) >= limit:
+            break
+
+    return rows, col_names
+
+
 def fetch_naver_nxt_ranking(limit: int = 30):
     """
     네이버 증권 "NXT 거래상위"(https://finance.naver.com/sise/nxt_sise_quant.naver) 스크래핑.
@@ -886,6 +1005,109 @@ def fetch_overseas_group_ranking(markets: list, limit: int = 30):
     for i, r in enumerate(top, start=1):
         r["rank"] = i
     return top
+
+
+# 업종분석 해외 탭용 — 그룹당 대표 거래소 1개로만 업종을 집계함 (그룹 안 거래소 전부 다
+# 합치면 업종 40개 x 거래소 3개 = 최대 120번 API 호출이라 너무 느려짐. 대표 거래소
+# 하나만 써도 그 그룹의 업종 분위기를 보는 용도로는 충분하다고 판단함)
+OVERSEAS_SECTOR_PRIMARY_MARKET = {"US": "NAS", "JP": "TSE", "HK_CN": "HKS"}
+
+
+def fetch_overseas_sector_list(group_name: str, limit: int = 25):
+    """
+    "업종분석" 해외 탭 — 업종별시세(HHDFS76370000)가 "업종 평균 등락률"을 직접 안 줘서,
+    업종코드조회(HHDFS76370100)로 업종 목록을 받은 다음, 업종마다 구성종목을 다시 불러와서
+    그 안의 등락률(rate)을 저희가 직접 평균 내서 계산함.
+    """
+    market = OVERSEAS_SECTOR_PRIMARY_MARKET.get(group_name)
+    if not market:
+        raise ValueError(f"알 수 없는 그룹: {group_name}")
+
+    code_data = kis_get(
+        "/uapi/overseas-price/v1/quotations/industry-price", "HHDFS76370100", {"AUTH": "", "EXCD": market}
+    )
+    industries = [i for i in code_data.get("output2", []) if i.get("icod") and i.get("icod") != "000"]
+
+    results = []
+    for ind in industries:
+        icod = ind.get("icod")
+        name = ind.get("name")
+        try:
+            detail = kis_get(
+                "/uapi/overseas-price/v1/quotations/industry-theme",
+                "HHDFS76370000",
+                {"KEYB": "", "AUTH": "", "EXCD": market, "ICOD": icod, "VOL_RANG": "0"},
+            )
+            stocks = detail.get("output2") or []
+            rates = []
+            for s in stocks:
+                try:
+                    rates.append(float(s.get("rate") or 0))
+                except (TypeError, ValueError):
+                    continue
+            if not rates:
+                continue
+            avg_change = sum(rates) / len(rates)
+            results.append(
+                {"icod": icod, "sector_name": name, "change_pct": round(avg_change, 2), "stock_count": len(rates)}
+            )
+        except Exception as e:
+            print(f"[overseas_sector:{group_name}] {icod}({name}) 조회 실패: {e}")
+
+    results.sort(key=lambda r: r["change_pct"], reverse=True)
+    top = results[:limit]
+    for i, r in enumerate(top, start=1):
+        r["rank"] = i
+    return top
+
+
+def fetch_overseas_sector_detail(group_name: str, icod: str, limit: int = 30):
+    """업종 하나를 클릭했을 때 보여줄 구성 종목 — ETF/우선주/워런트 제외는 거래량순위와 동일 로직 재사용"""
+    market = OVERSEAS_SECTOR_PRIMARY_MARKET.get(group_name)
+    if not market:
+        raise ValueError(f"알 수 없는 그룹: {group_name}")
+
+    def to_f(s):
+        try:
+            return float(s)
+        except (TypeError, ValueError):
+            return 0.0
+
+    exclude_keywords = ("ETF", "FUND", "TRUST", "INDEX", "PREFERRED", "WARRANT", "NOTES", " SHARES", "PROSHARES")
+
+    def is_fund_or_warrant(symbol: str, name: str) -> bool:
+        name_upper = (name or "").upper()
+        if any(kw in name_upper for kw in exclude_keywords):
+            return True
+        if symbol and (symbol.endswith(".W") or "-P" in symbol or ".PR" in symbol):
+            return True
+        return False
+
+    data = kis_get(
+        "/uapi/overseas-price/v1/quotations/industry-theme",
+        "HHDFS76370000",
+        {"KEYB": "", "AUTH": "", "EXCD": market, "ICOD": icod, "VOL_RANG": "0"},
+    )
+    rows = []
+    for r in data.get("output2") or []:
+        symbol = r.get("symb") or ""
+        name = r.get("name") or r.get("ename") or symbol
+        if is_fund_or_warrant(symbol, name):
+            continue
+        rows.append(
+            {
+                "rank": len(rows) + 1,
+                "symbol": symbol,
+                "market": market,
+                "stock_name": name,
+                "price": to_f(r.get("last")),
+                "change_pct": to_f(r.get("rate")),
+                "volume": to_f(r.get("tvol")),
+            }
+        )
+        if len(rows) >= limit:
+            break
+    return rows
 
 
 def _ensure_overseas_ranking_cached(group_name: str):
@@ -1874,6 +2096,94 @@ def overseas_ranking_endpoint(group: str = "US", date: str = ""):
             .execute()
         )
         return {"ok": True, "scan_date": trade_date, "group": group, "items": res.data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ── 업종분석 (국내=테마, 해외=섹터) — 목록은 캐싱+새로고침, 구성종목 상세는 그때그때 실시간 조회 ──
+
+
+@app.get("/api/naver-theme-list")
+def naver_theme_list_endpoint():
+    """국내 테마 목록 조회 (캐시된 값) — 없으면 빈 목록 반환"""
+    try:
+        res = supabase.table("naver_theme_ranking").select("*").order("rank").limit(25).execute()
+        updated_at = res.data[0]["updated_at"] if res.data else None
+        return {"ok": True, "updated_at": updated_at, "items": res.data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/sync-naver-theme-list")
+def sync_naver_theme_list_endpoint():
+    """국내 테마 목록 새로고침 — 실시간으로 다시 긁어와서 캐시 갱신"""
+    try:
+        rows = fetch_naver_theme_list(limit=25)
+        now_iso = now_kst().isoformat()
+        for r in rows:
+            r["updated_at"] = now_iso
+        supabase.table("naver_theme_ranking").delete().neq("theme_no", "").execute()
+        supabase.table("naver_theme_ranking").insert(rows).execute()
+        return {"ok": True, "synced": len(rows), "updated_at": now_iso}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/naver-theme-detail")
+def naver_theme_detail_endpoint(theme_no: str, theme_name: str = ""):
+    """테마 하나의 구성 종목 — 실시간 직접 조회 (캐싱 안 함, 클릭할 때만 호출되니까)"""
+    try:
+        rows, col_names = fetch_naver_theme_detail(theme_no, limit=30)
+        return {"ok": True, "theme_no": theme_no, "theme_name": theme_name, "columns": col_names, "items": rows}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/overseas-sector-list")
+def overseas_sector_list_endpoint(group: str = "US"):
+    """해외 업종 목록 조회 (캐시된 값) — 없으면 빈 목록 반환"""
+    try:
+        res = (
+            supabase.table("overseas_sector_ranking")
+            .select("*")
+            .eq("group_name", group)
+            .order("rank")
+            .limit(25)
+            .execute()
+        )
+        updated_at = res.data[0]["updated_at"] if res.data else None
+        return {"ok": True, "group": group, "updated_at": updated_at, "items": res.data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/sync-overseas-sector-list")
+def sync_overseas_sector_list_endpoint(group: str = "US"):
+    """
+    해외 업종 목록 새로고침 — 업종 40개 각각 구성종목을 다시 불러와서 평균 등락률
+    재계산. 업종 개수만큼 API를 호출해서 다른 새로고침보다 시간이 좀 걸림.
+    """
+    if group not in OVERSEAS_SECTOR_PRIMARY_MARKET:
+        return {"ok": False, "error": f"group은 {'/'.join(OVERSEAS_SECTOR_PRIMARY_MARKET.keys())} 중 하나여야 해요."}
+    try:
+        rows = fetch_overseas_sector_list(group, limit=25)
+        now_iso = now_kst().isoformat()
+        for r in rows:
+            r["group_name"] = group
+            r["updated_at"] = now_iso
+        supabase.table("overseas_sector_ranking").delete().eq("group_name", group).execute()
+        supabase.table("overseas_sector_ranking").insert(rows).execute()
+        return {"ok": True, "synced": len(rows), "group": group, "updated_at": now_iso}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/overseas-sector-detail")
+def overseas_sector_detail_endpoint(group: str = "US", icod: str = "", sector_name: str = ""):
+    """해외 업종 하나의 구성 종목 — 실시간 직접 조회 (캐싱 안 함)"""
+    try:
+        rows = fetch_overseas_sector_detail(group, icod, limit=30)
+        return {"ok": True, "group": group, "icod": icod, "sector_name": sector_name, "items": rows}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
