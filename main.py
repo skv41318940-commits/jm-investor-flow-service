@@ -226,6 +226,12 @@ NXT_RANKING_POOL_SIZE = 30
 NXT_SCAN_HOUR = 15
 NXT_SCAN_MINUTE = 35
 
+# 네이버 증권 "NXT 거래상위" 스크래핑용 — 이건 위 NXT_SCAN_HOUR(608종목 스캔, KRX 마감
+# 기준 15:35)와 완전히 다른 목적/데이터라 시각도 따로 둠. NXT 애프터마켓 마감(20:00)
+# 직후로 잡음.
+NAVER_NXT_SCAN_HOUR = 20
+NAVER_NXT_SCAN_MINUTE = 5
+
 _tick_buckets: dict = {}  # (code, market, trade_date, minute) -> {"buy_qty","buy_value","sell_qty","sell_value"}
 _tick_lock = threading.Lock()
 _ws_debug_count = 0  # 처음 몇 개 메시지만 원본 로그 남겨서 필드 위치 검증용
@@ -770,6 +776,42 @@ def fetch_naver_nxt_ranking(limit: int = 30):
     if not rows:
         raise ValueError("테이블은 찾았는데 종목 행을 하나도 못 뽑았어요 — 컬럼 구조를 다시 확인해야 해요.")
     return rows, col_names
+
+
+def _ensure_naver_nxt_ranking_cached():
+    """네이버 NXT 거래상위 마감 스냅샷 — NXT 마감(20:00) 직후 하루 1번만 저장"""
+    now = now_kst()
+    if now.weekday() >= 5:
+        return
+    scan_time = now.replace(hour=NAVER_NXT_SCAN_HOUR, minute=NAVER_NXT_SCAN_MINUTE, second=0, microsecond=0)
+    if now < scan_time:
+        return
+
+    try:
+        trade_date = _resolve_nxt_scan_trade_date()
+    except Exception as e:
+        print(f"[naver_nxt_ranking] 거래일 확인 실패: {e}")
+        return
+
+    try:
+        existing = (
+            supabase.table("naver_nxt_daily_ranking").select("stock_code").eq("scan_date", trade_date).limit(1).execute()
+        )
+        if existing.data:
+            return
+    except Exception as e:
+        print(f"[naver_nxt_ranking] 캐시 확인 실패: {e}")
+        return
+
+    try:
+        rows, _ = fetch_naver_nxt_ranking(limit=30)
+        for r in rows:
+            r["scan_date"] = trade_date
+        supabase.table("naver_nxt_daily_ranking").delete().eq("scan_date", trade_date).execute()
+        supabase.table("naver_nxt_daily_ranking").insert(rows).execute()
+        print(f"[naver_nxt_ranking] {trade_date} 스캔 완료, {len(rows)}종목 캐싱")
+    except Exception as e:
+        print(f"[naver_nxt_ranking] 스캔 실패: {e}")
 
 
 def fetch_krx_volume_ranking(limit: int = 30):
@@ -1480,6 +1522,61 @@ def krx_ranking_endpoint(date: str = ""):
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/sync-naver-nxt-ranking")
+def sync_naver_nxt_ranking_endpoint(force: bool = False):
+    """네이버 NXT 거래상위 수동 스캔 트리거 (디버그/테스트용)"""
+    try:
+        trade_date = _resolve_nxt_scan_trade_date()
+        if not force:
+            existing = (
+                supabase.table("naver_nxt_daily_ranking")
+                .select("stock_code")
+                .eq("scan_date", trade_date)
+                .limit(1)
+                .execute()
+            )
+            if existing.data:
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "scan_date": trade_date,
+                    "message": "이 거래일 스캔이 이미 있습니다 (force=true로 재스캔 가능)",
+                }
+
+        rows, _ = fetch_naver_nxt_ranking(limit=30)
+        for r in rows:
+            r["scan_date"] = trade_date
+        supabase.table("naver_nxt_daily_ranking").delete().eq("scan_date", trade_date).execute()
+        supabase.table("naver_nxt_daily_ranking").insert(rows).execute()
+        return {"ok": True, "synced": len(rows), "scan_date": trade_date}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/naver-nxt-ranking")
+def naver_nxt_ranking_endpoint(date: str = ""):
+    """네이버 NXT 거래상위 조회 — date 비우면 가장 최근 스캔"""
+    try:
+        if date:
+            trade_date = date
+        else:
+            latest = (
+                supabase.table("naver_nxt_daily_ranking")
+                .select("scan_date")
+                .order("scan_date", desc=True)
+                .limit(1)
+                .execute()
+            )
+            trade_date = latest.data[0]["scan_date"] if latest.data else now_kst().strftime("%Y-%m-%d")
+
+        res = (
+            supabase.table("naver_nxt_daily_ranking").select("*").eq("scan_date", trade_date).order("rank").execute()
+        )
+        return {"ok": True, "scan_date": trade_date, "items": res.data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def _get_watchlist_codes_with_source() -> list:
     """
     _get_watchlist_codes()와 완전히 같은 우선순위 로직이지만, 각 종목이 어느 소스에서
@@ -1603,6 +1700,7 @@ async def _ws_worker():
             # (예: Control 페이지의 PC 조회 프록시)이 이벤트 루프에서 막히지 않음
             await asyncio.to_thread(_ensure_nxt_ranking_cached)
             await asyncio.to_thread(_ensure_krx_ranking_cached)
+            await asyncio.to_thread(_ensure_naver_nxt_ranking_cached)
             codes = await asyncio.to_thread(_get_watchlist_codes)
             if not codes:
                 print("[ws_worker] 구독할 종목이 없어 잠시 대기합니다.")
@@ -1660,6 +1758,7 @@ async def _ws_worker():
                     if time.time() - last_refresh > 300:
                         await asyncio.to_thread(_ensure_nxt_ranking_cached)
                         await asyncio.to_thread(_ensure_krx_ranking_cached)
+                        await asyncio.to_thread(_ensure_naver_nxt_ranking_cached)
                         new_codes = await asyncio.to_thread(_get_watchlist_codes)
                         added = [c for c in new_codes if c not in codes]
                         for code in added:
