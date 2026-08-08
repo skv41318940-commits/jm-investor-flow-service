@@ -17,7 +17,6 @@ import json
 from datetime import datetime, timedelta, timezone
 
 import requests
-from bs4 import BeautifulSoup
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -31,31 +30,21 @@ def now_kst() -> datetime:
 
 
 # ⚠️ pykrx는 import되는 순간 내부적으로 KRX 웹사이트에 자동 로그인을 시도함
-# (KRX_ID/KRX_PW 환경변수 사용). KRX 서버가 그 순간 이상한 응답(빈 응답, 오류 페이지
-# 등)을 주면 pykrx가 예외 처리 없이 그대로 죽는데, 이게 앱 시작 시점(import 시점)에
-# 터지면 uvicorn이 앱을 아예 못 띄우고 서비스 전체(KRX와 무관한 NXT/해외 랭킹 등)까지
-# 같이 죽어버림 (2026-08-06, 2026-08-08 실제 발생한 장애).
-#
-# NXT/해외 엔드포인트와 동일한 원칙 적용: KRX 문제가 앱 전체를 막지 않도록,
-# pykrx는 앱이 뜰 때 미리 import하지 않고, KRX 데이터가 실제로 필요한 요청이
-# 들어온 "그 순간"에만 import를 시도함 (지연 로딩). 그 요청만 실패하고 나머지
-# 엔드포인트(NXT, 해외, 헬스체크 등)는 영향받지 않음.
-class _LazyPykrxStock:
-    """pykrx.stock을 최초 사용 시점에만 import하는 프록시.
-    import(=KRX 로그인)가 실패해도 이 프록시를 쓰는 그 호출 하나만 예외가 나고,
-    앱 자체는 정상적으로 계속 떠 있음."""
+# (KRX_ID/KRX_PW 환경변수 사용). KRX 서버가 그 순간 잠깐이라도 이상한 응답(빈 응답,
+# 오류 페이지 등)을 주면 pykrx가 예외 처리 없이 그대로 죽는데, 이게 import 시점에
+# 터지면 uvicorn이 앱을 아예 못 띄우고 서비스 전체가 죽어버림 (2026-08-06 저녁에 실제
+# 발생한 장애). 이런 일시적 KRX 쪽 문제로 서비스 전체가 죽지 않도록 몇 번 재시도함.
+_PYKRX_IMPORT_RETRIES = 5
+for _pykrx_attempt in range(1, _PYKRX_IMPORT_RETRIES + 1):
+    try:
+        from pykrx import stock
 
-    _module = None
-
-    def __getattr__(self, name):
-        if _LazyPykrxStock._module is None:
-            from pykrx import stock as _real_stock
-
-            _LazyPykrxStock._module = _real_stock
-        return getattr(_LazyPykrxStock._module, name)
-
-
-stock = _LazyPykrxStock()
+        break
+    except Exception as _pykrx_err:
+        print(f"[pykrx import] {_pykrx_attempt}/{_PYKRX_IMPORT_RETRIES}번째 시도 실패: {_pykrx_err}")
+        if _pykrx_attempt == _PYKRX_IMPORT_RETRIES:
+            raise
+        time.sleep(5)
 
 from supabase import create_client
 
@@ -1007,9 +996,9 @@ def naver_nxt_debug():
     """
     디버그 전용 — 네이버 증권 "NXT 거래상위" 페이지를 직접 긁어와서 원본을 확인.
     실제 파싱 코드 짜기 전에 테이블 구조(HTML class, 컬럼 순서)를 먼저 확인하려는 용도.
-    ⚠️ 제 자체 웹 크롤러 도구에선 이 사이트가 차단됐었는데, 서버(Render)의 일반
-    requests 라이브러리로는 다를 수 있어서 시도해보는 것 — 이것도 막히면 다른
-    방법(예: 개발자도구 네트워크 탭에서 실제 데이터 API 찾기)을 시도해야 함.
+    ⚠️ 1차 시도 때 "종목명" 문자열을 못 찾아서 페이지 맨 앞(GNB)만 보여줬던 문제가 있어서,
+    이번엔 그 이유를 특정할 수 있게 여러 단서(테이블 개수/class, iframe 존재 여부,
+    "종목명"의 다른 표기 형태)를 한 번에 같이 반환함.
     """
     try:
         headers = {
@@ -1019,36 +1008,38 @@ def naver_nxt_debug():
             "Accept-Language": "ko-KR,ko;q=0.9",
         }
         res = requests.get("https://finance.naver.com/sise/nxt_sise_quant.naver", headers=headers, timeout=10)
-        res.encoding = "euc-kr"  # 네이버 증권 페이지는 전통적으로 EUC-KR 인코딩을 씀
-        html = res.text
 
-        # 텍스트 검색("종목명")은 상단 검색창 라벨에서 먼저 걸려버려서 실제 테이블까지
-        # 못 내려감 → 테이블을 CSS 클래스(type_2)로 직접 찾는 방식으로 변경.
-        soup = BeautifulSoup(html, "html.parser")
-        table = soup.find("table", class_="type_2")
+        # 인코딩 두 가지 다 시도해서 어느 쪽이 한글이 깨지지 않는지 같이 보여줌
+        raw_bytes = res.content
+        html_euckr = raw_bytes.decode("euc-kr", errors="replace")
+        html_utf8 = raw_bytes.decode("utf-8", errors="replace")
 
-        if table is None:
-            return {
-                "ok": False,
-                "status_code": res.status_code,
-                "total_length": len(html),
-                "reason": "type_2 테이블을 찾지 못했습니다.",
-                "all_table_classes": [t.get("class") for t in soup.find_all("table")],
-            }
+        import re
 
-        rows = table.find_all("tr")
-        data = []
-        for row in rows:
-            cols = row.find_all("td")
-            if len(cols) > 1:
-                data.append([c.get_text(strip=True) for c in cols])
+        tables = re.findall(r'<table[^>]*class="([^"]*)"', html_euckr)
+        iframes = re.findall(r'<iframe[^>]*src="([^"]*)"', html_euckr)
+
+        # "종목명"이 여러 인코딩/띄어쓰기로 있을 수 있어서 후보 여러 개를 다 확인
+        candidates = {
+            "종목명(euckr)": "종목명" in html_euckr,
+            "종목명(utf8)": "종목명" in html_utf8,
+            "현재가": "현재가" in html_euckr,
+            "거래량": "거래량" in html_euckr,
+            "type_2(국내 거래량상위 표에 흔히 쓰는 class)": "type_2" in html_euckr,
+        }
+
+        idx = html_euckr.find("현재가")  # "종목명"보다 더 흔하게 쓰이는 컬럼명이라 대안으로 검색
+        snippet = html_euckr[max(0, idx - 800) : idx + 3000] if idx != -1 else html_euckr[:3000]
 
         return {
             "ok": True,
             "status_code": res.status_code,
-            "total_length": len(html),
-            "row_count": len(data),
-            "sample": data[:15],
+            "content_type_header": res.headers.get("content-type"),
+            "total_length": len(html_euckr),
+            "table_classes_found": tables,
+            "iframe_src_found": iframes,
+            "text_found": candidates,
+            "snippet": snippet,
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
