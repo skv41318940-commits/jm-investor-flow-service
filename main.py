@@ -247,6 +247,16 @@ NXT_SCAN_MINUTE = 35
 NAVER_NXT_SCAN_HOUR = 20
 NAVER_NXT_SCAN_MINUTE = 5
 
+# "실시간 랭킹" 해외 컬럼 — 미국/일본/홍콩·중국 3개 그룹, 그룹마다 마감 시각이 완전히
+# 달라서 각자 따로 스냅샷 시각을 잡음. (마켓코드 리스트, 마감 기준 시, 분)
+# 미국은 서머타임 따라 마감이 밀리는데, 넉넉하게 06:30로 잡아서 어느 쪽이든 이미 마감된
+# 뒤가 되게 함. 일본/홍콩·중국은 한국이랑 시차가 없거나 적어서 비교적 명확함.
+OVERSEAS_RANKING_GROUPS = {
+    "US": {"markets": ["NAS", "NYS", "AMS"], "hour": 6, "minute": 30},
+    "JP": {"markets": ["TSE"], "hour": 15, "minute": 10},
+    "HK_CN": {"markets": ["HKS", "SHS", "SZS"], "hour": 16, "minute": 30},
+}
+
 _tick_buckets: dict = {}  # (code, market, trade_date, minute) -> {"buy_qty","buy_value","sell_qty","sell_value"}
 _tick_lock = threading.Lock()
 _ws_debug_count = 0  # 처음 몇 개 메시지만 원본 로그 남겨서 필드 위치 검증용
@@ -791,6 +801,95 @@ def fetch_naver_nxt_ranking(limit: int = 30):
     if not rows:
         raise ValueError("테이블은 찾았는데 종목 행을 하나도 못 뽑았어요 — 컬럼 구조를 다시 확인해야 해요.")
     return rows, col_names
+
+
+def fetch_overseas_group_ranking(markets: list, limit: int = 30):
+    """
+    "실시간 랭킹" 해외 컬럼용 — 그룹 안의 거래소 여러 개(예: 미국=NAS+NYS+AMS)를 각각
+    조회해서 하나로 합친 뒤 거래량(tvol) 기준으로 다시 정렬. HHDFS76310010(해외주식
+    거래량순위, 2026-08-08 필드 확인 완료: rsym/excd/symb/name/last/rate/tvol/tamt 등).
+    """
+
+    def to_f(s):
+        try:
+            return float(s)
+        except (TypeError, ValueError):
+            return 0.0
+
+    all_rows = []
+    for market in markets:
+        try:
+            data = kis_get(
+                "/uapi/overseas-stock/v1/ranking/trade-vol",
+                "HHDFS76310010",
+                {"KEYB": "", "AUTH": "", "EXCD": market, "NDAY": "0", "PRC1": "", "PRC2": "", "VOL_RANG": "0"},
+            )
+            for r in data.get("output2", []):
+                all_rows.append(
+                    {
+                        "market": market,
+                        "symbol": r.get("symb"),
+                        "stock_name": r.get("name") or r.get("ename") or r.get("symb"),
+                        "price": to_f(r.get("last")),
+                        "change_pct": to_f(r.get("rate")),
+                        "volume": to_f(r.get("tvol")),
+                        "trading_value": to_f(r.get("tamt")),
+                    }
+                )
+        except Exception as e:
+            print(f"[overseas_ranking] {market} 조회 실패: {e}")
+
+    all_rows.sort(key=lambda r: r["volume"], reverse=True)
+    top = all_rows[:limit]
+    for i, r in enumerate(top, start=1):
+        r["rank"] = i
+    return top
+
+
+def _ensure_overseas_ranking_cached(group_name: str):
+    """
+    해외 거래량 상위 마감 스냅샷 — 그룹(US/JP/HK_CN)별로 각자의 마감 시각(KST) 기준
+    하루 1번만 저장. OVERSEAS_RANKING_GROUPS에 그룹별 거래소 목록/마감 시각이 정의돼있음.
+    """
+    group = OVERSEAS_RANKING_GROUPS.get(group_name)
+    if not group:
+        return
+    now = now_kst()
+    if now.weekday() >= 5:
+        return
+    scan_time = now.replace(hour=group["hour"], minute=group["minute"], second=0, microsecond=0)
+    if now < scan_time:
+        return
+
+    trade_date = now.strftime("%Y-%m-%d")  # 해외는 한투 API가 이미 그날 최종치를 주는 거라 달력 날짜 그대로 씀
+
+    try:
+        existing = (
+            supabase.table("overseas_daily_ranking")
+            .select("symbol")
+            .eq("scan_date", trade_date)
+            .eq("group_name", group_name)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            return
+    except Exception as e:
+        print(f"[overseas_ranking:{group_name}] 캐시 확인 실패: {e}")
+        return
+
+    try:
+        rows = fetch_overseas_group_ranking(group["markets"], limit=30)
+        for r in rows:
+            r["scan_date"] = trade_date
+            r["group_name"] = group_name
+        supabase.table("overseas_daily_ranking").delete().eq("scan_date", trade_date).eq(
+            "group_name", group_name
+        ).execute()
+        supabase.table("overseas_daily_ranking").insert(rows).execute()
+        print(f"[overseas_ranking:{group_name}] {trade_date} 스캔 완료, {len(rows)}종목 캐싱")
+    except Exception as e:
+        print(f"[overseas_ranking:{group_name}] 스캔 실패: {e}")
 
 
 def _ensure_naver_nxt_ranking_cached():
@@ -1592,6 +1691,72 @@ def naver_nxt_ranking_endpoint(date: str = ""):
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/sync-overseas-ranking")
+def sync_overseas_ranking_endpoint(group: str = "US", force: bool = False):
+    """해외 거래량 상위 수동 스캔 트리거 (디버그/테스트용). group: US/JP/HK_CN"""
+    group_def = OVERSEAS_RANKING_GROUPS.get(group)
+    if not group_def:
+        return {"ok": False, "error": f"group은 {'/'.join(OVERSEAS_RANKING_GROUPS.keys())} 중 하나여야 해요."}
+    try:
+        trade_date = now_kst().strftime("%Y-%m-%d")
+        if not force:
+            existing = (
+                supabase.table("overseas_daily_ranking")
+                .select("symbol")
+                .eq("scan_date", trade_date)
+                .eq("group_name", group)
+                .limit(1)
+                .execute()
+            )
+            if existing.data:
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "scan_date": trade_date,
+                    "message": "이 거래일 스캔이 이미 있습니다 (force=true로 재스캔 가능)",
+                }
+
+        rows = fetch_overseas_group_ranking(group_def["markets"], limit=30)
+        for r in rows:
+            r["scan_date"] = trade_date
+            r["group_name"] = group
+        supabase.table("overseas_daily_ranking").delete().eq("scan_date", trade_date).eq("group_name", group).execute()
+        supabase.table("overseas_daily_ranking").insert(rows).execute()
+        return {"ok": True, "synced": len(rows), "scan_date": trade_date, "group": group}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/overseas-ranking")
+def overseas_ranking_endpoint(group: str = "US", date: str = ""):
+    """해외 거래량 상위 조회 — group(US/JP/HK_CN), date 비우면 가장 최근 스캔"""
+    try:
+        if date:
+            trade_date = date
+        else:
+            latest = (
+                supabase.table("overseas_daily_ranking")
+                .select("scan_date")
+                .eq("group_name", group)
+                .order("scan_date", desc=True)
+                .limit(1)
+                .execute()
+            )
+            trade_date = latest.data[0]["scan_date"] if latest.data else now_kst().strftime("%Y-%m-%d")
+
+        res = (
+            supabase.table("overseas_daily_ranking")
+            .select("*")
+            .eq("scan_date", trade_date)
+            .eq("group_name", group)
+            .order("rank")
+            .execute()
+        )
+        return {"ok": True, "scan_date": trade_date, "group": group, "items": res.data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def _get_watchlist_codes_with_source() -> list:
     """
     _get_watchlist_codes()와 완전히 같은 우선순위 로직이지만, 각 종목이 어느 소스에서
@@ -1716,6 +1881,8 @@ async def _ws_worker():
             await asyncio.to_thread(_ensure_nxt_ranking_cached)
             await asyncio.to_thread(_ensure_krx_ranking_cached)
             await asyncio.to_thread(_ensure_naver_nxt_ranking_cached)
+            await asyncio.to_thread(_ensure_overseas_ranking_cached, "JP")
+            await asyncio.to_thread(_ensure_overseas_ranking_cached, "HK_CN")
             codes = await asyncio.to_thread(_get_watchlist_codes)
             if not codes:
                 print("[ws_worker] 구독할 종목이 없어 잠시 대기합니다.")
@@ -1774,6 +1941,8 @@ async def _ws_worker():
                         await asyncio.to_thread(_ensure_nxt_ranking_cached)
                         await asyncio.to_thread(_ensure_krx_ranking_cached)
                         await asyncio.to_thread(_ensure_naver_nxt_ranking_cached)
+                        await asyncio.to_thread(_ensure_overseas_ranking_cached, "JP")
+                        await asyncio.to_thread(_ensure_overseas_ranking_cached, "HK_CN")
                         new_codes = await asyncio.to_thread(_get_watchlist_codes)
                         added = [c for c in new_codes if c not in codes]
                         for code in added:
@@ -1871,6 +2040,7 @@ async def _overseas_ws_worker():
 
         try:
             approval_key = get_ws_approval_key("overseas")
+            await asyncio.to_thread(_ensure_overseas_ranking_cached, "US")
             watch = await asyncio.to_thread(_get_overseas_watchlist_symbols)
             if not watch:
                 print("[overseas_ws_worker] 구독할 해외주식 관심종목이 없어 잠시 대기합니다.")
@@ -1922,6 +2092,7 @@ async def _overseas_ws_worker():
 
                     # 5분마다 관심종목 갱신 — 새로 등록된 종목이 있으면 재연결 없이 바로 구독 추가
                     if time.time() - last_refresh > 300:
+                        await asyncio.to_thread(_ensure_overseas_ranking_cached, "US")
                         new_watch = await asyncio.to_thread(_get_overseas_watchlist_symbols)
                         added = [w for w in new_watch if w not in watch]
                         for symbol, market in added:
