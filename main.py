@@ -841,8 +841,12 @@ def fetch_naver_theme_detail(theme_no: str, limit: int = 30):
             continue
 
         cell_texts = [td.get_text(strip=True) for td in tr.find_all("td")]
+        # cell_texts[0]=종목명(이미 위에서 링크로 추출함), cell_texts[1]="테마 편입 사유..."
+        # 마우스오버 툴팁용 숨겨진 셀 — 헤더 목록엔 없는데 데이터 셀엔 껴있어서, 여기서부터
+        # 한 칸씩 밀려서 col_names[1](현재가)이 cell_texts[2]랑 대응되게 오프셋을 맞춰줌
+        # (2026-08-08 실제 데이터로 확인 완료 — 이게 없으면 전부 다음 컬럼 값으로 밀려서 나옴)
         value_map = {}
-        for i, col in enumerate(col_names):
+        for i, col in enumerate(col_names[1:], start=2):
             if i < len(cell_texts):
                 value_map[col] = cell_texts[i]
 
