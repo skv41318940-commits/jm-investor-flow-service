@@ -1505,6 +1505,35 @@ def kis_overseas_daily_debug(symbol: str = "AAPL", market: str = "NAS"):
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/naver-theme-detail-debug")
+def naver_theme_detail_debug(theme_no: str = "449"):
+    """디버그 전용 — 테마 상세 페이지의 실제 테이블 구조(헤더/첫 행) 그대로 확인"""
+    if BeautifulSoup is None:
+        return {"ok": False, "error": "beautifulsoup4가 설치되어 있지 않습니다."}
+    try:
+        url = f"https://finance.naver.com/sise/sise_group_detail.naver?type=theme&no={theme_no}"
+        res = requests.get(url, headers=_naver_headers(), timeout=10)
+        soup = BeautifulSoup(res.content.decode("euc-kr", errors="replace"), "html.parser")
+
+        all_tables = soup.find_all("table")
+        table_info = [{"index": i, "class": t.get("class")} for i, t in enumerate(all_tables)]
+
+        table = soup.find("table", class_="type_5")
+        result = {"ok": True, "all_tables": table_info, "type_5_found": table is not None}
+        if table:
+            ths = table.find_all("th")
+            result["header_texts"] = [th.get_text(strip=True) for th in ths]
+            trs = table.find_all("tr")[:5]
+            rows_preview = []
+            for tr in trs:
+                tds = tr.find_all("td")
+                rows_preview.append([td.get_text(strip=True) for td in tds])
+            result["rows_preview"] = rows_preview
+        return result
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/kis-overseas-industry-code-debug")
 def kis_overseas_industry_code_debug(market: str = "NAS"):
     """디버그 전용 — 해외주식 업종별코드조회(HHDFS76370100) 원본 응답 확인 (업종 목록 + ICOD)"""
