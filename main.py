@@ -878,7 +878,25 @@ def overseas_search_endpoint(q: str, limit: int = 8):
                 .limit(remaining)
                 .execute()
             )
-            for r in res.data:
+            master_rows = list(res.data)
+
+            # ⚠️ 나스닥 스크리너 CSV가 실제로는 나스닥이 아닌 다른 거래소 종목도 섞여있어서
+            # (예: IONQ는 실제 NYSE인데 NAS로 잘못 들어있었음, 2026-08-08 확인됨),
+            # 검증된 별칭 테이블에 같은 심볼이 있으면 그 거래소 정보로 덮어씀
+            symbols = [r["symbol"] for r in master_rows]
+            corrections = {}
+            if symbols:
+                try:
+                    corr_res = (
+                        supabase.table("overseas_name_aliases_kr").select("symbol,market").in_("symbol", symbols).execute()
+                    )
+                    corrections = {r["symbol"]: r["market"] for r in corr_res.data}
+                except Exception as e:
+                    print(f"[overseas_search] 거래소 정정 조회 실패: {e}")
+
+            for r in master_rows:
+                if r["symbol"] in corrections:
+                    r["market"] = corrections[r["symbol"]]
                 if r["symbol"] not in seen:
                     seen.add(r["symbol"])
                     items.append(r)
@@ -2237,6 +2255,33 @@ def sync_shortsale_endpoint(code: str):
         rows = fetch_shortsale(code)
         supabase.table("stock_shortsale_flow").upsert(rows).execute()
         return {"ok": True, "synced": len(rows)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/pykrx-shorting-balance-debug")
+def pykrx_shorting_balance_debug(code: str, days: int = 40):
+    """
+    디버그 전용 — pykrx의 공매도 잔고비중 원본을 그대로(날짜별) 반환.
+    7/24 이후로 데이터가 정말 없는 건지, 있는데 어딘가에서 걸러지는 건지 확인용.
+    """
+    try:
+        today = now_kst()
+        fromdate = (today - timedelta(days=days)).strftime("%Y%m%d")
+        todate = today.strftime("%Y%m%d")
+        df = stock.get_shorting_balance_by_date(fromdate, todate, code)
+        rows = [
+            {"date": idx.strftime("%Y-%m-%d"), **{k: (float(v) if hasattr(v, "item") else v) for k, v in row.items()}}
+            for idx, row in df.iterrows()
+        ]
+        return {
+            "ok": True,
+            "code": code,
+            "요청범위": f"{fromdate} ~ {todate}",
+            "받은행수": len(rows),
+            "컬럼": list(df.columns),
+            "rows": rows,
+        }
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
