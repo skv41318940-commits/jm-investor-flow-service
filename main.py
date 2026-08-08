@@ -1283,6 +1283,34 @@ def kis_overseas_daily_debug(symbol: str = "AAPL", market: str = "NAS"):
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/kis-overseas-industry-code-debug")
+def kis_overseas_industry_code_debug(market: str = "NAS"):
+    """디버그 전용 — 해외주식 업종별코드조회(HHDFS76370100) 원본 응답 확인 (업종 목록 + ICOD)"""
+    try:
+        data = kis_get(
+            "/uapi/overseas-price/v1/quotations/industry-price",
+            "HHDFS76370100",
+            {"AUTH": "", "EXCD": market},
+        )
+        return {"ok": True, "raw": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/kis-overseas-industry-theme-debug")
+def kis_overseas_industry_theme_debug(market: str = "NAS", icod: str = ""):
+    """디버그 전용 — 해외주식 업종별시세(HHDFS76370000) 원본 응답 확인 (업종 하나의 구성종목/등락률)"""
+    try:
+        data = kis_get(
+            "/uapi/overseas-price/v1/quotations/industry-theme",
+            "HHDFS76370000",
+            {"KEYB": "", "AUTH": "", "EXCD": market, "ICOD": icod, "VOL_RANG": "0"},
+        )
+        return {"ok": True, "raw": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/naver-theme-list-debug")
 def naver_theme_list_debug():
     """
