@@ -31,21 +31,31 @@ def now_kst() -> datetime:
 
 
 # ⚠️ pykrx는 import되는 순간 내부적으로 KRX 웹사이트에 자동 로그인을 시도함
-# (KRX_ID/KRX_PW 환경변수 사용). KRX 서버가 그 순간 잠깐이라도 이상한 응답(빈 응답,
-# 오류 페이지 등)을 주면 pykrx가 예외 처리 없이 그대로 죽는데, 이게 import 시점에
-# 터지면 uvicorn이 앱을 아예 못 띄우고 서비스 전체가 죽어버림 (2026-08-06 저녁에 실제
-# 발생한 장애). 이런 일시적 KRX 쪽 문제로 서비스 전체가 죽지 않도록 몇 번 재시도함.
-_PYKRX_IMPORT_RETRIES = 5
-for _pykrx_attempt in range(1, _PYKRX_IMPORT_RETRIES + 1):
-    try:
-        from pykrx import stock
+# (KRX_ID/KRX_PW 환경변수 사용). KRX 서버가 그 순간 이상한 응답(빈 응답, 오류 페이지
+# 등)을 주면 pykrx가 예외 처리 없이 그대로 죽는데, 이게 앱 시작 시점(import 시점)에
+# 터지면 uvicorn이 앱을 아예 못 띄우고 서비스 전체(KRX와 무관한 NXT/해외 랭킹 등)까지
+# 같이 죽어버림 (2026-08-06, 2026-08-08 실제 발생한 장애).
+#
+# NXT/해외 엔드포인트와 동일한 원칙 적용: KRX 문제가 앱 전체를 막지 않도록,
+# pykrx는 앱이 뜰 때 미리 import하지 않고, KRX 데이터가 실제로 필요한 요청이
+# 들어온 "그 순간"에만 import를 시도함 (지연 로딩). 그 요청만 실패하고 나머지
+# 엔드포인트(NXT, 해외, 헬스체크 등)는 영향받지 않음.
+class _LazyPykrxStock:
+    """pykrx.stock을 최초 사용 시점에만 import하는 프록시.
+    import(=KRX 로그인)가 실패해도 이 프록시를 쓰는 그 호출 하나만 예외가 나고,
+    앱 자체는 정상적으로 계속 떠 있음."""
 
-        break
-    except Exception as _pykrx_err:
-        print(f"[pykrx import] {_pykrx_attempt}/{_PYKRX_IMPORT_RETRIES}번째 시도 실패: {_pykrx_err}")
-        if _pykrx_attempt == _PYKRX_IMPORT_RETRIES:
-            raise
-        time.sleep(5)
+    _module = None
+
+    def __getattr__(self, name):
+        if _LazyPykrxStock._module is None:
+            from pykrx import stock as _real_stock
+
+            _LazyPykrxStock._module = _real_stock
+        return getattr(_LazyPykrxStock._module, name)
+
+
+stock = _LazyPykrxStock()
 
 from supabase import create_client
 
