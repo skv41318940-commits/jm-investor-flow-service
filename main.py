@@ -37,11 +37,21 @@ def now_kst() -> datetime:
 
 
 # ⚠️ pykrx는 import되는 순간 내부적으로 KRX 웹사이트에 자동 로그인을 시도함
-# (KRX_ID/KRX_PW 환경변수 사용). KRX 서버가 그 순간 잠깐이라도 이상한 응답(빈 응답,
+# (KRX_ID/KRX_PW 환경변수를 읽어서). KRX 서버가 그 순간 잠깐이라도 이상한 응답(빈 응답,
 # 오류 페이지 등)을 주면 pykrx가 예외 처리 없이 그대로 죽는데, 이게 import 시점에
-# 터지면 uvicorn이 앱을 아예 못 띄우고 서비스 전체가 죽어버림 (2026-08-06 저녁에 실제
-# 발생한 장애). 이런 일시적 KRX 쪽 문제로 서비스 전체가 죽지 않도록 몇 번 재시도함.
+# 터지면 uvicorn이 앱을 아예 못 띄우고 서비스 전체가 죽어버림 (2026-08-06, 2026-08-08
+# 두 번 실제 발생한 장애). 근데 정작 저희가 실제로 쓰는 pykrx 기능(일봉 조회, 종목명
+# 조회 등)은 이 로그인이랑 전혀 무관함 — 채권 관련 서브모듈이 부수적으로 트리거하는
+# 로그인일 뿐이라, 두 가지로 방어함:
+#   1) import 하는 그 순간만 KRX_ID/KRX_PW를 잠깐 숨겨서 애초에 로그인 시도 자체를 스킵
+#      (저희 자체 KRX 로그인 함수는 매번 호출 시점에 os.environ에서 다시 읽으니 영향 없음)
+#   2) 그래도 실패하면(재시도까지 다 실패해도) 더 이상 죽지 않고 stock=None으로 두고
+#      계속 부팅 — 이러면 pykrx 쓰는 개별 기능만 그때그때 에러 응답을 주고, 나머지
+#      (국내/NXT/해외 웹소켓, 네이버 스크래핑 등)는 정상 작동함
 _PYKRX_IMPORT_RETRIES = 5
+_saved_krx_id = os.environ.pop("KRX_ID", None)
+_saved_krx_pw = os.environ.pop("KRX_PW", None)
+stock = None
 for _pykrx_attempt in range(1, _PYKRX_IMPORT_RETRIES + 1):
     try:
         from pykrx import stock
@@ -50,8 +60,13 @@ for _pykrx_attempt in range(1, _PYKRX_IMPORT_RETRIES + 1):
     except Exception as _pykrx_err:
         print(f"[pykrx import] {_pykrx_attempt}/{_PYKRX_IMPORT_RETRIES}번째 시도 실패: {_pykrx_err}")
         if _pykrx_attempt == _PYKRX_IMPORT_RETRIES:
-            raise
-        time.sleep(5)
+            print("[pykrx import] 재시도 다 실패 — pykrx 없이 나머지 서비스는 계속 띄웁니다.")
+        else:
+            time.sleep(5)
+if _saved_krx_id is not None:
+    os.environ["KRX_ID"] = _saved_krx_id
+if _saved_krx_pw is not None:
+    os.environ["KRX_PW"] = _saved_krx_pw
 
 from supabase import create_client
 
