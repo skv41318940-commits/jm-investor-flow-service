@@ -2347,6 +2347,7 @@ async def _ws_worker():
             await asyncio.to_thread(_ensure_naver_nxt_ranking_cached)
             await asyncio.to_thread(_ensure_overseas_ranking_cached, "JP")
             await asyncio.to_thread(_ensure_overseas_ranking_cached, "HK_CN")
+            await asyncio.to_thread(_ensure_fundamentals_synced_today)
             codes = await asyncio.to_thread(_get_watchlist_codes)
             if not codes:
                 print("[ws_worker] 구독할 종목이 없어 잠시 대기합니다.")
@@ -2407,6 +2408,7 @@ async def _ws_worker():
                         await asyncio.to_thread(_ensure_naver_nxt_ranking_cached)
                         await asyncio.to_thread(_ensure_overseas_ranking_cached, "JP")
                         await asyncio.to_thread(_ensure_overseas_ranking_cached, "HK_CN")
+                        await asyncio.to_thread(_ensure_fundamentals_synced_today)
                         new_codes = await asyncio.to_thread(_get_watchlist_codes)
                         added = [c for c in new_codes if c not in codes]
                         for code in added:
@@ -3775,6 +3777,113 @@ def _latest_trading_day() -> str:
     raise ValueError("최근 10일 내 KRX 영업일을 찾지 못했습니다")
 
 
+# ── 재무제표(펀더멘털) 동기화 — 원래 PC 프로그램(fundamentals_sync.py)에서만 돌리던 걸
+# 클라우드로 이전. pykrx만 쓰고 키움(PC 전용) 의존성이 전혀 없어서 그대로 옮길 수 있었음
+# (2026-08-09). PER/PBR/EPS/BPS는 KRX 공식 제공값, ROE는 EPS/BPS 기반 근사치 —
+# pykrx가 실제 재무제표 원장을 안 줘서 완전 정확한 값은 아님(원본 스크립트와 동일한 한계).
+def _calc_fundamentals_one(code: str, name: str, today: str, year_ago: str):
+    try:
+        fdf = stock.get_market_fundamental(today, today, code)
+        if fdf.empty:
+            print(f"[fundamentals_sync] {code} 펀더멘털 데이터 없음 (휴장일이거나 상장폐지 종목일 수 있음)")
+            return None
+        row = fdf.iloc[0]
+        per = float(row.get("PER", 0) or 0)
+        pbr = float(row.get("PBR", 0) or 0)
+        eps = float(row.get("EPS", 0) or 0)
+        bps = float(row.get("BPS", 0) or 0)
+        roe = round((eps / bps) * 100, 2) if bps else 0.0
+
+        cap_df = stock.get_market_cap(today, today, code)
+        market_cap = int(cap_df.iloc[0].get("시가총액", 0)) if not cap_df.empty else 0
+
+        ohlcv = stock.get_market_ohlcv_by_date(year_ago, today, code)
+        high_52w = int(ohlcv["고가"].max()) if not ohlcv.empty else 0
+        low_52w = int(ohlcv["저가"].min()) if not ohlcv.empty else 0
+
+        return {
+            "code": code,
+            "name": name,
+            "per": per,
+            "pbr": pbr,
+            "roe": roe,
+            "eps": eps,
+            "bps": bps,
+            "market_cap": market_cap,
+            "high_52w": high_52w,
+            "low_52w": low_52w,
+            "synced_at": now_kst().isoformat(),
+        }
+    except Exception as e:
+        print(f"[fundamentals_sync] {code} 계산 실패: {e}")
+        return None
+
+
+def sync_fundamentals_all():
+    """관심종목(watchlist) 테이블 전체를 훑어서 stock_fundamentals에 upsert. 반환: {success, failed}"""
+    if stock is None:
+        raise RuntimeError("pykrx를 사용할 수 없어서 재무제표 동기화를 할 수 없습니다.")
+
+    watchlist = supabase.table("watchlist").select("code,name").execute().data
+    today = _latest_trading_day()
+    year_ago = (now_kst() - timedelta(days=365)).strftime("%Y%m%d")
+
+    ok, fail = 0, 0
+    for row in watchlist:
+        code = row.get("code")
+        name = row.get("name", code)
+        if not code:
+            fail += 1
+            continue
+
+        result = _calc_fundamentals_one(code, name, today, year_ago)
+        if result:
+            try:
+                supabase.table("stock_fundamentals").upsert(result).execute()
+                ok += 1
+            except Exception as e:
+                print(f"[fundamentals_sync] {code} 저장 실패: {e}")
+                fail += 1
+        else:
+            fail += 1
+
+        time.sleep(0.2)  # KRX 서버 부담 줄이기
+
+    return {"success": ok, "failed": fail}
+
+
+def _ensure_fundamentals_synced_today():
+    """
+    하루 1번만 자동 동기화 — 국내 워커의 다른 마감 스냅샷들이랑 같은 방식(16:00 KST 이후,
+    오늘자로 이미 돌았으면 스킵). PC 없이도 매일 자동으로 채워지게 하려는 용도.
+    """
+    now = now_kst()
+    if now.weekday() >= 5:
+        return
+    if now.hour < 16:
+        return
+    try:
+        today_str = now.strftime("%Y-%m-%d")
+        existing = (
+            supabase.table("stock_fundamentals")
+            .select("code")
+            .gte("synced_at", f"{today_str}T00:00:00")
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            return
+    except Exception as e:
+        print(f"[fundamentals_sync] 캐시 확인 실패: {e}")
+        return
+
+    try:
+        result = sync_fundamentals_all()
+        print(f"[fundamentals_sync] 자동 동기화 완료: 성공 {result['success']}건, 실패 {result['failed']}건")
+    except Exception as e:
+        print(f"[fundamentals_sync] 자동 동기화 실패: {e}")
+
+
 def fetch_volume_top30(limit: int = 30):
     ymd = _latest_trading_day()
 
@@ -3910,6 +4019,20 @@ def sync_institution_type_endpoint(code: str):
         rows = fetch_institution_type_flow(code)
         supabase.table("institution_type_flow").upsert(rows).execute()
         return {"ok": True, "synced": len(rows)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/sync-fundamentals")
+def sync_fundamentals_endpoint():
+    """
+    관심종목 재무제표(PER/PBR/ROE/EPS/BPS/시총/52주 고저) 수동 동기화 트리거.
+    PC 프로그램 없이도 클라우드에서 직접 pykrx로 계산해서 채워줌 — 자동으로는 매일
+    16:00 KST 이후 하루 1번 돌지만, 지금 바로 채우고 싶을 때 이걸로 수동 실행 가능.
+    """
+    try:
+        result = sync_fundamentals_all()
+        return {"ok": True, **result}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
