@@ -3819,6 +3819,70 @@ def _calc_fundamentals_one(code: str, name: str, today: str, year_ago: str):
         return None
 
 
+def sync_fundamentals_market_wide():
+    """
+    관심종목만이 아니라 KRX 전체(코스피+코스닥) 상장종목 재무제표를 한 번에 동기화.
+    종목별로 한 건씩 조회하던 sync_fundamentals_all()과 다르게, pykrx의 "그날 전체
+    스냅샷" 벌크 API(market="ALL")로 API 호출 2번 만에 끝냄 — 훨씬 빠름.
+    ⚠️ 대신 52주 최고/최저는 종목마다 1년치 일봉을 따로 조회해야 해서 여기선 뺐음
+    (2500개 넘는 종목에 다 하면 너무 오래 걸림) — 필요하면 sync_fundamentals_all()
+    (관심종목 전용, 52주 포함)을 같이 돌리면 그 종목들은 채워짐.
+    """
+    if stock is None:
+        raise RuntimeError("pykrx를 사용할 수 없어서 재무제표 동기화를 할 수 없습니다.")
+
+    today = _latest_trading_day()
+    fdf = stock.get_market_fundamental(today, market="ALL")
+    cap_df = stock.get_market_cap(today, market="ALL")
+    if fdf.empty:
+        raise ValueError(f"{today} 기준 재무제표 데이터를 가져오지 못했습니다.")
+
+    synced_at = now_kst().isoformat()
+    rows = []
+    for code, row in fdf.iterrows():
+        try:
+            per = float(row.get("PER", 0) or 0)
+            pbr = float(row.get("PBR", 0) or 0)
+            eps = float(row.get("EPS", 0) or 0)
+            bps = float(row.get("BPS", 0) or 0)
+            roe = round((eps / bps) * 100, 2) if bps else 0.0
+            market_cap = int(cap_df.loc[code, "시가총액"]) if code in cap_df.index else 0
+            try:
+                name = stock.get_market_ticker_name(code)
+            except Exception:
+                name = code
+            rows.append(
+                {
+                    "code": code,
+                    "name": name,
+                    "per": per,
+                    "pbr": pbr,
+                    "roe": roe,
+                    "eps": eps,
+                    "bps": bps,
+                    "market_cap": market_cap,
+                    "high_52w": 0,  # 벌크 경로에선 계산 안 함 (아래 docstring 참고)
+                    "low_52w": 0,
+                    "synced_at": synced_at,
+                }
+            )
+        except Exception as e:
+            print(f"[fundamentals_sync_market] {code} 처리 실패: {e}")
+
+    ok, fail = 0, 0
+    batch_size = 200  # Supabase에 한 번에 너무 많이 보내면 문제 생길 수 있어 나눠서 전송
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i : i + batch_size]
+        try:
+            supabase.table("stock_fundamentals").upsert(batch).execute()
+            ok += len(batch)
+        except Exception as e:
+            print(f"[fundamentals_sync_market] batch({i}~{i+len(batch)}) 저장 실패: {e}")
+            fail += len(batch)
+
+    return {"success": ok, "failed": fail, "total": len(rows)}
+
+
 def sync_fundamentals_all():
     """관심종목(watchlist) 테이블 전체를 훑어서 stock_fundamentals에 upsert. 반환: {success, failed}"""
     if stock is None:
@@ -3878,8 +3942,11 @@ def _ensure_fundamentals_synced_today():
         return
 
     try:
-        result = sync_fundamentals_all()
-        print(f"[fundamentals_sync] 자동 동기화 완료: 성공 {result['success']}건, 실패 {result['failed']}건")
+        result = sync_fundamentals_market_wide()
+        print(
+            f"[fundamentals_sync] 자동 동기화(전체 시장) 완료: 성공 {result['success']}건, "
+            f"실패 {result['failed']}건, 총 {result['total']}종목"
+        )
     except Exception as e:
         print(f"[fundamentals_sync] 자동 동기화 실패: {e}")
 
@@ -4026,12 +4093,26 @@ def sync_institution_type_endpoint(code: str):
 @app.get("/api/sync-fundamentals")
 def sync_fundamentals_endpoint():
     """
-    관심종목 재무제표(PER/PBR/ROE/EPS/BPS/시총/52주 고저) 수동 동기화 트리거.
-    PC 프로그램 없이도 클라우드에서 직접 pykrx로 계산해서 채워줌 — 자동으로는 매일
-    16:00 KST 이후 하루 1번 돌지만, 지금 바로 채우고 싶을 때 이걸로 수동 실행 가능.
+    관심종목 재무제표(PER/PBR/ROE/EPS/BPS/시총/52주 고저 포함) 수동 동기화.
+    52주 고저까지 필요한 관심종목만 정밀하게 채우고 싶을 때 사용 — 전체 시장은
+    /api/sync-fundamentals-market 참고.
     """
     try:
         result = sync_fundamentals_all()
+        return {"ok": True, **result}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/sync-fundamentals-market")
+def sync_fundamentals_market_endpoint():
+    """
+    KRX 전체(코스피+코스닥) 상장종목 재무제표 일괄 동기화 — 관심종목 여부와 무관하게
+    아무 종목이나 재무제표가 나오게 하려는 용도. 매일 16:00 KST 이후 자동으로도 돌지만,
+    지금 바로 채우고 싶을 때 이걸로 수동 실행 가능. 52주 고저는 포함 안 됨(느려져서 뺌).
+    """
+    try:
+        result = sync_fundamentals_market_wide()
         return {"ok": True, **result}
     except Exception as e:
         return {"ok": False, "error": str(e)}
