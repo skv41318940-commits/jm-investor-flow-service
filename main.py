@@ -686,6 +686,74 @@ def _ensure_nxt_ranking_cached():
         print(f"[nxt_ranking] 스캔 실패: {e}")
 
 
+def fetch_krx_volume_ranking(limit: int = 30):
+    """
+    "실시간 랭킹" 페이지용 — KRX 전체(코스피+코스닥)에서 거래량(체결 수량) 기준 상위.
+    fetch_volume_top30()은 거래대금 기준이라 별개 함수로 둠 — 사부님 사이트의
+    "거래량 상위" 컬럼과 맞추기 위해 정렬 기준만 거래량으로 다르게 함.
+    """
+    ymd = _latest_trading_day()
+    df = stock.get_market_ohlcv_by_ticker(ymd, market="ALL")
+    if df.empty:
+        raise ValueError(f"KRX에서 {ymd} 시세 데이터를 가져오지 못했습니다.")
+
+    df = df.sort_values("거래량", ascending=False).head(limit)
+    trade_date = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}"
+
+    rows = []
+    for i, (code, row) in enumerate(df.iterrows(), start=1):
+        try:
+            name = stock.get_market_ticker_name(code)
+        except Exception:
+            name = code
+        rows.append(
+            {
+                "scan_date": trade_date,
+                "rank": i,
+                "stock_code": code,
+                "stock_name": name,
+                "volume": int(row.get("거래량", 0)),
+                "trading_value": round(float(row.get("거래대금", 0)) / 1e8, 1),  # 억원
+                "change_pct": float(row.get("등락률", 0)),
+            }
+        )
+    return rows
+
+
+def _ensure_krx_ranking_cached():
+    """KRX 거래량 상위도 NXT랑 똑같은 방식(15:35 기준 하루 1번)으로 마감 스냅샷 저장"""
+    now = now_kst()
+    if now.weekday() >= 5:
+        return
+    scan_time = now.replace(hour=NXT_SCAN_HOUR, minute=NXT_SCAN_MINUTE, second=0, microsecond=0)
+    if now < scan_time:
+        return
+
+    try:
+        trade_date = _resolve_nxt_scan_trade_date()  # KRX/NXT 둘 다 같은 거래일 기준이라 그대로 재사용
+    except Exception as e:
+        print(f"[krx_ranking] 거래일 확인 실패: {e}")
+        return
+
+    try:
+        existing = (
+            supabase.table("krx_daily_ranking").select("stock_code").eq("scan_date", trade_date).limit(1).execute()
+        )
+        if existing.data:
+            return
+    except Exception as e:
+        print(f"[krx_ranking] 캐시 확인 실패: {e}")
+        return
+
+    try:
+        rows = fetch_krx_volume_ranking(limit=30)
+        supabase.table("krx_daily_ranking").delete().eq("scan_date", trade_date).execute()
+        supabase.table("krx_daily_ranking").insert(rows).execute()
+        print(f"[krx_ranking] {trade_date} 스캔 완료, {len(rows)}종목 캐싱")
+    except Exception as e:
+        print(f"[krx_ranking] 스캔 실패: {e}")
+
+
 def _get_nxt_ranking_codes(limit: int) -> list:
     """
     가장 최근에 스캔된 NXT 순위에서 점수 상위 종목코드를 반환.
@@ -917,6 +985,33 @@ def kis_overseas_daily_debug(symbol: str = "AAPL", market: str = "NAS"):
             "/uapi/overseas-price/v1/quotations/dailyprice",
             "HHDFS76240000",
             {"AUTH": "", "EXCD": market, "SYMB": symbol, "GUBN": "0", "BYMD": now_kst().strftime("%Y%m%d"), "MODP": "0"},
+        )
+        return {"ok": True, "raw": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/kis-overseas-volume-rank-debug")
+def kis_overseas_volume_rank_debug(market: str = "NAS", nday: str = "0"):
+    """
+    디버그 전용 — 해외주식 거래량순위(HHDFS76310010) 원본 응답을 그대로 반환.
+    "실시간 랭킹" 페이지의 해외 컬럼 만들기 전에 output 필드명이 정확히 뭔지 확인하려는 용도.
+    market: NAS/NYS/AMS/TSE/HKS/SHS/SZS/HSX/HNX
+    nday: 0(당일)/1(2일전)/2(3일전)/3(5일전)/4(10일전)/5(20일전)/6(30일전)/7(60일전)/8(120일전)/9(1년전)
+    """
+    try:
+        data = kis_get(
+            "/uapi/overseas-stock/v1/ranking/trade-vol",
+            "HHDFS76310010",
+            {
+                "KEYB": "",
+                "AUTH": "",
+                "EXCD": market,
+                "NDAY": nday,
+                "PRC1": "",
+                "PRC2": "",
+                "VOL_RANG": "0",
+            },
         )
         return {"ok": True, "raw": data}
     except Exception as e:
@@ -1241,6 +1336,49 @@ def nxt_ranking_endpoint(date: str = ""):
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/sync-krx-ranking")
+def sync_krx_ranking_endpoint(limit: int = 30, force: bool = False):
+    """KRX 거래량 상위 수동 스캔 트리거 (디버그/테스트용) — /api/sync-nxt-ranking과 동일한 방식"""
+    try:
+        trade_date = _resolve_nxt_scan_trade_date()
+        if not force:
+            existing = (
+                supabase.table("krx_daily_ranking").select("stock_code").eq("scan_date", trade_date).limit(1).execute()
+            )
+            if existing.data:
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "scan_date": trade_date,
+                    "message": "이 거래일 스캔이 이미 있습니다 (force=true로 재스캔 가능)",
+                }
+
+        rows = fetch_krx_volume_ranking(limit=limit)
+        supabase.table("krx_daily_ranking").delete().eq("scan_date", trade_date).execute()
+        supabase.table("krx_daily_ranking").insert(rows).execute()
+        return {"ok": True, "synced": len(rows), "scan_date": trade_date}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/krx-ranking")
+def krx_ranking_endpoint(date: str = ""):
+    """KRX 거래량 상위 조회 — date 비우면 가장 최근 스캔 (nxt-ranking과 동일한 방식)"""
+    try:
+        if date:
+            trade_date = date
+        else:
+            latest = (
+                supabase.table("krx_daily_ranking").select("scan_date").order("scan_date", desc=True).limit(1).execute()
+            )
+            trade_date = latest.data[0]["scan_date"] if latest.data else now_kst().strftime("%Y-%m-%d")
+
+        res = supabase.table("krx_daily_ranking").select("*").eq("scan_date", trade_date).order("rank").execute()
+        return {"ok": True, "scan_date": trade_date, "items": res.data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def _get_watchlist_codes_with_source() -> list:
     """
     _get_watchlist_codes()와 완전히 같은 우선순위 로직이지만, 각 종목이 어느 소스에서
@@ -1363,6 +1501,7 @@ async def _ws_worker():
             # asyncio.to_thread로 별도 스레드에서 돌려야 이 작업이 진행되는 동안 다른 API 요청
             # (예: Control 페이지의 PC 조회 프록시)이 이벤트 루프에서 막히지 않음
             await asyncio.to_thread(_ensure_nxt_ranking_cached)
+            await asyncio.to_thread(_ensure_krx_ranking_cached)
             codes = await asyncio.to_thread(_get_watchlist_codes)
             if not codes:
                 print("[ws_worker] 구독할 종목이 없어 잠시 대기합니다.")
@@ -1419,6 +1558,7 @@ async def _ws_worker():
                     # 장중에 15:35를 넘기는 순간 자동으로 스캔 상위 종목이 채워지게 함
                     if time.time() - last_refresh > 300:
                         await asyncio.to_thread(_ensure_nxt_ranking_cached)
+                        await asyncio.to_thread(_ensure_krx_ranking_cached)
                         new_codes = await asyncio.to_thread(_get_watchlist_codes)
                         added = [c for c in new_codes if c not in codes]
                         for code in added:
