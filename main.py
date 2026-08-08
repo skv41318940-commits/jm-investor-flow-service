@@ -17,6 +17,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 import requests
+from bs4 import BeautifulSoup
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -1011,16 +1012,33 @@ def naver_nxt_debug():
         res.encoding = "euc-kr"  # 네이버 증권 페이지는 전통적으로 EUC-KR 인코딩을 씀
         html = res.text
 
-        # "종목명"이 테이블 헤더에 있을 거라 그 주변만 잘라서 보여줌 (전체는 너무 길어서)
-        idx = html.find("종목명")
-        snippet = html[max(0, idx - 500) : idx + 4000] if idx != -1 else html[:4000]
+        # 텍스트 검색("종목명")은 상단 검색창 라벨에서 먼저 걸려버려서 실제 테이블까지
+        # 못 내려감 → 테이블을 CSS 클래스(type_2)로 직접 찾는 방식으로 변경.
+        soup = BeautifulSoup(html, "html.parser")
+        table = soup.find("table", class_="type_2")
+
+        if table is None:
+            return {
+                "ok": False,
+                "status_code": res.status_code,
+                "total_length": len(html),
+                "reason": "type_2 테이블을 찾지 못했습니다.",
+                "all_table_classes": [t.get("class") for t in soup.find_all("table")],
+            }
+
+        rows = table.find_all("tr")
+        data = []
+        for row in rows:
+            cols = row.find_all("td")
+            if len(cols) > 1:
+                data.append([c.get_text(strip=True) for c in cols])
 
         return {
             "ok": True,
             "status_code": res.status_code,
             "total_length": len(html),
-            "found_종목명": idx != -1,
-            "snippet": snippet,
+            "row_count": len(data),
+            "sample": data[:15],
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
