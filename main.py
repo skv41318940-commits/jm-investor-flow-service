@@ -1283,6 +1283,49 @@ def kis_overseas_daily_debug(symbol: str = "AAPL", market: str = "NAS"):
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/naver-theme-list-debug")
+def naver_theme_list_debug():
+    """
+    디버그 전용 — 네이버 증권 "테마별 시세" 목록 페이지 구조 확인.
+    테마명, 등락률, 상세페이지로 가는 링크(no=XXX 파라미터)를 어떻게 뽑아낼지
+    확인하려는 용도.
+    """
+    if BeautifulSoup is None:
+        return {"ok": False, "error": "beautifulsoup4가 설치되어 있지 않습니다."}
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Referer": "https://finance.naver.com/",
+            "Accept-Language": "ko-KR,ko;q=0.9",
+        }
+        res = requests.get("https://finance.naver.com/sise/theme.naver", headers=headers, timeout=10)
+        soup = BeautifulSoup(res.content.decode("euc-kr", errors="replace"), "html.parser")
+
+        tables = [t.get("class") for t in soup.find_all("table")]
+        theme_links = soup.find_all("a", href=re.compile(r"sise_group_detail\.naver"))
+        sample_links = [{"text": a.get_text(strip=True), "href": a["href"]} for a in theme_links[:10]]
+
+        table = soup.find("table", class_="type_1")
+        rows_preview = []
+        if table:
+            trs = table.find_all("tr")[:8]
+            for tr in trs:
+                tds = tr.find_all("td")
+                rows_preview.append([td.get_text(strip=True) for td in tds])
+
+        return {
+            "ok": True,
+            "status_code": res.status_code,
+            "table_classes_found": tables,
+            "theme_link_count": len(theme_links),
+            "sample_theme_links": sample_links,
+            "type_1_table_rows_preview": rows_preview,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/naver-nxt-debug")
 def naver_nxt_debug():
     """
