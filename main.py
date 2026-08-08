@@ -724,6 +724,26 @@ def _ensure_nxt_ranking_cached():
         print(f"[nxt_ranking] 스캔 실패: {e}")
 
 
+def _is_preferred_stock_name(name: str) -> bool:
+    """
+    국내 우선주 이름 패턴 — '삼성전자우', 'LG화학우B', '현대차2우B' 등은 끝이
+    "우"(+등급 알파벳 하나) 로 끝남. 100% 완벽한 판별은 아니지만 실무에서 흔히 쓰는 방식.
+    """
+    return bool(name) and bool(re.search(r"우[A-Z]?$", name))
+
+
+def _get_krx_etf_codes() -> set:
+    """KRX ETF 종목코드 집합 — "실시간 랭킹"에서 ETF 제외용. pykrx 자체가 안 되어있으면 빈 집합 반환."""
+    if stock is None:
+        return set()
+    try:
+        ymd = _latest_trading_day()
+        return set(stock.get_etf_ticker_list(ymd))
+    except Exception as e:
+        print(f"[ranking] ETF 목록 조회 실패, ETF 제외 없이 진행: {e}")
+        return set()
+
+
 def fetch_naver_nxt_ranking(limit: int = 30):
     """
     네이버 증권 "NXT 거래상위"(https://finance.naver.com/sise/nxt_sise_quant.naver) 스크래핑.
@@ -753,6 +773,8 @@ def fetch_naver_nxt_ranking(limit: int = 30):
     header_ths = table.find("thead").find_all("th")
     col_names = [th.get_text(strip=True) for th in header_ths]
 
+    etf_codes = _get_krx_etf_codes()  # ETF 제외용
+
     rows = []
     trs = table.find("tbody").find_all("tr") if table.find("tbody") else table.find_all("tr")
     rank = 0
@@ -765,6 +787,9 @@ def fetch_naver_nxt_ranking(limit: int = 30):
             continue
         code = code_match.group(1)
         name = link.get_text(strip=True)
+
+        if code in etf_codes or _is_preferred_stock_name(name):
+            continue  # ETF/우선주 제외 — 순위(rank)엔 안 넣고 그냥 건너뜀
 
         tds = tr.find_all("td")
         cell_texts = [td.get_text(strip=True) for td in tds]
@@ -808,6 +833,9 @@ def fetch_overseas_group_ranking(markets: list, limit: int = 30):
     "실시간 랭킹" 해외 컬럼용 — 그룹 안의 거래소 여러 개(예: 미국=NAS+NYS+AMS)를 각각
     조회해서 하나로 합친 뒤 거래량(tvol) 기준으로 다시 정렬. HHDFS76310010(해외주식
     거래량순위, 2026-08-08 필드 확인 완료: rsym/excd/symb/name/last/rate/tvol/tamt 등).
+    ETF/우선주/워런트는 제외 — "종목"만 순수하게 보고 싶다는 요청 반영.
+    ⚠️ 해외는 국내처럼 확실한 판별 필드가 없어서, 종목명에 흔한 키워드(ETF/FUND/TRUST 등)가
+    있는지로 걸러냄 — 100% 정확하진 않지만 실무에서 흔히 쓰는 방식.
     """
 
     def to_f(s):
@@ -815,6 +843,16 @@ def fetch_overseas_group_ranking(markets: list, limit: int = 30):
             return float(s)
         except (TypeError, ValueError):
             return 0.0
+
+    exclude_keywords = ("ETF", "FUND", "TRUST", "INDEX", "PREFERRED", "WARRANT", "NOTES", " SHARES", "PROSHARES")
+
+    def is_fund_or_warrant(symbol: str, name: str) -> bool:
+        name_upper = (name or "").upper()
+        if any(kw in name_upper for kw in exclude_keywords):
+            return True
+        if symbol and (symbol.endswith(".W") or "-P" in symbol or ".PR" in symbol):
+            return True  # 워런트/우선주 심볼 패턴
+        return False
 
     all_rows = []
     for market in markets:
@@ -825,11 +863,15 @@ def fetch_overseas_group_ranking(markets: list, limit: int = 30):
                 {"KEYB": "", "AUTH": "", "EXCD": market, "NDAY": "0", "PRC1": "", "PRC2": "", "VOL_RANG": "0"},
             )
             for r in data.get("output2", []):
+                symbol = r.get("symb") or ""
+                name = r.get("name") or r.get("ename") or symbol
+                if is_fund_or_warrant(symbol, name):
+                    continue
                 all_rows.append(
                     {
                         "market": market,
-                        "symbol": r.get("symb"),
-                        "stock_name": r.get("name") or r.get("ename") or r.get("symb"),
+                        "symbol": symbol,
+                        "stock_name": name,
                         "price": to_f(r.get("last")),
                         "change_pct": to_f(r.get("rate")),
                         "volume": to_f(r.get("tvol")),
@@ -933,25 +975,31 @@ def fetch_krx_volume_ranking(limit: int = 30):
     "실시간 랭킹" 페이지용 — KRX 전체(코스피+코스닥)에서 거래량(체결 수량) 기준 상위.
     fetch_volume_top30()은 거래대금 기준이라 별개 함수로 둠 — 사부님 사이트의
     "거래량 상위" 컬럼과 맞추기 위해 정렬 기준만 거래량으로 다르게 함.
+    ETF/우선주는 제외 — "종목"만 순수하게 보고 싶다는 요청 반영.
     """
     ymd = _latest_trading_day()
     df = stock.get_market_ohlcv_by_ticker(ymd, market="ALL")
     if df.empty:
         raise ValueError(f"KRX에서 {ymd} 시세 데이터를 가져오지 못했습니다.")
 
-    df = df.sort_values("거래량", ascending=False).head(limit)
+    etf_codes = _get_krx_etf_codes()
+    df = df.sort_values("거래량", ascending=False)
     trade_date = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}"
 
     rows = []
-    for i, (code, row) in enumerate(df.iterrows(), start=1):
+    for code, row in df.iterrows():
+        if code in etf_codes:
+            continue
         try:
             name = stock.get_market_ticker_name(code)
         except Exception:
             name = code
+        if _is_preferred_stock_name(name):
+            continue
         rows.append(
             {
                 "scan_date": trade_date,
-                "rank": i,
+                "rank": len(rows) + 1,
                 "stock_code": code,
                 "stock_name": name,
                 "volume": int(row.get("거래량", 0)),
@@ -959,6 +1007,8 @@ def fetch_krx_volume_ranking(limit: int = 30):
                 "change_pct": float(row.get("등락률", 0)),
             }
         )
+        if len(rows) >= limit:
+            break
     return rows
 
 
