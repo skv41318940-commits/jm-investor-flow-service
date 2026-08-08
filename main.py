@@ -14,9 +14,16 @@ pykrx는 키움 OpenAPI와 무관하게 KRX 공식 데이터를 인터넷으로 
 import os
 import time
 import json
+import re
 from datetime import datetime, timedelta, timezone
 
 import requests
+
+try:
+    from bs4 import BeautifulSoup  # 네이버 증권 NXT 거래상위 스크래핑용 — requirements.txt에 beautifulsoup4 필요
+except ImportError:
+    BeautifulSoup = None
+    print("[naver_scrape] beautifulsoup4가 설치되어 있지 않아 NXT 거래상위 스크래핑을 건너뜁니다.")
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -686,6 +693,85 @@ def _ensure_nxt_ranking_cached():
         print(f"[nxt_ranking] 스캔 실패: {e}")
 
 
+def fetch_naver_nxt_ranking(limit: int = 30):
+    """
+    네이버 증권 "NXT 거래상위"(https://finance.naver.com/sise/nxt_sise_quant.naver) 스크래핑.
+    ⚠️ 공식 API가 아니라 페이지를 직접 긁는 방식이라, 네이버가 페이지 구조를 바꾸면
+    깨질 수 있음 — 컬럼 순서를 하드코딩하지 않고 <thead>의 <th> 텍스트를 그대로 읽어서
+    "이 값이 어느 컬럼인지" 런타임에 판단하게 만들어서, 순서가 조금 바뀌는 정도는
+    안 깨지게 방어함. 완전히 다른 구조로 바뀌면(예: JS 렌더링 방식으로 전환) 그때는
+    다시 손봐야 함.
+    """
+    if BeautifulSoup is None:
+        raise RuntimeError("beautifulsoup4가 설치되어 있지 않습니다 (requirements.txt 확인 필요).")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Referer": "https://finance.naver.com/",
+        "Accept-Language": "ko-KR,ko;q=0.9",
+    }
+    res = requests.get("https://finance.naver.com/sise/nxt_sise_quant.naver", headers=headers, timeout=10)
+    soup = BeautifulSoup(res.content.decode("euc-kr", errors="replace"), "html.parser")
+
+    table = soup.find("table", class_="type_2")
+    if table is None:
+        raise ValueError("페이지에서 종목 테이블(table.type_2)을 찾지 못했어요 — 네이버 쪽 구조가 바뀌었을 수 있어요.")
+
+    # 헤더 컬럼명을 그대로 읽어서 순서 매핑 (하드코딩 안 함)
+    header_ths = table.find("thead").find_all("th")
+    col_names = [th.get_text(strip=True) for th in header_ths]
+
+    rows = []
+    trs = table.find("tbody").find_all("tr") if table.find("tbody") else table.find_all("tr")
+    rank = 0
+    for tr in trs:
+        link = tr.find("a", href=re.compile(r"code=\d{6}"))
+        if link is None:
+            continue  # 광고/빈 줄/구분선 행은 건너뜀
+        code_match = re.search(r"code=(\d{6})", link["href"])
+        if not code_match:
+            continue
+        code = code_match.group(1)
+        name = link.get_text(strip=True)
+
+        tds = tr.find_all("td")
+        cell_texts = [td.get_text(strip=True) for td in tds]
+        # cell_texts[0]은 순번, cell_texts[1]은 종목명 링크 — 그 뒤부터 헤더와 대응
+        value_map = {}
+        for i, col in enumerate(col_names[2:], start=2):
+            if i < len(cell_texts):
+                value_map[col] = cell_texts[i]
+
+        def to_num(s):
+            if not s:
+                return 0.0
+            s = s.replace(",", "").replace("%", "").replace("+", "")
+            try:
+                return float(s)
+            except ValueError:
+                return 0.0
+
+        rank += 1
+        rows.append(
+            {
+                "rank": rank,
+                "stock_code": code,
+                "stock_name": name,
+                "price": to_num(value_map.get("현재가", "0")),
+                "change_pct": to_num(value_map.get("등락률", "0")),
+                "volume": to_num(value_map.get("거래량", "0")),
+                "trading_value": to_num(value_map.get("거래대금", "0")),  # 네이버 표시 단위 그대로(백만원)
+            }
+        )
+        if len(rows) >= limit:
+            break
+
+    if not rows:
+        raise ValueError("테이블은 찾았는데 종목 행을 하나도 못 뽑았어요 — 컬럼 구조를 다시 확인해야 해요.")
+    return rows, col_names
+
+
 def fetch_krx_volume_ranking(limit: int = 30):
     """
     "실시간 랭킹" 페이지용 — KRX 전체(코스피+코스닥)에서 거래량(체결 수량) 기준 상위.
@@ -994,55 +1080,16 @@ def kis_overseas_daily_debug(symbol: str = "AAPL", market: str = "NAS"):
 @app.get("/api/naver-nxt-debug")
 def naver_nxt_debug():
     """
-    디버그 전용 — 네이버 증권 "NXT 거래상위" 페이지를 직접 긁어와서 원본을 확인.
-    실제 파싱 코드 짜기 전에 테이블 구조(HTML class, 컬럼 순서)를 먼저 확인하려는 용도.
-    ⚠️ 1차 시도 때 "종목명" 문자열을 못 찾아서 페이지 맨 앞(GNB)만 보여줬던 문제가 있어서,
-    이번엔 그 이유를 특정할 수 있게 여러 단서(테이블 개수/class, iframe 존재 여부,
-    "종목명"의 다른 표기 형태)를 한 번에 같이 반환함.
+    디버그 전용 — fetch_naver_nxt_ranking()이 실제로 파싱한 결과를 그대로 반환.
+    (1차: 원본 HTML 확인 → 구조 파악 완료. 2차: 이제 실제 파싱 함수가 정확히
+    뽑아내는지 구조화된 JSON으로 확인하는 단계)
     """
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Referer": "https://finance.naver.com/",
-            "Accept-Language": "ko-KR,ko;q=0.9",
-        }
-        res = requests.get("https://finance.naver.com/sise/nxt_sise_quant.naver", headers=headers, timeout=10)
-
-        # 인코딩 두 가지 다 시도해서 어느 쪽이 한글이 깨지지 않는지 같이 보여줌
-        raw_bytes = res.content
-        html_euckr = raw_bytes.decode("euc-kr", errors="replace")
-        html_utf8 = raw_bytes.decode("utf-8", errors="replace")
-
-        import re
-
-        tables = re.findall(r'<table[^>]*class="([^"]*)"', html_euckr)
-        iframes = re.findall(r'<iframe[^>]*src="([^"]*)"', html_euckr)
-
-        # "종목명"이 여러 인코딩/띄어쓰기로 있을 수 있어서 후보 여러 개를 다 확인
-        candidates = {
-            "종목명(euckr)": "종목명" in html_euckr,
-            "종목명(utf8)": "종목명" in html_utf8,
-            "현재가": "현재가" in html_euckr,
-            "거래량": "거래량" in html_euckr,
-            "type_2(국내 거래량상위 표에 흔히 쓰는 class)": "type_2" in html_euckr,
-        }
-
-        idx = html_euckr.find("현재가")  # "종목명"보다 더 흔하게 쓰이는 컬럼명이라 대안으로 검색
-        snippet = html_euckr[max(0, idx - 800) : idx + 3000] if idx != -1 else html_euckr[:3000]
-
-        return {
-            "ok": True,
-            "status_code": res.status_code,
-            "content_type_header": res.headers.get("content-type"),
-            "total_length": len(html_euckr),
-            "table_classes_found": tables,
-            "iframe_src_found": iframes,
-            "text_found": candidates,
-            "snippet": snippet,
-        }
+        rows, col_names = fetch_naver_nxt_ranking(limit=10)
+        return {"ok": True, "헤더에서_읽은_컬럼명": col_names, "파싱된_상위10개": rows}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
 
 
 @app.get("/api/kis-overseas-volume-rank-debug")
