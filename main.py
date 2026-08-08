@@ -991,6 +991,41 @@ def kis_overseas_daily_debug(symbol: str = "AAPL", market: str = "NAS"):
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/naver-nxt-debug")
+def naver_nxt_debug():
+    """
+    디버그 전용 — 네이버 증권 "NXT 거래상위" 페이지를 직접 긁어와서 원본을 확인.
+    실제 파싱 코드 짜기 전에 테이블 구조(HTML class, 컬럼 순서)를 먼저 확인하려는 용도.
+    ⚠️ 제 자체 웹 크롤러 도구에선 이 사이트가 차단됐었는데, 서버(Render)의 일반
+    requests 라이브러리로는 다를 수 있어서 시도해보는 것 — 이것도 막히면 다른
+    방법(예: 개발자도구 네트워크 탭에서 실제 데이터 API 찾기)을 시도해야 함.
+    """
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Referer": "https://finance.naver.com/",
+            "Accept-Language": "ko-KR,ko;q=0.9",
+        }
+        res = requests.get("https://finance.naver.com/sise/nxt_sise_quant.naver", headers=headers, timeout=10)
+        res.encoding = "euc-kr"  # 네이버 증권 페이지는 전통적으로 EUC-KR 인코딩을 씀
+        html = res.text
+
+        # "종목명"이 테이블 헤더에 있을 거라 그 주변만 잘라서 보여줌 (전체는 너무 길어서)
+        idx = html.find("종목명")
+        snippet = html[max(0, idx - 500) : idx + 4000] if idx != -1 else html[:4000]
+
+        return {
+            "ok": True,
+            "status_code": res.status_code,
+            "total_length": len(html),
+            "found_종목명": idx != -1,
+            "snippet": snippet,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/kis-overseas-volume-rank-debug")
 def kis_overseas_volume_rank_debug(market: str = "NAS", nday: str = "0"):
     """
