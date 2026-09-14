@@ -4121,3 +4121,34 @@ def sync_fundamentals_market_endpoint():
 @app.get("/api/ping")
 def ping():
     return {"ok": True}
+@app.get("/api/stock-ohlcv")
+def stock_ohlcv_endpoint(code: str, start: str, end: str):
+    """
+    목표가 매핑(패턴분석) 캔들차트용 — 정밀 일봉 시가/고가/저가/종가/거래량.
+    pykrx(KRX 공식 데이터)로 가져오므로 키움/한투 로그인과 무관하게 항상 정확함.
+    start/end: "YYYY-MM-DD" 형식.
+    """
+    if stock is None:
+        return {"ok": False, "error": "pykrx를 사용할 수 없습니다 (서버 기동 시 로그인에 실패했을 수 있어요, 잠시 후 다시 시도해주세요)."}
+    try:
+        start_ymd = start.replace("-", "")
+        end_ymd = end.replace("-", "")
+        df = stock.get_market_ohlcv_by_date(start_ymd, end_ymd, code)
+        if df.empty:
+            return {"ok": False, "error": f"{code} 종목의 {start}~{end} 구간 일봉 데이터가 없습니다."}
+
+        candles = []
+        for date_idx, row in df.iterrows():
+            candles.append(
+                {
+                    "date": date_idx.strftime("%Y-%m-%d"),
+                    "open": float(row.get("시가", 0)),
+                    "high": float(row.get("고가", 0)),
+                    "low": float(row.get("저가", 0)),
+                    "close": float(row.get("종가", 0)),
+                    "volume": float(row.get("거래량", 0)),
+                }
+            )
+        return {"ok": True, "code": code, "candles": candles}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
