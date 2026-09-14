@@ -4152,3 +4152,58 @@ def stock_ohlcv_endpoint(code: str, start: str, end: str):
         return {"ok": True, "code": code, "candles": candles}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+@app.get("/api/stock-minute-ohlcv")
+def stock_minute_ohlcv_endpoint(code: str, market: str = "J"):
+    """
+    종목분석/패턴분석 분봉 캔들차트용 — 당일 분봉 시가/고가/저가/종가/거래량.
+    한국투자증권 API(FHKST03010200) 기반, PC(키움) 없이 클라우드에서 바로 조회됨.
+    market: "J"(KRX 정규장, 기본값) / "NX"(NXT)
+    ⚠️ 당일 하루치만 제공됨(한투 API 자체가 "당일 분봉조회"라 과거 날짜는 안 됨).
+    """
+    if not KIS_APP_KEY or not KIS_APP_SECRET:
+        return {"ok": False, "error": "KIS_APP_KEY / KIS_APP_SECRET 환경변수가 설정되어 있지 않습니다."}
+    try:
+        now_str = now_kst().strftime("%H%M%S")
+        data = kis_get(
+            "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
+            tr_id="FHKST03010200",
+            params={
+                "FID_ETC_CLS_CODE": "",
+                "FID_COND_MRKT_DIV_CODE": market,
+                "FID_INPUT_ISCD": code,
+                "FID_INPUT_HOUR_1": now_str,
+                "FID_PW_DATA_INCU_YN": "Y",
+            },
+        )
+        if data.get("rt_cd") != "0":
+            return {"ok": False, "error": f"KIS API 오류: {data.get('msg1', '알 수 없는 오류')}"}
+
+        output2 = data.get("output2", [])
+        if not output2:
+            return {"ok": False, "error": f"{code}에 대한 분봉 데이터가 없습니다. (market={market})"}
+
+        # 시:분만 보고 날짜를 구분 안 하면 이전 거래일 데이터가 섞여 들어올 수 있어서,
+        # 가장 최근 날짜(오늘)만 사용 — fetch_minute_chart와 동일한 방어 로직
+        latest_date = max(r.get("stck_bsop_date", "") for r in output2)
+        output2 = [r for r in output2 if r.get("stck_bsop_date") == latest_date]
+
+        candles = []
+        for r in output2:
+            hour = r.get("stck_cntg_hour", "")
+            if len(hour) != 6:
+                continue
+            candles.append(
+                {
+                    "time": f"{hour[:2]}:{hour[2:4]}",
+                    "open": float(r.get("stck_oprc", 0)),
+                    "high": float(r.get("stck_hgpr", 0)),
+                    "low": float(r.get("stck_lwpr", 0)),
+                    "close": float(r.get("stck_prpr", 0)),
+                    "volume": float(r.get("cntg_vol", 0)),
+                }
+            )
+        candles.reverse()  # KIS는 최신순으로 주므로 오래된 순으로 재정렬
+
+        return {"ok": True, "code": code, "date": latest_date, "candles": candles}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
