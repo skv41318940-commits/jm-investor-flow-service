@@ -4152,58 +4152,160 @@ def stock_ohlcv_endpoint(code: str, start: str, end: str):
         return {"ok": True, "code": code, "candles": candles}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+# ── 분봉 페이지네이션 ───────────────────────────────────────────────────────
+# 한투 "주식당일분봉조회"(FHKST03010200)는 한 번 호출에 최대 30개 분봉만 주고,
+# FID_INPUT_HOUR_1(HHMMSS) "이전" 시각의 분봉을 최신순으로 돌려줌. 그래서 응답에서
+# 가장 오래된 시각을 커서로 삼아 반복 호출하며 장 시작(KRX 09:00 / NXT 08:00)까지 이어붙임.
+_MINUTE_MAX_PAGES = 40  # NXT 08:00~20:00(720분) ÷ 30 = 24페이지 + 여유. 무한루프 방지용 상한
+
+
+def _kis_minute_page(code: str, market: str, cursor_hhmmss: str) -> list:
+    """분봉 한 페이지(최대 30개, 최신순) 조회. 일시적 오류는 최대 3번까지 재시도."""
+    last_err = None
+    for attempt in range(3):
+        try:
+            data = kis_get(
+                "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
+                tr_id="FHKST03010200",
+                params={
+                    "FID_ETC_CLS_CODE": "",
+                    "FID_COND_MRKT_DIV_CODE": market,  # J:KRX 정규장, NX:NXT, UN:통합
+                    "FID_INPUT_ISCD": code,
+                    "FID_INPUT_HOUR_1": cursor_hhmmss,
+                    "FID_PW_DATA_INCU_YN": "Y",
+                },
+            )
+            if data.get("rt_cd") == "0":
+                return data.get("output2") or []
+            last_err = f"KIS API 오류: {data.get('msg1', '알 수 없는 오류')}"
+        except Exception as e:
+            last_err = str(e)
+        time.sleep(0.5 * (attempt + 1))
+    raise ValueError(last_err)
+
+
+def fetch_minute_candles_paginated(code: str, market: str = "J", start_hhmm: str = ""):
+    """
+    반복 호출로 당일 분봉을 start_hhmm(기본 J=09:00, NX/UN=08:00)까지 이어붙여 반환.
+    반환: (candles[오래된 순], latest_date, pages, complete, warning)
+      complete=True  → 시작 시각(또는 그날 첫 분봉)까지 다 모았음
+      complete=False → 상한/오류/진전 없음으로 중간에 멈춤 (warning에 이유)
+    """
+    if not start_hhmm:
+        start_hhmm = "09:00" if market == "J" else "08:00"
+    stop = start_hhmm.replace(":", "")[:4] + "00"  # HHMMSS
+
+    cursor = now_kst().strftime("%H%M%S")
+    by_hour: dict = {}  # "HHMMSS" -> 원본 row (중복 제거용)
+    latest_date = ""
+    pages = 0
+    complete = False
+    warning = None
+
+    for _ in range(_MINUTE_MAX_PAGES):
+        try:
+            output2 = _kis_minute_page(code, market, cursor)
+        except Exception as e:
+            if not by_hour:
+                raise  # 첫 페이지부터 실패하면 그대로 에러
+            warning = f"{pages + 1}번째 호출에서 실패해 그때까지 모은 데이터만 반환: {e}"
+            break
+        pages += 1
+
+        if not output2:
+            if not by_hour:
+                raise ValueError(f"{code}에 대한 분봉 데이터가 없습니다. (market={market})")
+            complete = True  # 더 이전 데이터가 없음 = 그날 첫 분봉까지 도달
+            break
+
+        # 시:분만 보고 날짜를 구분 안 하면 이전 거래일 데이터가 섞임 → 첫 페이지의 가장 최근 날짜만 사용
+        if not latest_date:
+            latest_date = max(r.get("stck_bsop_date", "") for r in output2)
+        page = [
+            r
+            for r in output2
+            if r.get("stck_bsop_date") == latest_date and len(r.get("stck_cntg_hour", "")) == 6
+        ]
+        if not page:
+            complete = True  # 이전 거래일 데이터만 남음 = 오늘 첫 분봉을 이미 지남
+            break
+
+        new_count = 0
+        for r in page:
+            if r["stck_cntg_hour"] not in by_hour:
+                by_hour[r["stck_cntg_hour"]] = r
+                new_count += 1
+
+        if len(page) < len(output2):
+            complete = True  # 이번 페이지에 이전 거래일이 섞여 있음 = 오늘 첫 분봉 도달
+            break
+
+        oldest = min(r["stck_cntg_hour"] for r in page)
+        if oldest <= stop:
+            complete = True  # 요청한 시작 시각까지 도달
+            break
+        if new_count == 0:
+            warning = "커서를 옮겨도 새 분봉이 없어 중간에 멈췄어요."
+            break
+
+        # 다음 커서 = 가장 오래된 분봉 시각 - 1초 (같은 분봉이 또 오더라도 by_hour로 걸러짐)
+        cursor = (datetime.strptime(oldest, "%H%M%S") - timedelta(seconds=1)).strftime("%H%M%S")
+        time.sleep(0.15)  # 한투 초당 호출 한도 여유
+    else:
+        warning = f"최대 {_MINUTE_MAX_PAGES}페이지에서 멈췄어요 (시작 시각까지 못 닿았을 수 있음)."
+
+    candles = []
+    for hour in sorted(h for h in by_hour if h >= stop):
+        r = by_hour[hour]
+        candles.append(
+            {
+                "time": f"{hour[:2]}:{hour[2:4]}",
+                "open": float(r.get("stck_oprc", 0)),
+                "high": float(r.get("stck_hgpr", 0)),
+                "low": float(r.get("stck_lwpr", 0)),
+                "close": float(r.get("stck_prpr", 0)),
+                "volume": float(r.get("cntg_vol", 0)),
+            }
+        )
+    if not candles:
+        raise ValueError(f"{code}에 대한 {start_hhmm} 이후 분봉 데이터가 없습니다. (market={market})")
+    return candles, latest_date, pages, complete, warning
+
+
 @app.get("/api/stock-minute-ohlcv")
-def stock_minute_ohlcv_endpoint(code: str, market: str = "J"):
+def stock_minute_ohlcv_endpoint(code: str, market: str = "J", start_time: str = ""):
     """
     종목분석/패턴분석 분봉 캔들차트용 — 당일 분봉 시가/고가/저가/종가/거래량.
     한국투자증권 API(FHKST03010200) 기반, PC(키움) 없이 클라우드에서 바로 조회됨.
-    market: "J"(KRX 정규장, 기본값) / "NX"(NXT)
+    한 번 호출에 30개만 주는 API라서, 커서(FID_INPUT_HOUR_1)를 옮겨가며 반복 호출해
+    장 시작(J=09:00, NX/UN=08:00)부터 현재까지 이어붙여서 반환함.
+    market: "J"(KRX 정규장, 기본값) / "NX"(NXT) / "UN"(통합)
+    start_time: "HH:MM" — 비우면 시장별 기본 시작 시각
+    응답의 complete=false면 시작 시각까지 다 못 모은 것(warning에 이유).
     ⚠️ 당일 하루치만 제공됨(한투 API 자체가 "당일 분봉조회"라 과거 날짜는 안 됨).
     """
     if not KIS_APP_KEY or not KIS_APP_SECRET:
         return {"ok": False, "error": "KIS_APP_KEY / KIS_APP_SECRET 환경변수가 설정되어 있지 않습니다."}
+    if market not in ("J", "NX", "UN"):
+        return {"ok": False, "error": "market은 J / NX / UN 중 하나여야 해요."}
+    if start_time and not re.fullmatch(r"\d{2}:?\d{2}", start_time):
+        return {"ok": False, "error": "start_time은 HH:MM 형식이어야 해요. (예: 09:00)"}
     try:
-        now_str = now_kst().strftime("%H%M%S")
-        data = kis_get(
-            "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
-            tr_id="FHKST03010200",
-            params={
-                "FID_ETC_CLS_CODE": "",
-                "FID_COND_MRKT_DIV_CODE": market,
-                "FID_INPUT_ISCD": code,
-                "FID_INPUT_HOUR_1": now_str,
-                "FID_PW_DATA_INCU_YN": "Y",
-            },
-        )
-        if data.get("rt_cd") != "0":
-            return {"ok": False, "error": f"KIS API 오류: {data.get('msg1', '알 수 없는 오류')}"}
-
-        output2 = data.get("output2", [])
-        if not output2:
-            return {"ok": False, "error": f"{code}에 대한 분봉 데이터가 없습니다. (market={market})"}
-
-        # 시:분만 보고 날짜를 구분 안 하면 이전 거래일 데이터가 섞여 들어올 수 있어서,
-        # 가장 최근 날짜(오늘)만 사용 — fetch_minute_chart와 동일한 방어 로직
-        latest_date = max(r.get("stck_bsop_date", "") for r in output2)
-        output2 = [r for r in output2 if r.get("stck_bsop_date") == latest_date]
-
-        candles = []
-        for r in output2:
-            hour = r.get("stck_cntg_hour", "")
-            if len(hour) != 6:
-                continue
-            candles.append(
-                {
-                    "time": f"{hour[:2]}:{hour[2:4]}",
-                    "open": float(r.get("stck_oprc", 0)),
-                    "high": float(r.get("stck_hgpr", 0)),
-                    "low": float(r.get("stck_lwpr", 0)),
-                    "close": float(r.get("stck_prpr", 0)),
-                    "volume": float(r.get("cntg_vol", 0)),
-                }
-            )
-        candles.reverse()  # KIS는 최신순으로 주므로 오래된 순으로 재정렬
-
-        return {"ok": True, "code": code, "date": latest_date, "candles": candles}
+        start_hhmm = start_time.replace(":", "")
+        start_hhmm = f"{start_hhmm[:2]}:{start_hhmm[2:4]}" if start_hhmm else ""
+        candles, latest_date, pages, complete, warning = fetch_minute_candles_paginated(code, market, start_hhmm)
+        result = {
+            "ok": True,
+            "code": code,
+            "market": market,
+            "date": latest_date,
+            "count": len(candles),
+            "pages": pages,
+            "complete": complete,
+            "candles": candles,
+        }
+        if warning:
+            result["warning"] = warning
+        return result
     except Exception as e:
         return {"ok": False, "error": str(e)}
