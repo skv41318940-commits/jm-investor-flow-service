@@ -4320,12 +4320,12 @@ def stock_minute_ohlcv_endpoint(code: str, market: str = "J", start_time: str = 
     except Exception as e:
         return {"ok": False, "error": str(e)}
 @app.get("/api/naver-industry-debug")
-def naver_industry_debug(no: str = ""):
+def naver_industry_debug(no: str = "", path: str = "stocks/industry"):
     """
     네이버가 2026-09에 finance.naver.com → stock.naver.com(Next.js)로 개편하면서
     기존 HTML 스크래핑(테마/업종 목록)이 다 깨짐. 화면이 실제로 쓰는 새 JSON API
-    (m.stock.naver.com/api/stocks/industry)의 실제 응답 모양을 먼저 확인하기 위한
-    디버그용 엔드포인트. no를 안 주면 "목록"을, 주면 "그 업종의 구성종목"을 그대로 반환.
+    (m.stock.naver.com/api/{path})의 실제 응답 모양을 먼저 확인하기 위한 디버그용
+    엔드포인트. path로 다른 후보 경로도 찔러볼 수 있음 (예: stocks/theme).
     """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -4333,12 +4333,12 @@ def naver_industry_debug(no: str = ""):
         "Referer": "https://m.stock.naver.com/",
     }
     try:
+        base = f"https://m.stock.naver.com/api/{path}"
         if no:
-            url = f"https://m.stock.naver.com/api/stocks/industry/{no}"
-            res = requests.get(url, headers=headers, params={"page": 1, "pageSize": 20}, timeout=10)
+            url = f"{base}/{no}"
         else:
-            url = "https://m.stock.naver.com/api/stocks/industry"
-            res = requests.get(url, headers=headers, params={"page": 1, "pageSize": 10}, timeout=10)
+            url = base
+        res = requests.get(url, headers=headers, params={"page": 1, "pageSize": 10}, timeout=10)
 
         return {
             "ok": True,
@@ -4348,3 +4348,4 @@ def naver_industry_debug(no: str = ""):
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
