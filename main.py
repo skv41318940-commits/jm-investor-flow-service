@@ -4319,3 +4319,32 @@ def stock_minute_ohlcv_endpoint(code: str, market: str = "J", start_time: str = 
         return result
     except Exception as e:
         return {"ok": False, "error": str(e)}
+@app.get("/api/naver-industry-debug")
+def naver_industry_debug(no: str = ""):
+    """
+    네이버가 2026-09에 finance.naver.com → stock.naver.com(Next.js)로 개편하면서
+    기존 HTML 스크래핑(테마/업종 목록)이 다 깨짐. 화면이 실제로 쓰는 새 JSON API
+    (m.stock.naver.com/api/stocks/industry)의 실제 응답 모양을 먼저 확인하기 위한
+    디버그용 엔드포인트. no를 안 주면 "목록"을, 주면 "그 업종의 구성종목"을 그대로 반환.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Referer": "https://m.stock.naver.com/",
+    }
+    try:
+        if no:
+            url = f"https://m.stock.naver.com/api/stocks/industry/{no}"
+            res = requests.get(url, headers=headers, params={"page": 1, "pageSize": 20}, timeout=10)
+        else:
+            url = "https://m.stock.naver.com/api/stocks/industry"
+            res = requests.get(url, headers=headers, params={"page": 1, "pageSize": 10}, timeout=10)
+
+        return {
+            "ok": True,
+            "requested_url": res.url,
+            "status_code": res.status_code,
+            "raw_text_preview": res.text[:3000],
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
