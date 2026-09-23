@@ -753,117 +753,90 @@ def _naver_headers():
     }
 
 
+def _naver_stock_headers():
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Referer": "https://m.stock.naver.com/",
+    }
+
+
 def fetch_naver_theme_list(limit: int = 25):
     """
-    "업종분석" 국내 탭용 — 네이버 증권 "테마별 시세"(https://finance.naver.com/sise/theme.naver)
-    인기 테마 목록. 2026-08-08 필드 확인 완료: 링크에서 no=(테마ID), 첫 번째 %가 등락률.
+    "업종분석" 국내 탭용 — 네이버 증권 인기 테마 목록.
+    2026-09 네이버가 finance.naver.com(HTML) → stock.naver.com(Next.js, JSON API)로
+    전면 개편하면서 기존 테이블 스크래핑이 깨져서, 화면이 실제로 쓰는 새 JSON API로 교체함.
     """
-    if BeautifulSoup is None:
-        raise RuntimeError("beautifulsoup4가 설치되어 있지 않습니다.")
-
-    res = requests.get("https://finance.naver.com/sise/theme.naver", headers=_naver_headers(), timeout=10)
-    soup = BeautifulSoup(res.content.decode("euc-kr", errors="replace"), "html.parser")
-    table = soup.find("table", class_="type_1")
-    if table is None:
-        raise ValueError("페이지에서 테마 목록 테이블을 찾지 못했어요 — 네이버 쪽 구조가 바뀌었을 수 있어요.")
-
-    def to_num(s):
-        if not s:
-            return 0.0
-        s = s.replace(",", "").replace("%", "").replace("+", "")
-        try:
-            return float(s)
-        except ValueError:
-            return 0.0
+    res = requests.get(
+        "https://m.stock.naver.com/api/stocks/theme",
+        headers=_naver_stock_headers(),
+        params={"page": 1, "pageSize": limit},
+        timeout=10,
+    )
+    res.raise_for_status()
+    data = res.json()
+    groups = data.get("groups", [])
+    if not groups:
+        raise ValueError("네이버에서 테마 목록을 가져오지 못했어요 — 응답 구조가 바뀌었을 수 있어요.")
 
     rows = []
-    for tr in table.find_all("tr"):
-        link = tr.find("a", href=re.compile(r"sise_group_detail\.naver\?type=theme"))
-        if link is None:
-            continue
-        no_match = re.search(r"no=(\d+)", link["href"])
-        if not no_match:
-            continue
-        theme_no = no_match.group(1)
-        theme_name = link.get_text(strip=True)
-        cell_texts = [td.get_text(strip=True) for td in tr.find_all("td")]
-        change_pct = to_num(cell_texts[1]) if len(cell_texts) > 1 else 0.0
-
-        rows.append({"rank": len(rows) + 1, "theme_no": theme_no, "theme_name": theme_name, "change_pct": change_pct})
-        if len(rows) >= limit:
-            break
-
-    if not rows:
-        raise ValueError("테마 행을 하나도 못 뽑았어요 — 컬럼 구조를 다시 확인해야 해요.")
+    for i, g in enumerate(groups[:limit], start=1):
+        rows.append(
+            {
+                "rank": i,
+                "theme_no": str(g.get("no")),
+                "theme_name": g.get("name", ""),
+                "change_pct": float(g.get("changeRate", 0) or 0),
+            }
+        )
     return rows
 
 
 def fetch_naver_theme_detail(theme_no: str, limit: int = 30):
     """
-    테마 하나를 클릭했을 때 보여줄 구성 종목 — NXT 스크래핑 때와 같은 방식(헤더를 직접
-    읽어서 컬럼 매핑, 순서 하드코딩 안 함)으로 견고하게 만듦.
+    테마 하나를 클릭했을 때 보여줄 구성 종목 — 마찬가지로 새 JSON API 사용.
     """
-    if BeautifulSoup is None:
-        raise RuntimeError("beautifulsoup4가 설치되어 있지 않습니다.")
-
-    url = f"https://finance.naver.com/sise/sise_group_detail.naver?type=theme&no={theme_no}"
-    res = requests.get(url, headers=_naver_headers(), timeout=10)
-    soup = BeautifulSoup(res.content.decode("euc-kr", errors="replace"), "html.parser")
-    table = soup.find("table", class_="type_5")
-    if table is None:
-        raise ValueError("테마 상세 페이지에서 종목 테이블(table.type_5)을 찾지 못했어요.")
-
-    header_ths = table.find_all("th")
-    col_names = [th.get_text(strip=True) for th in header_ths]
+    res = requests.get(
+        f"https://m.stock.naver.com/api/stocks/theme/{theme_no}",
+        headers=_naver_stock_headers(),
+        params={"page": 1, "pageSize": limit},
+        timeout=10,
+    )
+    res.raise_for_status()
+    data = res.json()
+    stocks = data.get("stocks", [])
+    if not stocks:
+        raise ValueError("이 테마의 구성종목을 가져오지 못했어요 — 응답 구조가 바뀌었을 수 있어요.")
 
     etf_codes = _get_krx_etf_codes()
 
-    def to_num(s):
-        if not s:
-            return 0.0
-        s = s.replace(",", "").replace("%", "").replace("+", "")
+    def to_f(s):
         try:
             return float(s)
-        except ValueError:
+        except (TypeError, ValueError):
             return 0.0
 
     rows = []
-    for tr in table.find_all("tr"):
-        link = tr.find("a", href=re.compile(r"code=\d{6}"))
-        if link is None:
-            continue
-        code_match = re.search(r"code=(\d{6})", link["href"])
-        if not code_match:
-            continue
-        code = code_match.group(1)
-        name = link.get_text(strip=True)
+    for s in stocks:
+        code = s.get("itemCode", "")
+        name = s.get("stockName", "")
         if code in etf_codes or _is_preferred_stock_name(name):
             continue
-
-        cell_texts = [td.get_text(strip=True) for td in tr.find_all("td")]
-        # cell_texts[0]=종목명(이미 위에서 링크로 추출함), cell_texts[1]="테마 편입 사유..."
-        # 마우스오버 툴팁용 숨겨진 셀 — 헤더 목록엔 없는데 데이터 셀엔 껴있어서, 여기서부터
-        # 한 칸씩 밀려서 col_names[1](현재가)이 cell_texts[2]랑 대응되게 오프셋을 맞춰줌
-        # (2026-08-08 실제 데이터로 확인 완료 — 이게 없으면 전부 다음 컬럼 값으로 밀려서 나옴)
-        value_map = {}
-        for i, col in enumerate(col_names[1:], start=2):
-            if i < len(cell_texts):
-                value_map[col] = cell_texts[i]
-
         rows.append(
             {
                 "rank": len(rows) + 1,
                 "stock_code": code,
                 "stock_name": name,
-                "price": to_num(value_map.get("현재가", "0")),
-                "change_pct": to_num(value_map.get("등락률", "0")),
-                "volume": to_num(value_map.get("거래량", "0")),
-                "trading_value": to_num(value_map.get("거래대금", "0")),
+                "price": to_f(s.get("closePriceRaw")),
+                "change_pct": to_f(s.get("fluctuationsRatio")),
+                "volume": to_f(s.get("accumulatedTradingVolumeRaw")),
+                "trading_value": to_f(s.get("accumulatedTradingValueRaw")),
             }
         )
         if len(rows) >= limit:
             break
 
+    col_names = ["종목명", "현재가", "등락률", "거래량", "거래대금"]
     return rows, col_names
 
 
