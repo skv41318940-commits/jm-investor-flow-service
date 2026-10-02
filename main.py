@@ -657,10 +657,7 @@ def fetch_nxt_scan_scores(limit: int = NXT_RANKING_POOL_SIZE):
 
     rows = []
     for i, r in enumerate(scored[:limit], start=1):
-        try:
-            name = stock.get_market_ticker_name(r["code"])
-        except Exception:
-            name = r["code"]
+        name = _safe_ticker_name(r["code"])
         rows.append(
             {
                 "scan_date": trade_date,
@@ -729,6 +726,8 @@ def _is_preferred_stock_name(name: str) -> bool:
     국내 우선주 이름 패턴 — '삼성전자우', 'LG화학우B', '현대차2우B' 등은 끝이
     "우"(+등급 알파벳 하나) 로 끝남. 100% 완벽한 판별은 아니지만 실무에서 흔히 쓰는 방식.
     """
+    if not isinstance(name, str):
+        return False
     return bool(name) and bool(re.search(r"우[A-Z]?$", name))
 
 
@@ -759,6 +758,78 @@ def _naver_stock_headers():
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Referer": "https://m.stock.naver.com/",
     }
+
+
+# ── 종목코드 → 종목명 (안전 버전) ─────────────────────────────────────────────
+# ⚠️ pykrx의 get_market_ticker_name()은 실패해도 예외를 안 던지고 "빈 DataFrame"을
+# 돌려줄 때가 있음 (Render 로그의 "Error occurred in get_stock_name: 'NoneType' object
+# is not subscriptable"). 특히 0126Z0 같은 영문 섞인 신규 종목코드에서 잘 터짐.
+# 그 DataFrame이 이름 자리에 들어가면 _is_preferred_stock_name()에서 "The truth value of
+# a DataFrame is ambiguous" 에러로 랭킹 스캔 전체가 죽고, Supabase 저장도 실패함
+# (2026-08 중순부터 KRX 랭킹/NXT 스캔이 매일 실패하던 원인). 그래서 이름은 항상 이 함수로만 구함:
+#   1) pykrx 결과가 "진짜 문자열"일 때만 사용
+#   2) 아니면 Supabase에 이미 저장된 이름(stock_fundamentals / sector_stocks)에서 찾음
+#   3) 그래도 없으면(allow_remote=True일 때만) 네이버 증권 API로 1건 조회
+#   4) 다 실패하면 종목코드를 그대로 이름으로 씀 — 절대 예외를 던지지 않음
+_name_cache: dict = {}
+_name_cache_loaded_at = 0.0
+_name_cache_lock = threading.Lock()
+
+
+def _load_name_cache():
+    global _name_cache_loaded_at
+    with _name_cache_lock:
+        if _name_cache and time.time() - _name_cache_loaded_at < 6 * 3600:
+            return
+        loaded = {}
+        for table in ("sector_stocks", "stock_fundamentals"):
+            start = 0
+            while True:
+                try:
+                    res = supabase.table(table).select("code,name").range(start, start + 999).execute()
+                except Exception as e:
+                    print(f"[name_cache] {table} 조회 실패: {e}")
+                    break
+                for r in res.data or []:
+                    code, name = r.get("code"), r.get("name")
+                    if code and isinstance(name, str) and name and name != code:
+                        loaded[code] = name
+                if not res.data or len(res.data) < 1000:
+                    break
+                start += 1000
+        _name_cache.update(loaded)
+        _name_cache_loaded_at = time.time()
+        print(f"[name_cache] 종목명 {len(_name_cache)}개 로드")
+
+
+def _safe_ticker_name(code: str, allow_remote: bool = True) -> str:
+    if not code:
+        return code
+    if stock is not None:
+        try:
+            name = stock.get_market_ticker_name(code)
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+        except Exception:
+            pass
+
+    _load_name_cache()
+    if code in _name_cache:
+        return _name_cache[code]
+
+    if allow_remote:
+        try:
+            res = requests.get(
+                f"https://m.stock.naver.com/api/stock/{code}/basic", headers=_naver_stock_headers(), timeout=5
+            )
+            if res.ok:
+                name = (res.json() or {}).get("stockName")
+                if isinstance(name, str) and name.strip():
+                    _name_cache[code] = name.strip()
+                    return name.strip()
+        except Exception as e:
+            print(f"[name_lookup] {code} 네이버 조회 실패: {e}")
+    return code
 
 
 def fetch_naver_theme_list(limit: int = 25):
@@ -1189,10 +1260,7 @@ def fetch_krx_volume_ranking(limit: int = 30):
     for code, row in df.iterrows():
         if code in etf_codes:
             continue
-        try:
-            name = stock.get_market_ticker_name(code)
-        except Exception:
-            name = code
+        name = _safe_ticker_name(code)
         if _is_preferred_stock_name(name):
             continue
         rows.append(
@@ -2331,6 +2399,7 @@ async def _ws_worker():
             await asyncio.to_thread(_ensure_overseas_ranking_cached, "JP")
             await asyncio.to_thread(_ensure_overseas_ranking_cached, "HK_CN")
             await asyncio.to_thread(_ensure_fundamentals_synced_today)
+            await asyncio.to_thread(_ensure_market_flow_synced_today)
             codes = await asyncio.to_thread(_get_watchlist_codes)
             if not codes:
                 print("[ws_worker] 구독할 종목이 없어 잠시 대기합니다.")
@@ -2392,6 +2461,7 @@ async def _ws_worker():
                         await asyncio.to_thread(_ensure_overseas_ranking_cached, "JP")
                         await asyncio.to_thread(_ensure_overseas_ranking_cached, "HK_CN")
                         await asyncio.to_thread(_ensure_fundamentals_synced_today)
+                        await asyncio.to_thread(_ensure_market_flow_synced_today)
                         new_codes = await asyncio.to_thread(_get_watchlist_codes)
                         added = [c for c in new_codes if c not in codes]
                         for code in added:
@@ -3745,6 +3815,172 @@ def sync_investor_flow_endpoint(code: str):
         return {"ok": False, "error": str(e)}
 
 
+
+# ── 시장 전체 수급(전체/코스피/코스닥) — 원래 PC 프로그램(market_flow_sync.py)만 채우던
+# market_flow_trend 테이블을 클라우드에서 매일 자동으로 채움 (2026-10-02 이전).
+# PC 프로그램이 8/15 이후로 안 돌아서 시장분석 수급 차트가 8/14에서 멈춰 있었음.
+# 단위는 기존 데이터와 같은 "억원". 기존 값과 단위가 다르면 저장하지 않고 멈추는 안전장치 포함.
+MARKET_FLOW_MARKETS = ("ALL", "KOSPI", "KOSDAQ")
+
+
+def _pick(row, *names):
+    for n in names:
+        v = row.get(n, None)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+    return 0.0
+
+
+def _market_flow_df(fromdate: str, todate: str, market: str):
+    """pykrx 시장 단위 투자자별 순매수(원). ALL이 실패하면 코스피+코스닥을 더해서 대신 씀."""
+    try:
+        df = stock.get_market_trading_value_by_date(fromdate, todate, market, detail=True)
+        if df is not None and not df.empty:
+            return df
+    except Exception as e:
+        print(f"[market_flow] {market} 조회 실패: {e}")
+    if market == "ALL":
+        kospi = _market_flow_df(fromdate, todate, "KOSPI")
+        kosdaq = _market_flow_df(fromdate, todate, "KOSDAQ")
+        if kospi is not None and kosdaq is not None:
+            return kospi.add(kosdaq, fill_value=0)
+    return None
+
+
+def fetch_market_flow(market: str, days: int = 20):
+    if stock is None:
+        raise RuntimeError("pykrx를 사용할 수 없습니다.")
+    today = now_kst()
+    fromdate = (today - timedelta(days=days * 2)).strftime("%Y%m%d")
+    todate = today.strftime("%Y%m%d")
+    df = _market_flow_df(fromdate, todate, market)
+    if df is None or df.empty:
+        raise ValueError(f"KRX에서 {market} 시장 수급을 가져오지 못했습니다 ({fromdate}~{todate}).")
+    print(f"[market_flow] {market} rows={len(df)} columns={list(df.columns)}")
+    df = df.tail(days)
+
+    now_iso = now_kst().isoformat()
+    rows = []
+    for date_idx, row in df.iterrows():
+        foreign = _pick(row, "외국인합계", "외국인") + (0.0 if "외국인합계" in row.index else _pick(row, "기타외국인"))
+        # 기관 = 금융투자+보험+투신+사모+은행+기타금융+연기금 (HTS의 "기관합계"와 같은 기준)
+        if "기관합계" in row.index:
+            institution = _pick(row, "기관합계")
+        else:
+            institution = sum(_pick(row, c) for c in ("금융투자", "보험", "투신", "사모", "은행", "기타금융", "연기금"))
+        rows.append(
+            {
+                "market": market,
+                "trade_date": date_idx.strftime("%Y-%m-%d"),
+                "foreign_amt": round(foreign / 1e8, 1),
+                "institution": round(institution / 1e8, 1),
+                "individual": round(_pick(row, "개인") / 1e8, 1),
+                "pension": round(_pick(row, "연기금") / 1e8, 1),
+                "updated_at": now_iso,
+            }
+        )
+    return rows
+
+
+def _check_market_flow_units(market: str, rows: list):
+    """
+    새로 계산한 값이 기존(PC 프로그램이 저장한) 값과 단위가 같은지 겹치는 날짜로 확인.
+    외국인 순매수가 2배 넘게 차이나면 단위/계산 방식이 다른 것이니 저장하지 않고 에러를 냄.
+    """
+    dates = [r["trade_date"] for r in rows]
+    try:
+        old = (
+            supabase.table("market_flow_trend")
+            .select("trade_date,foreign_amt,individual")
+            .eq("market", market)
+            .in_("trade_date", dates)
+            .execute()
+            .data
+        )
+    except Exception as e:
+        print(f"[market_flow] 기존값 비교 조회 실패 (비교 없이 진행): {e}")
+        return
+    new_by_date = {r["trade_date"]: r for r in rows}
+    ratios = []
+    for o in old:
+        n = new_by_date.get(o["trade_date"])
+        old_v = float(o.get("foreign_amt") or 0)
+        if n and abs(old_v) >= 100:
+            ratios.append(n["foreign_amt"] / old_v)
+    if not ratios:
+        return
+    ratios.sort()
+    median = ratios[len(ratios) // 2]
+    if not (0.5 <= median <= 2.0):
+        raise ValueError(
+            f"{market}: 새 값과 기존 값의 크기가 너무 달라서(약 {median:.2f}배) 저장을 멈췄어요. "
+            "단위나 계산 방식이 기존 PC 프로그램과 다를 수 있어요."
+        )
+
+
+def sync_market_flow(days: int = 20) -> dict:
+    result = {}
+    for market in MARKET_FLOW_MARKETS:
+        try:
+            rows = fetch_market_flow(market, days)
+            _check_market_flow_units(market, rows)
+            supabase.table("market_flow_trend").upsert(rows).execute()
+            result[market] = {"ok": True, "synced": len(rows), "last_date": rows[-1]["trade_date"] if rows else None}
+        except Exception as e:
+            print(f"[market_flow] {market} 동기화 실패: {e}")
+            result[market] = {"ok": False, "error": str(e)}
+    return result
+
+
+_market_flow_last_try = {"date": None, "count": 0}
+
+
+def _ensure_market_flow_synced_today():
+    """
+    평일 16:30 KST 이후 하루 1번 자동 동기화 (투자자별 집계가 장 마감 후 확정되므로).
+    오늘 날짜(거래일) 행이 이미 있으면 스킵. 실패하면 5분마다 다시 시도하되 하루 최대 6번까지만.
+    """
+    now = now_kst()
+    if now.weekday() >= 5 or (now.hour, now.minute) < (16, 30):
+        return
+    today_str = now.strftime("%Y-%m-%d")
+    if _market_flow_last_try["date"] != today_str:
+        _market_flow_last_try.update({"date": today_str, "count": 0})
+    if _market_flow_last_try["count"] >= 6:
+        return
+    try:
+        existing = (
+            supabase.table("market_flow_trend")
+            .select("trade_date")
+            .eq("market", "ALL")
+            .eq("trade_date", today_str)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            return
+    except Exception as e:
+        print(f"[market_flow] 캐시 확인 실패: {e}")
+        return
+    _market_flow_last_try["count"] += 1
+    result = sync_market_flow(days=20)
+    print(f"[market_flow] 자동 동기화 결과: {result}")
+
+
+@app.get("/api/sync-market-flow")
+def sync_market_flow_endpoint(days: int = 40):
+    """
+    시장 전체 수급(전체/코스피/코스닥) 수동 동기화 — 브라우저로 이 주소를 한 번 열면
+    최근 days 영업일치를 채움 (기본 40일: 8월 중순 이후 비어있던 구간까지 한 번에 메움).
+    평소엔 _ws_worker가 평일 16:30 이후 자동으로 돌림.
+    """
+    days = max(1, min(days, 120))
+    return {"ok": True, "result": sync_market_flow(days)}
+
+
 def _latest_trading_day() -> str:
     """오늘이 주말/공휴일이라 데이터가 없을 수 있어서, 최근 영업일을 찾아 반환 (YYYYMMDD)"""
     from datetime import date as _date
@@ -3830,10 +4066,7 @@ def sync_fundamentals_market_wide():
             bps = float(row.get("BPS", 0) or 0)
             roe = round((eps / bps) * 100, 2) if bps else 0.0
             market_cap = int(cap_df.loc[code, "시가총액"]) if code in cap_df.index else 0
-            try:
-                name = stock.get_market_ticker_name(code)
-            except Exception:
-                name = code
+            name = _safe_ticker_name(code, allow_remote=False)  # 2500종목이라 네이버 개별조회는 안 함
             rows.append(
                 {
                     "code": code,
@@ -3947,10 +4180,7 @@ def fetch_volume_top30(limit: int = 30):
 
     rows = []
     for i, (code, row) in enumerate(df.iterrows(), start=1):
-        try:
-            name = stock.get_market_ticker_name(code)
-        except Exception:
-            name = code
+        name = _safe_ticker_name(code)
         rows.append(
             {
                 "rank": i,
