@@ -2540,6 +2540,28 @@ def _in_overseas_window(now: datetime) -> bool:
     return not (OVERSEAS_WS_IDLE_START_HOUR <= h < OVERSEAS_WS_IDLE_END_HOUR)
 
 
+def _overseas_ws_allowed(now: datetime) -> bool:
+    """
+    해외 웹소켓을 지금 연결해도 되는지.
+    ⚠️ 한투가 appkey 하나당 웹소켓 접속을 1개만 허용함 — 해외 워커가 낮에도 연결을 붙잡고 있으면
+    국내 워커가 "ALREADY IN USE appkey"(OPSP8996)로 계속 거절당함 (2026-10-08, 국내 실시간 체결이
+    하루 종일 하나도 안 쌓인 장애의 원인). 그래서 국내 실시간 시간(평일 07:50~20:10 KST)엔 해외가
+    무조건 양보함. 해외 관심종목이 미국 주식이면 미국장은 한국시간 밤~새벽이라 영향 없음.
+    (도쿄/홍콩 등 아시아 종목은 국내장과 시간이 겹쳐서 이 방식으로는 정밀 추적이 안 됨 — 필요해지면
+    국내/해외 구독을 웹소켓 하나로 합치는 방식으로 바꿔야 함)
+    또 예전엔 토요일을 통째로 쉬어서 미국 금요일장(한국 토요일 새벽)을 놓쳤는데, 토요일 07:50 전까지는 열어둠.
+    """
+    t = (now.hour, now.minute)
+    wd = now.weekday()  # 0=월 ... 5=토, 6=일
+    if wd < 5 and (7, 50) <= t <= (20, 10):
+        return False  # 국내 실시간 시간 — 국내 워커에 양보
+    if wd == 6:
+        return False  # 일요일: 열린 거래소 없음
+    if wd == 5 and t >= (7, 50):
+        return False  # 토요일 아침 이후: 미국 금요일장 끝남
+    return _in_overseas_window(now)
+
+
 def _get_overseas_watchlist_symbols() -> list:
     """
     해외주식 정밀 추적 대상 — [(symbol, market), ...] 최대 OVERSEAS_WS_SUBSCRIBE_LIMIT개.
@@ -2595,7 +2617,7 @@ async def _overseas_ws_worker():
     consecutive_failures = 0
     while True:
         now = now_kst()
-        if not _in_overseas_window(now) or now.weekday() >= 5:
+        if not _overseas_ws_allowed(now):
             await asyncio.sleep(60)
             continue
 
@@ -2623,7 +2645,7 @@ async def _overseas_ws_worker():
                 sub_error_count = 0
                 while True:
                     now2 = now_kst()
-                    if not _in_overseas_window(now2) or now2.weekday() >= 5:
+                    if not _overseas_ws_allowed(now2):
                         break
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=5)
@@ -2708,7 +2730,13 @@ async def _daily_jobs_worker():
 @app.on_event("startup")
 async def _start_ws_worker():
     asyncio.create_task(_ws_worker())
-    asyncio.create_task(_overseas_ws_worker())
+    # 해외주식 실시간 체결 수집은 사용 안 함 (2026-10-08 사용자 요청) — 한투가 appkey당 실시간 연결을
+    # 1개만 허용해서, 해외 연결이 켜져 있으면 국내 실시간 체결이 "ALREADY IN USE appkey"로 막힘.
+    # 다시 쓰려면 Render 환경변수 OVERSEAS_WS_ENABLED=1 을 추가하면 됨 (국내장 시간엔 자동으로 양보함).
+    if os.environ.get("OVERSEAS_WS_ENABLED") == "1":
+        asyncio.create_task(_overseas_ws_worker())
+    else:
+        print("[overseas_ws_worker] 꺼져 있음 (OVERSEAS_WS_ENABLED=1 로 켤 수 있음)")
     asyncio.create_task(_daily_jobs_worker())
 
 
