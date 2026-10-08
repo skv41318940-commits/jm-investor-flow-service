@@ -2401,6 +2401,7 @@ async def _ws_worker():
         return
 
     consecutive_failures = 0
+    ws_stage = {"v": "준비"}  # 어느 단계에서 끊겼는지 로그로 남기기 위한 진단용
     while True:
         now = now_kst()
         start_t = now.replace(hour=7, minute=50, second=0, microsecond=0)
@@ -2410,6 +2411,7 @@ async def _ws_worker():
             continue
 
         try:
+            ws_stage["v"] = "승인키 발급"
             approval_key = get_ws_approval_key()
             # ⚠️ NXT 608개 전체 구독은 한투 웹소켓 실제 한도(등록 41건 = 종목 20개, KRX+NXT
             # 2건씩)를 훌쩍 넘어서 MAX SUBSCRIBE OVER로 계속 끊기는 문제가 있어 되돌림.
@@ -2428,15 +2430,34 @@ async def _ws_worker():
                 await asyncio.sleep(300)
                 continue
 
+            ws_stage["v"] = "접속 중"
             async with websockets.connect(KIS_WS_URL, ping_interval=None) as ws:
+                print(f"[ws_worker] 웹소켓 접속 성공 — {len(codes)}개 종목 구독 시작")
+                sent = 0
+                total_subs = len(codes) * 2
                 for code in codes:
                     for tr_id in ("H0STCNT0", "H0NXCNT0"):
+                        ws_stage["v"] = f"구독 {sent + 1}/{total_subs}번째({code} {tr_id})"
                         sub = {
                             "header": {"approval_key": approval_key, "custtype": "P", "tr_type": "1", "content-type": "utf-8"},
                             "body": {"input": {"tr_id": tr_id, "tr_key": code}},
                         }
                         await ws.send(json.dumps(sub))
-                        await asyncio.sleep(0.1)
+                        sent += 1
+                        # 진단용: 구독할 때마다 서버 응답을 잠깐 확인해서, 서버가 거절하면(예: MAX SUBSCRIBE OVER,
+                        # 잘못된 승인키) 연결이 끊기기 전에 그 이유를 로그에 남김 (2026-10-08 원인불명 끊김 추적)
+                        try:
+                            reply = await asyncio.wait_for(ws.recv(), timeout=0.3)
+                            if reply.startswith("{"):
+                                if '"PINGPONG"' in reply:
+                                    await ws.send(reply)
+                                elif "SUCCESS" not in reply:
+                                    print(f"[ws_worker] 구독 거절 응답({code} {tr_id}): {reply[:300]}")
+                            elif reply[:1] in ("0", "1"):
+                                _parse_realtime_message(reply)
+                        except asyncio.TimeoutError:
+                            pass
+                ws_stage["v"] = "수신 중"
                 print(f"[ws_worker] {len(codes)}개 종목({NXT_WS_SUBSCRIBE_LIMIT}개 상한) 구독 요청 완료 (KRX+NXT)")
                 consecutive_failures = 0  # 연결/구독까지 성공했으니 실패 카운트 초기화
 
@@ -2494,7 +2515,10 @@ async def _ws_worker():
         except Exception as e:
             consecutive_failures += 1
             wait = _ws_backoff_seconds(consecutive_failures)
-            print(f"[ws_worker] 연결 오류({consecutive_failures}번째, {type(e).__name__}), {wait}초 후 재시도: {e}")
+            print(
+                f"[ws_worker] 연결 오류({consecutive_failures}번째, {type(e).__name__}, 끊긴 단계: {ws_stage['v']}), "
+                f"{wait}초 후 재시도: {e}"
+            )
             if consecutive_failures % 3 == 0:
                 # 정확한 만료 시간을 몰라서 6시간으로 캐싱해뒀는데, 실제로는 더 일찍 상했을 수
                 # 있음 — 연속으로 계속 실패하면 캐시된 키가 문제라고 보고 새로 발급받음.
