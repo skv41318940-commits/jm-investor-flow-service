@@ -70,6 +70,31 @@ if _saved_krx_pw is not None:
 
 from supabase import create_client
 
+
+def _krx_df(fn, *args, retries: int = 3, wait: float = 3.0, **kwargs):
+    """
+    pykrx 호출을 감싸는 재시도 래퍼.
+    ⚠️ KRX 로그인 세션이 만료된 상태에서 첫 요청을 보내면 pykrx가 에러 대신 "빈 결과"를
+    돌려주고, 그 사이에 뒤에서 재로그인함(Render 로그의 "KRX 세션 만료, 재로그인 시도..."
+    → "KRX 세션 갱신 완료."). 그래서 바로 다시 요청하면 정상적으로 데이터가 옴.
+    이걸 안 해서 세션이 만료된 직후의 요청(하루 1번 도는 자동 동기화 포함)이
+    "KRX에서 데이터를 가져오지 못했습니다"로 실패하던 문제를 막음 (2026-10-08).
+    """
+    last = None
+    for attempt in range(retries):
+        try:
+            last = fn(*args, **kwargs)
+            if last is not None and not getattr(last, "empty", False):
+                return last
+        except Exception as e:
+            if attempt == retries - 1:
+                raise
+            print(f"[krx_retry] {getattr(fn, '__name__', fn)} {attempt + 1}번째 실패, 재시도: {e}")
+        if attempt < retries - 1:
+            time.sleep(wait)
+    return last
+
+
 # ── 환경변수로 받음 (Render 대시보드에서 설정) ──
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]  # RLS 우회해서 쓰기 위해 service role 사용
@@ -634,7 +659,7 @@ def fetch_nxt_scan_scores(limit: int = NXT_RANKING_POOL_SIZE):
     608종목 각각을 따로 조회하지 않음 (API 호출 1번으로 끝).
     """
     ymd = _latest_trading_day()
-    df = stock.get_market_ohlcv_by_ticker(ymd, market="ALL")
+    df = _krx_df(stock.get_market_ohlcv_by_ticker, ymd, market="ALL")
     print(f"[nxt_scan] date={ymd} rows={len(df)}")
 
     if df.empty:
@@ -1248,7 +1273,7 @@ def fetch_krx_volume_ranking(limit: int = 30):
     ETF/우선주는 제외 — "종목"만 순수하게 보고 싶다는 요청 반영.
     """
     ymd = _latest_trading_day()
-    df = stock.get_market_ohlcv_by_ticker(ymd, market="ALL")
+    df = _krx_df(stock.get_market_ohlcv_by_ticker, ymd, market="ALL")
     if df.empty:
         raise ValueError(f"KRX에서 {ymd} 시세 데이터를 가져오지 못했습니다.")
 
@@ -2393,13 +2418,10 @@ async def _ws_worker():
             # ⚠️ 아래 두 함수는 Supabase/pykrx 네트워크 호출을 동기(블로킹) 방식으로 하기 때문에,
             # asyncio.to_thread로 별도 스레드에서 돌려야 이 작업이 진행되는 동안 다른 API 요청
             # (예: Control 페이지의 PC 조회 프록시)이 이벤트 루프에서 막히지 않음
-            await asyncio.to_thread(_ensure_nxt_ranking_cached)
-            await asyncio.to_thread(_ensure_krx_ranking_cached)
-            await asyncio.to_thread(_ensure_naver_nxt_ranking_cached)
-            await asyncio.to_thread(_ensure_overseas_ranking_cached, "JP")
-            await asyncio.to_thread(_ensure_overseas_ranking_cached, "HK_CN")
-            await asyncio.to_thread(_ensure_fundamentals_synced_today)
-            await asyncio.to_thread(_ensure_market_flow_synced_today)
+            # ⚠️ 마감 스냅샷/재무제표/시장수급 같은 "하루 1번" 작업은 여기서 하지 않고
+            # _daily_jobs_worker(5분 주기)로 분리함. 예전엔 웹소켓 재연결할 때마다 같이 돌아서,
+            # 웹소켓이 10초마다 끊기는 날엔 KRX/Supabase를 10초마다 두드리고 자동 동기화
+            # 재시도 횟수도 몇 분 만에 다 써버리는 문제가 있었음 (2026-10-08).
             codes = await asyncio.to_thread(_get_watchlist_codes)
             if not codes:
                 print("[ws_worker] 구독할 종목이 없어 잠시 대기합니다.")
@@ -2455,13 +2477,7 @@ async def _ws_worker():
                     # 5분마다 관심종목 목록 갱신 — 이때 NXT 스캔 캐시도 같이 확인해서,
                     # 장중에 15:35를 넘기는 순간 자동으로 스캔 상위 종목이 채워지게 함
                     if time.time() - last_refresh > 300:
-                        await asyncio.to_thread(_ensure_nxt_ranking_cached)
-                        await asyncio.to_thread(_ensure_krx_ranking_cached)
-                        await asyncio.to_thread(_ensure_naver_nxt_ranking_cached)
-                        await asyncio.to_thread(_ensure_overseas_ranking_cached, "JP")
-                        await asyncio.to_thread(_ensure_overseas_ranking_cached, "HK_CN")
-                        await asyncio.to_thread(_ensure_fundamentals_synced_today)
-                        await asyncio.to_thread(_ensure_market_flow_synced_today)
+                        # (하루 1번 도는 마감 스냅샷/동기화는 _daily_jobs_worker로 분리함)
                         new_codes = await asyncio.to_thread(_get_watchlist_codes)
                         added = [c for c in new_codes if c not in codes]
                         for code in added:
@@ -2477,14 +2493,16 @@ async def _ws_worker():
                 _flush_tick_buckets()
         except Exception as e:
             consecutive_failures += 1
-            print(f"[ws_worker] 연결 오류({consecutive_failures}번째), 10초 후 재시도: {e}")
-            if consecutive_failures >= 3:
+            wait = _ws_backoff_seconds(consecutive_failures)
+            print(f"[ws_worker] 연결 오류({consecutive_failures}번째, {type(e).__name__}), {wait}초 후 재시도: {e}")
+            if consecutive_failures % 3 == 0:
                 # 정확한 만료 시간을 몰라서 6시간으로 캐싱해뒀는데, 실제로는 더 일찍 상했을 수
-                # 있음 — 연속으로 계속 실패하면 캐시된 키가 문제라고 보고 강제로 새로 발급받음
-                # (2026-08-07 국내장 애프터마켓 중 계속 재연결 실패하던 장애의 원인으로 추정됨)
-                print("[ws_worker] 연속 실패 3회 이상 — 승인키를 강제로 재발급받습니다.")
+                # 있음 — 연속으로 계속 실패하면 캐시된 키가 문제라고 보고 새로 발급받음.
+                # ⚠️ 예전엔 3번째 이후 "매번" 재발급해서 10초마다 승인키를 새로 받았는데(하루 700번 넘게),
+                # 이게 오히려 한투 쪽 제한에 걸려 계속 끊기는 악순환이 될 수 있어서 3번에 1번만 재발급함.
+                print("[ws_worker] 연속 실패 — 승인키를 새로 발급받습니다.")
                 invalidate_ws_approval_key("domestic")
-            await asyncio.sleep(10)
+            await asyncio.sleep(wait)
 
 
 def _in_overseas_window(now: datetime) -> bool:
@@ -2559,7 +2577,6 @@ async def _overseas_ws_worker():
 
         try:
             approval_key = get_ws_approval_key("overseas")
-            await asyncio.to_thread(_ensure_overseas_ranking_cached, "US")
             watch = await asyncio.to_thread(_get_overseas_watchlist_symbols)
             if not watch:
                 print("[overseas_ws_worker] 구독할 해외주식 관심종목이 없어 잠시 대기합니다.")
@@ -2611,7 +2628,6 @@ async def _overseas_ws_worker():
 
                     # 5분마다 관심종목 갱신 — 새로 등록된 종목이 있으면 재연결 없이 바로 구독 추가
                     if time.time() - last_refresh > 300:
-                        await asyncio.to_thread(_ensure_overseas_ranking_cached, "US")
                         new_watch = await asyncio.to_thread(_get_overseas_watchlist_symbols)
                         added = [w for w in new_watch if w not in watch]
                         for symbol, market in added:
@@ -2626,17 +2642,50 @@ async def _overseas_ws_worker():
                 await asyncio.to_thread(_flush_overseas_tick_buckets)
         except Exception as e:
             consecutive_failures += 1
-            print(f"[overseas_ws_worker] 연결 오류({consecutive_failures}번째), 10초 후 재시도: {e}")
-            if consecutive_failures >= 3:
-                print("[overseas_ws_worker] 연속 실패 3회 이상 — 승인키를 강제로 재발급받습니다.")
+            wait = _ws_backoff_seconds(consecutive_failures)
+            print(f"[overseas_ws_worker] 연결 오류({consecutive_failures}번째, {type(e).__name__}), {wait}초 후 재시도: {e}")
+            if consecutive_failures % 3 == 0:
+                print("[overseas_ws_worker] 연속 실패 — 승인키를 새로 발급받습니다.")
                 invalidate_ws_approval_key("overseas")
-            await asyncio.sleep(10)
+            await asyncio.sleep(wait)
+
+
+def _ws_backoff_seconds(failures: int) -> int:
+    """연속 실패가 늘수록 재시도 간격을 늘림: 10초 → 20 → 40 → 80 → 최대 120초"""
+    return min(10 * (2 ** max(0, failures - 1)), 120)
+
+
+async def _daily_jobs_worker():
+    """
+    하루 1번 도는 작업(마감 스냅샷, 재무제표, 시장 수급)을 웹소켓과 상관없이 5분마다 확인.
+    각 함수가 스스로 "지금 할 시간인지 / 오늘 이미 했는지"를 판단하니, 여기선 순서대로 부르기만 함.
+    하나가 실패해도 나머지는 계속 돌도록 각각 따로 감쌈.
+    """
+    jobs = [
+        ("nxt_ranking", _ensure_nxt_ranking_cached, ()),
+        ("krx_ranking", _ensure_krx_ranking_cached, ()),
+        ("naver_nxt_ranking", _ensure_naver_nxt_ranking_cached, ()),
+        ("overseas_ranking_US", _ensure_overseas_ranking_cached, ("US",)),
+        ("overseas_ranking_JP", _ensure_overseas_ranking_cached, ("JP",)),
+        ("overseas_ranking_HK_CN", _ensure_overseas_ranking_cached, ("HK_CN",)),
+        ("fundamentals", _ensure_fundamentals_synced_today, ()),
+        ("market_flow", _ensure_market_flow_synced_today, ()),
+    ]
+    await asyncio.sleep(30)  # 서버 막 켜졌을 때 다른 초기화가 먼저 끝나게 잠깐 대기
+    while True:
+        for name, fn, args in jobs:
+            try:
+                await asyncio.to_thread(fn, *args)
+            except Exception as e:
+                print(f"[daily_jobs] {name} 실패: {e}")
+        await asyncio.sleep(300)
 
 
 @app.on_event("startup")
 async def _start_ws_worker():
     asyncio.create_task(_ws_worker())
     asyncio.create_task(_overseas_ws_worker())
+    asyncio.create_task(_daily_jobs_worker())
 
 
 @app.get("/api/tick-avg")
@@ -3255,7 +3304,7 @@ def fetch_shorting_balance(code: str, days: int = 20):
     fromdate = (today - timedelta(days=days * 2)).strftime("%Y%m%d")
     todate = today.strftime("%Y%m%d")
 
-    df = stock.get_shorting_balance_by_date(fromdate, todate, code)
+    df = _krx_df(stock.get_shorting_balance_by_date, fromdate, todate, code)
     print(f"[shorting_balance] code={code} rows={len(df)} columns={list(df.columns)}")
 
     if df.empty:
@@ -3314,7 +3363,7 @@ def pykrx_shorting_balance_debug(code: str, days: int = 40):
         today = now_kst()
         fromdate = (today - timedelta(days=days)).strftime("%Y%m%d")
         todate = today.strftime("%Y%m%d")
-        df = stock.get_shorting_balance_by_date(fromdate, todate, code)
+        df = _krx_df(stock.get_shorting_balance_by_date, fromdate, todate, code)
         rows = [
             {"date": idx.strftime("%Y-%m-%d"), **{k: (float(v) if hasattr(v, "item") else v) for k, v in row.items()}}
             for idx, row in df.iterrows()
@@ -3697,7 +3746,7 @@ def fetch_broker_flow(code: str):
     price = None
     try:
         ymd = _latest_trading_day()
-        ohlcv = stock.get_market_ohlcv_by_date(ymd, ymd, code)
+        ohlcv = _krx_df(stock.get_market_ohlcv_by_date, ymd, ymd, code)
         if not ohlcv.empty:
             price = float(ohlcv.iloc[-1].get("종가", 0)) or None
     except Exception as e:
@@ -3758,7 +3807,7 @@ def fetch_investor_flow(code: str, days: int = 20):
     fromdate = (today - timedelta(days=days * 2)).strftime("%Y%m%d")  # 주말 감안 여유있게
     todate = today.strftime("%Y%m%d")
 
-    df = stock.get_market_trading_value_by_date(fromdate, todate, code, detail=True)
+    df = _krx_df(stock.get_market_trading_value_by_date, fromdate, todate, code, detail=True)
 
     # 디버그용: Render 대시보드 Logs 탭에서 이 출력을 확인할 수 있음
     print(f"[investor_flow] code={code} fromdate={fromdate} todate={todate} rows={len(df)}")
@@ -3837,7 +3886,7 @@ def _pick(row, *names):
 def _market_flow_df(fromdate: str, todate: str, market: str):
     """pykrx 시장 단위 투자자별 순매수(원). ALL이 실패하면 코스피+코스닥을 더해서 대신 씀."""
     try:
-        df = stock.get_market_trading_value_by_date(fromdate, todate, market, detail=True)
+        df = _krx_df(stock.get_market_trading_value_by_date, fromdate, todate, market, detail=True)
         if df is not None and not df.empty:
             return df
     except Exception as e:
@@ -3935,22 +3984,21 @@ def sync_market_flow(days: int = 20) -> dict:
     return result
 
 
-_market_flow_last_try = {"date": None, "count": 0}
+_market_flow_last_try = {"at": 0.0}
 
 
 def _ensure_market_flow_synced_today():
     """
-    평일 16:30 KST 이후 하루 1번 자동 동기화 (투자자별 집계가 장 마감 후 확정되므로).
-    오늘 날짜(거래일) 행이 이미 있으면 스킵. 실패하면 5분마다 다시 시도하되 하루 최대 6번까지만.
+    평일 16:30~21:00 KST 사이, 오늘 날짜 행이 아직 없으면 동기화 (투자자별 집계가 장 마감 후 확정되므로).
+    실패하거나 오늘 데이터가 아직 안 나왔으면 15분 뒤에 다시 시도 — 휴장일(대체공휴일 등)엔
+    오늘 데이터가 끝까지 안 생기니 21시에 그날은 포기함.
     """
     now = now_kst()
-    if now.weekday() >= 5 or (now.hour, now.minute) < (16, 30):
+    if now.weekday() >= 5 or not ((16, 30) <= (now.hour, now.minute) < (21, 0)):
+        return
+    if time.time() - _market_flow_last_try["at"] < 15 * 60:
         return
     today_str = now.strftime("%Y-%m-%d")
-    if _market_flow_last_try["date"] != today_str:
-        _market_flow_last_try.update({"date": today_str, "count": 0})
-    if _market_flow_last_try["count"] >= 6:
-        return
     try:
         existing = (
             supabase.table("market_flow_trend")
@@ -3965,7 +4013,7 @@ def _ensure_market_flow_synced_today():
     except Exception as e:
         print(f"[market_flow] 캐시 확인 실패: {e}")
         return
-    _market_flow_last_try["count"] += 1
+    _market_flow_last_try["at"] = time.time()
     result = sync_market_flow(days=20)
     print(f"[market_flow] 자동 동기화 결과: {result}")
 
@@ -3989,8 +4037,9 @@ def _latest_trading_day() -> str:
     for _ in range(10):
         ymd = d.strftime("%Y%m%d")
         # 코스피 지수 하나로 그날 데이터가 있는지 간단히 확인
-        test = stock.get_index_ohlcv_by_date(ymd, ymd, "1001")
-        if not test.empty:
+        # 첫날(오늘)만 재시도 — 세션 만료로 빈 값이 오면 어제를 "최근 영업일"로 잘못 고르는 문제 방지
+        test = _krx_df(stock.get_index_ohlcv_by_date, ymd, ymd, "1001", retries=2 if _ == 0 else 1)
+        if test is not None and not test.empty:
             return ymd
         d -= timedelta(days=1)
     raise ValueError("최근 10일 내 KRX 영업일을 찾지 못했습니다")
@@ -4002,7 +4051,7 @@ def _latest_trading_day() -> str:
 # pykrx가 실제 재무제표 원장을 안 줘서 완전 정확한 값은 아님(원본 스크립트와 동일한 한계).
 def _calc_fundamentals_one(code: str, name: str, today: str, year_ago: str):
     try:
-        fdf = stock.get_market_fundamental(today, today, code)
+        fdf = _krx_df(stock.get_market_fundamental, today, today, code)
         if fdf.empty:
             print(f"[fundamentals_sync] {code} 펀더멘털 데이터 없음 (휴장일이거나 상장폐지 종목일 수 있음)")
             return None
@@ -4013,10 +4062,10 @@ def _calc_fundamentals_one(code: str, name: str, today: str, year_ago: str):
         bps = float(row.get("BPS", 0) or 0)
         roe = round((eps / bps) * 100, 2) if bps else 0.0
 
-        cap_df = stock.get_market_cap(today, today, code)
+        cap_df = _krx_df(stock.get_market_cap, today, today, code)
         market_cap = int(cap_df.iloc[0].get("시가총액", 0)) if not cap_df.empty else 0
 
-        ohlcv = stock.get_market_ohlcv_by_date(year_ago, today, code)
+        ohlcv = _krx_df(stock.get_market_ohlcv_by_date, year_ago, today, code)
         high_52w = int(ohlcv["고가"].max()) if not ohlcv.empty else 0
         low_52w = int(ohlcv["저가"].min()) if not ohlcv.empty else 0
 
@@ -4051,8 +4100,8 @@ def sync_fundamentals_market_wide():
         raise RuntimeError("pykrx를 사용할 수 없어서 재무제표 동기화를 할 수 없습니다.")
 
     today = _latest_trading_day()
-    fdf = stock.get_market_fundamental(today, market="ALL")
-    cap_df = stock.get_market_cap(today, market="ALL")
+    fdf = _krx_df(stock.get_market_fundamental, today, market="ALL")
+    cap_df = _krx_df(stock.get_market_cap, today, market="ALL")
     if fdf.empty:
         raise ValueError(f"{today} 기준 재무제표 데이터를 가져오지 못했습니다.")
 
@@ -4170,7 +4219,7 @@ def _ensure_fundamentals_synced_today():
 def fetch_volume_top30(limit: int = 30):
     ymd = _latest_trading_day()
 
-    df = stock.get_market_ohlcv_by_ticker(ymd, market="ALL")
+    df = _krx_df(stock.get_market_ohlcv_by_ticker, ymd, market="ALL")
     print(f"[volume_top30] date={ymd} rows={len(df)} columns={list(df.columns)}")
 
     if df.empty:
@@ -4265,7 +4314,7 @@ def fetch_institution_type_flow(code: str, days: int = 60):
     fromdate = (today - timedelta(days=days * 2)).strftime("%Y%m%d")  # 주말 감안 여유있게
     todate = today.strftime("%Y%m%d")
 
-    df = stock.get_market_trading_value_by_date(fromdate, todate, code, detail=True)
+    df = _krx_df(stock.get_market_trading_value_by_date, fromdate, todate, code, detail=True)
     print(f"[institution_type_flow] code={code} rows={len(df)} columns={list(df.columns)}")
 
     if df.empty:
@@ -4346,7 +4395,7 @@ def stock_ohlcv_endpoint(code: str, start: str, end: str):
     try:
         start_ymd = start.replace("-", "")
         end_ymd = end.replace("-", "")
-        df = stock.get_market_ohlcv_by_date(start_ymd, end_ymd, code)
+        df = _krx_df(stock.get_market_ohlcv_by_date, start_ymd, end_ymd, code)
         if df.empty:
             return {"ok": False, "error": f"{code} 종목의 {start}~{end} 구간 일봉 데이터가 없습니다."}
 
