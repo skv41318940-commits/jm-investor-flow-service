@@ -426,6 +426,12 @@ def _add_tick(code: str, market: str, hhmmss: str, bsop_date: str, price: float,
         # "3"(장전 단일가 등)은 매수/매도 구분이 없어서 수량 누적은 스킵 (가격은 위에서 이미 반영)
 
 
+_VALID_CODE = re.compile(r"^[0-9A-Z]{6}$")  # 005930, 0126Z0 같은 6자리 종목코드
+_VALID_HHMMSS = re.compile(r"^([01][0-9]|2[0-3])[0-5][0-9][0-5][0-9]$")
+_stride_warned: dict = {}
+_bad_tick_count = {"n": 0}
+
+
 def _parse_realtime_message(raw: str):
     global _ws_debug_count
     parts = raw.split("|")
@@ -450,9 +456,21 @@ def _parse_realtime_message(raw: str):
         print(f"[ws_debug] tr={tr_id} count={count} first_tick_fields={fields[:TICK_FIELD_COUNT]}")
         _ws_debug_count += 1
 
-    for i in range(max(count, 1)):
-        start = i * TICK_FIELD_COUNT
-        chunk = fields[start : start + TICK_FIELD_COUNT]
+    # ⚠️ 한 메시지에 체결이 여러 건(count>1) 묶여 올 때, 한 건당 필드 수를 46개로 고정해서 잘랐더니
+    # 실제 필드 수가 다른 경우(시장/TR별로 다를 수 있음) 두 번째 건부터 위치가 밀려서 "2", "0.25" 같은
+    # 엉뚱한 종목코드와 "99:81" 같은 깨진 시각이 저장되고 있었음 (그날 데이터의 10~30%).
+    # → 전체 필드 수를 건수로 나눠서 실제 한 건당 필드 수를 구하고, 종목코드/시각 형식이 맞는 것만 저장함.
+    n_records = max(count, 1)
+    stride = TICK_FIELD_COUNT
+    if n_records > 1 and len(fields) % n_records == 0:
+        stride = len(fields) // n_records
+    if stride != TICK_FIELD_COUNT and _stride_warned.get(tr_id) != stride:
+        _stride_warned[tr_id] = stride
+        print(f"[ws_parse] {tr_id} 한 건당 필드 수가 {TICK_FIELD_COUNT}가 아니라 {stride}개로 와서 그에 맞춰 자름")
+
+    for i in range(n_records):
+        start = i * stride
+        chunk = fields[start : start + stride]
         if len(chunk) < IDX_CCLD_DVSN + 1:
             continue
         try:
@@ -461,9 +479,16 @@ def _parse_realtime_message(raw: str):
             price = float(chunk[IDX_PRICE])
             cntg_vol = float(chunk[IDX_CNTG_VOL])
             ccld_dvsn = chunk[IDX_CCLD_DVSN]
-            bsop_date = chunk[IDX_BSOP_DATE] if len(chunk) > IDX_BSOP_DATE else now_kst().strftime("%Y%m%d")
+            bsop_date = chunk[IDX_BSOP_DATE] if len(chunk) > IDX_BSOP_DATE else ""
         except (ValueError, IndexError):
             continue
+        if not _VALID_CODE.match(code) or not _VALID_HHMMSS.match(hhmmss):
+            _bad_tick_count["n"] += 1
+            if _bad_tick_count["n"] in (1, 100, 1000, 10000):
+                print(f"[ws_parse] 형식이 깨진 체결 {_bad_tick_count['n']}건째 버림 (예: code={code!r}, time={hhmmss!r})")
+            continue
+        if not re.fullmatch(r"\d{8}", bsop_date or ""):
+            bsop_date = now_kst().strftime("%Y%m%d")
         _add_tick(code, market, hhmmss, bsop_date, price, cntg_vol, ccld_dvsn)
 
 
@@ -4430,6 +4455,200 @@ def sync_fundamentals_market_endpoint():
         return {"ok": True, **result}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 📑 증권사 리포트 (애널리스트 종목분석 리포트) — 무료 공개 자료만 모아서 "원문 링크"로 연결
+# ──────────────────────────────────────────────────────────────────────────
+# 출처: 네이버 증권 리서치 > 종목분석 리포트 (증권사들이 무료로 공개한 리포트 목록).
+# ⚠️ 리포트 PDF를 서버에 복사·저장하지 않고 원문 링크만 보여줌 (저작권 때문).
+# ⚠️ 네이버가 2026-09에 사이트를 개편해서, 옛 HTML 페이지가 안 되면 새 JSON API를 시도함.
+#    둘 다 응답 모양을 이 작업 환경에서 직접 확인하지 못해서, 실패하면 /api/stock-reports-debug로
+#    실제 응답을 보고 맞춰야 함.
+# ══════════════════════════════════════════════════════════════════════════
+from concurrent.futures import ThreadPoolExecutor
+
+_report_cache: dict = {}  # code -> (저장시각, 결과)
+_REPORT_CACHE_SEC = 30 * 60
+
+
+def _naver_research_list_html(code: str, page: int = 1) -> str:
+    res = requests.get(
+        "https://finance.naver.com/research/company_list.naver",
+        headers=_naver_headers(),
+        params={"searchType": "itemCode", "itemCode": code, "page": page},
+        timeout=10,
+    )
+    res.raise_for_status()
+    return res.content.decode("euc-kr", errors="replace")
+
+
+def _parse_naver_research_list(html: str) -> list:
+    if BeautifulSoup is None:
+        raise RuntimeError("beautifulsoup4가 설치되어 있지 않습니다.")
+    soup = BeautifulSoup(html, "html.parser")
+    rows = []
+    for tr in soup.find_all("tr"):
+        link = tr.find("a", href=re.compile(r"company_read\.naver"))
+        if link is None:
+            continue
+        tds = tr.find_all("td")
+        texts = [td.get_text(" ", strip=True) for td in tds]
+        title = link.get_text(" ", strip=True)
+        href = link["href"]
+        detail_url = href if href.startswith("http") else "https://finance.naver.com/research/" + href.lstrip("/")
+        pdf = tr.find("a", href=re.compile(r"\.pdf", re.I))
+        date_txt = next((t for t in texts if re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", t)), "")
+        date_iso = f"20{date_txt[0:2]}-{date_txt[3:5]}-{date_txt[6:8]}" if date_txt else ""
+        # 증권사 = 제목 바로 다음 칸 (종목명 / 제목 / 증권사 / 첨부 / 작성일 / 조회수 순서)
+        broker = ""
+        for i, td in enumerate(tds):
+            if link in td.find_all("a"):
+                if i + 1 < len(texts):
+                    broker = texts[i + 1]
+                break
+        rows.append(
+            {
+                "date": date_iso,
+                "title": title,
+                "broker": broker,
+                "detail_url": detail_url,
+                "pdf_url": pdf["href"] if pdf else None,
+                "target_price": None,
+                "opinion": None,
+            }
+        )
+    return rows
+
+
+def _naver_research_detail(detail_url: str) -> dict:
+    """리포트 상세 페이지에서 목표가·투자의견만 뽑음 (목록엔 이 두 개가 없어서)"""
+    try:
+        res = requests.get(detail_url, headers=_naver_headers(), timeout=8)
+        text = res.content.decode("euc-kr", errors="replace")
+        if BeautifulSoup is not None:
+            text = BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
+        tp = re.search(r"목표가\s*[:：]?\s*([\d,]{3,})", text)
+        op = re.search(r"투자의견\s*[:：]?\s*([가-힣A-Za-z]+)", text)
+        return {
+            "target_price": int(tp.group(1).replace(",", "")) if tp else None,
+            "opinion": op.group(1).strip() if op else None,
+        }
+    except Exception:
+        return {"target_price": None, "opinion": None}
+
+
+def _naver_research_json(code: str) -> list:
+    """예비 경로 — 개편된 네이버 모바일 증권의 리서치 JSON (주소 후보를 차례로 시도)"""
+    candidates = [
+        (f"https://m.stock.naver.com/api/research/stock/{code}", {"pageSize": 30, "page": 1}),
+        ("https://m.stock.naver.com/api/research/company", {"itemCode": code, "pageSize": 30, "page": 1}),
+    ]
+    for url, params in candidates:
+        try:
+            res = requests.get(url, headers=_naver_stock_headers(), params=params, timeout=8)
+            if not res.ok:
+                continue
+            data = res.json()
+        except Exception:
+            continue
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = data.get("researches") or data.get("items") or data.get("result") or data.get("list") or []
+        else:
+            items = []
+        rows = []
+        for it in items if isinstance(items, list) else []:
+            if not isinstance(it, dict):
+                continue
+            title = it.get("title") or it.get("researchTitle") or ""
+            if not title:
+                continue
+            date = str(it.get("writeDate") or it.get("date") or it.get("regDate") or "")[:10].replace(".", "-")
+            nid = it.get("nid") or it.get("researchId") or it.get("id")
+            tp_raw = str(it.get("targetPrice") or "").replace(",", "")
+            rows.append(
+                {
+                    "date": date,
+                    "title": title,
+                    "broker": it.get("brokerName") or it.get("brokerage") or it.get("company") or "",
+                    "detail_url": f"https://finance.naver.com/research/company_read.naver?nid={nid}" if nid else None,
+                    "pdf_url": it.get("attachUrl") or it.get("pdfUrl") or it.get("fileUrl"),
+                    "target_price": int(tp_raw) if tp_raw.isdigit() else None,
+                    "opinion": it.get("opinion") or it.get("investOpinion"),
+                }
+            )
+        if rows:
+            return rows
+    return []
+
+
+def fetch_stock_reports(code: str, limit: int = 30) -> dict:
+    cached = _report_cache.get(code)
+    if cached and time.time() - cached[0] < _REPORT_CACHE_SEC:
+        return cached[1]
+
+    rows, source, errors = [], "", []
+    try:
+        rows = _parse_naver_research_list(_naver_research_list_html(code))
+        source = "네이버 증권 리서치"
+    except Exception as e:
+        errors.append(f"네이버 리서치 목록: {e}")
+    if not rows:
+        try:
+            rows = _naver_research_json(code)
+            if rows:
+                source = "네이버 증권 리서치(신규 API)"
+        except Exception as e:
+            errors.append(f"네이버 신규 API: {e}")
+
+    rows = rows[:limit]
+    # 목록에 목표가가 없으면 최근 15개만 상세 페이지에서 목표가·투자의견을 채움 (동시에 6개씩)
+    need = [r for r in rows[:15] if r["target_price"] is None and r.get("detail_url")]
+    if need:
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            for r, d in zip(need, ex.map(lambda x: _naver_research_detail(x["detail_url"]), need)):
+                r.update({k: v for k, v in d.items() if v is not None})
+
+    result = {"ok": True, "code": code, "source": source, "items": rows}
+    if not rows:
+        result["note"] = "최근 리포트가 없어요. 증권사가 분석하지 않는 소형주는 리포트가 아예 없는 경우가 많아요."
+        result["errors"] = errors
+    _report_cache[code] = (time.time(), result)
+    return result
+
+
+@app.get("/api/stock-reports")
+def stock_reports_endpoint(code: str, refresh: bool = False):
+    """종목별 증권사 리포트 목록 (제목·증권사·날짜·목표가·투자의견·원문 링크). 30분 캐시."""
+    try:
+        code = (code or "").strip().upper()
+        if refresh:
+            _report_cache.pop(code, None)
+        return fetch_stock_reports(code)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/stock-reports-debug")
+def stock_reports_debug(code: str = "005930"):
+    """디버그 전용 — 리포트 출처들의 실제 응답 앞부분을 그대로 보여줌 (구조가 바뀌었을 때 맞추는 용도)"""
+    out = {}
+    try:
+        html = _naver_research_list_html(code)
+        out["naver_html_len"] = len(html)
+        out["naver_parsed_top3"] = _parse_naver_research_list(html)[:3]
+        out["naver_html_preview"] = html[:1500]
+    except Exception as e:
+        out["naver_html_error"] = str(e)
+    for url in (f"https://m.stock.naver.com/api/research/stock/{code}", "https://m.stock.naver.com/api/research/company"):
+        try:
+            r = requests.get(url, headers=_naver_stock_headers(), params={"itemCode": code, "pageSize": 5, "page": 1}, timeout=8)
+            out[url] = {"status": r.status_code, "preview": r.text[:800]}
+        except Exception as e:
+            out[url] = {"error": str(e)}
+    return out
 
 
 @app.get("/api/ping")
