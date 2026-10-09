@@ -400,7 +400,12 @@ def get_ws_approval_key(purpose: str = "domestic") -> str:
         return key
 
 
+# 실시간 연결 상태 (데이터 상태 알림용) — 마지막으로 구독 성공한 시각 / 마지막 체결 받은 시각
+_ws_status = {"last_subscribed": 0.0, "last_tick": 0.0}
+
+
 def _add_tick(code: str, market: str, hhmmss: str, bsop_date: str, price: float, qty: float, ccld_dvsn: str):
+    _ws_status["last_tick"] = time.time()
     if price <= 0 or qty <= 0:
         return
     if len(hhmmss) < 4:
@@ -2484,6 +2489,7 @@ async def _ws_worker():
                             pass
                 ws_stage["v"] = "수신 중"
                 print(f"[ws_worker] {len(codes)}개 종목({NXT_WS_SUBSCRIBE_LIMIT}개 상한) 구독 요청 완료 (KRX+NXT)")
+                _ws_status["last_subscribed"] = time.time()
                 consecutive_failures = 0  # 연결/구독까지 성공했으니 실패 카운트 초기화
 
                 last_flush = time.time()
@@ -2741,6 +2747,7 @@ async def _daily_jobs_worker():
         ("overseas_ranking_HK_CN", _ensure_overseas_ranking_cached, ("HK_CN",)),
         ("fundamentals", _ensure_fundamentals_synced_today, ()),
         ("market_flow", _ensure_market_flow_synced_today, ()),
+        ("health_report", _ensure_health_report_sent_today, ()),
     ]
     await asyncio.sleep(30)  # 서버 막 켜졌을 때 다른 초기화가 먼저 끝나게 잠깐 대기
     while True:
@@ -4709,7 +4716,7 @@ def _naver_research_detail_json(research_id) -> dict:
     return out
 
 
-def fetch_stock_reports(code: str, limit: int = 30) -> dict:
+def fetch_stock_reports(code: str, limit: int = 40) -> dict:
     cached = _report_cache.get(code)
     if cached and time.time() - cached[0] < _REPORT_CACHE_SEC:
         return cached[1]
@@ -4733,7 +4740,7 @@ def fetch_stock_reports(code: str, limit: int = 30) -> dict:
     rows = rows[:limit]
     # 목록에 목표가가 없으면 최근 15개만 상세 페이지에서 목표가·투자의견을 채움 (동시에 6개씩)
     need = [
-        r for r in rows[:20]
+        r for r in rows[:40]
         if r.get("detail_url") and (r["target_price"] is None or not r.get("pdf_url") or not r.get("opinion"))
     ]
     if need:
@@ -4968,6 +4975,295 @@ def research_debug():
             except Exception as e:
                 out[f"{cat}:{path}"] = {"error": str(e)}
     return out
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 🩺 데이터 상태 점검 + 텔레그램 알림
+# ──────────────────────────────────────────────────────────────────────────
+# 2026-07~10월에 시장 수급이 석 달간 멈춰 있었는데 아무도 몰랐던 일의 재발 방지.
+# 평일 18:40 KST에 오늘 데이터가 다 들어왔는지 점검해서 텔레그램으로 보냄.
+# Render 환경변수: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (없으면 점검만 하고 전송은 건너뜀)
+# ══════════════════════════════════════════════════════════════════════════
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+HEALTH_REPORT_HOUR, HEALTH_REPORT_MINUTE = 18, 40
+_health_sent = {"date": None}
+
+
+def send_telegram(text: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[telegram] 토큰/채팅ID 미설정 — 전송 건너뜀")
+        return False
+    try:
+        res = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True},
+            timeout=10,
+        )
+        if not res.ok:
+            print(f"[telegram] 전송 실패: {res.status_code} {res.text[:200]}")
+        return res.ok
+    except Exception as e:
+        print(f"[telegram] 전송 오류: {e}")
+        return False
+
+
+def _latest_value(table: str, column: str, where: tuple = None):
+    try:
+        q = supabase.table(table).select(column)
+        if where:
+            q = q.eq(where[0], where[1])
+        res = q.order(column, desc=True).limit(1).execute()
+        return str(res.data[0][column]) if res.data else None
+    except Exception as e:
+        return f"조회실패({e})"
+
+
+def build_health_report() -> dict:
+    now = now_kst()
+    today = now.strftime("%Y-%m-%d")
+    try:
+        trading_day = _latest_trading_day() == now.strftime("%Y%m%d")
+    except Exception:
+        trading_day = now.weekday() < 5  # KRX 확인이 안 되면 평일이면 장 열린 날로 봄
+
+    checks = []
+
+    def add(name, latest, ok, hint=""):
+        checks.append({"name": name, "latest": latest, "ok": ok, "hint": hint})
+
+    mf = _latest_value("market_flow_trend", "trade_date", ("market", "ALL"))
+    add("시장 수급", mf, bool(mf and mf[:10] == today), "KRX(pykrx) 로그인·응답 확인")
+    kr = _latest_value("krx_daily_ranking", "scan_date")
+    add("KRX 거래량 랭킹", kr, bool(kr and kr[:10] == today), "pykrx 응답 확인")
+    nx = _latest_value("nxt_daily_ranking", "scan_date")
+    add("NXT 스캔", nx, bool(nx and nx[:10] == today), "pykrx 응답 확인")
+    fd = _latest_value("stock_fundamentals", "synced_at")
+    add("재무제표", fd[:10] if fd else None, bool(fd and fd[:10] == today), "16시 이후 자동 동기화")
+    try:
+        cnt = (
+            supabase.table("tick_minute_flow").select("stock_code", count="exact").eq("trade_date", today).limit(1).execute().count
+        ) or 0
+    except Exception:
+        cnt = 0
+    last_tick_min = (time.time() - _ws_status["last_tick"]) / 60 if _ws_status["last_tick"] else None
+    add(
+        "실시간 체결(정밀 세력평단)",
+        f"오늘 {cnt:,}줄" + (f" · 마지막 체결 {last_tick_min:.0f}분 전" if last_tick_min is not None else ""),
+        cnt > 0,
+        "한투 웹소켓 연결 확인 (ALREADY IN USE 등)",
+    )
+
+    failed = [c for c in checks if not c["ok"]]
+    return {"date": today, "trading_day": trading_day, "ok": not failed, "checks": checks}
+
+
+def format_health_message(rep: dict) -> str:
+    head = "✅ JM 데이터 점검 — 모두 정상" if rep["ok"] else "⚠️ JM 데이터 점검 — 확인 필요"
+    lines = [f"{head} ({rep['date']})"]
+    for c in rep["checks"]:
+        mark = "✅" if c["ok"] else "❌"
+        lines.append(f"{mark} {c['name']}: {c['latest'] or '없음'}" + ("" if c["ok"] else f"  → {c['hint']}"))
+    return "\n".join(lines)
+
+
+def _ensure_health_report_sent_today():
+    now = now_kst()
+    today = now.strftime("%Y-%m-%d")
+    if now.weekday() >= 5 or _health_sent["date"] == today:
+        return
+    if (now.hour, now.minute) < (HEALTH_REPORT_HOUR, HEALTH_REPORT_MINUTE):
+        return
+    _health_sent["date"] = today  # 실패해도 하루 1번만 (알림 폭탄 방지)
+    rep = build_health_report()
+    if not rep["trading_day"]:
+        print(f"[health] {today} 휴장일 — 점검 알림 생략")
+        return
+    send_telegram(format_health_message(rep))
+
+
+@app.get("/api/health")
+def health_endpoint(send: bool = False):
+    """데이터 상태 점검 결과 — send=true면 텔레그램으로도 바로 보냄 (설정 확인용)"""
+    rep = build_health_report()
+    rep["telegram_configured"] = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+    if send:
+        rep["telegram_sent"] = send_telegram(format_health_message(rep))
+    return rep
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 📊 DART 분기 실적 (매출·영업이익·순이익) — 흑자/적자·흑자전환/적자전환 정확 판별
+# ──────────────────────────────────────────────────────────────────────────
+# 금융감독원 OpenDART 공식 API. Render 환경변수 DART_API_KEY 필요.
+# 종목코드 → DART 고유번호(corp_code) 변환표는 DART가 zip으로 주는 걸 하루 1번 받아 메모리에 둠.
+# 분기 값: 1·2·3분기 보고서의 "3개월" 값을 쓰고, 4분기는 사업보고서(연간) − 1~3분기 합으로 계산.
+# ══════════════════════════════════════════════════════════════════════════
+import io
+import zipfile
+import xml.etree.ElementTree as ET
+
+DART_API_KEY = os.environ.get("DART_API_KEY")
+_dart_corp_map: dict = {}
+_dart_corp_loaded_at = 0.0
+_dart_quarter_cache: dict = {}  # code -> (시각, 결과)
+
+REPORT_CODES = [("11013", 1), ("11012", 2), ("11014", 3), ("11011", 4)]  # 1분기/반기/3분기/사업보고서
+ACCOUNT_ALIASES = {
+    "revenue": ["매출액", "수익(매출액)", "영업수익", "매출", "순영업수익"],
+    "op": ["영업이익", "영업이익(손실)", "영업손익"],
+    "net": ["당기순이익", "당기순이익(손실)", "분기순이익", "반기순이익", "당기순손익", "분기순이익(손실)", "반기순이익(손실)"],
+}
+
+
+def _dart_corp_code(stock_code: str):
+    global _dart_corp_loaded_at
+    if not DART_API_KEY:
+        raise RuntimeError("DART_API_KEY 환경변수가 설정되어 있지 않아요.")
+    if not _dart_corp_map or time.time() - _dart_corp_loaded_at > 24 * 3600:
+        res = requests.get("https://opendart.fss.or.kr/api/corpCode.xml", params={"crtfc_key": DART_API_KEY}, timeout=30)
+        res.raise_for_status()
+        with zipfile.ZipFile(io.BytesIO(res.content)) as zf:
+            xml_bytes = zf.read(zf.namelist()[0])
+        root = ET.fromstring(xml_bytes)
+        m = {}
+        for el in root.iter("list"):
+            sc = (el.findtext("stock_code") or "").strip()
+            cc = (el.findtext("corp_code") or "").strip()
+            if sc and cc:
+                m[sc] = cc
+        _dart_corp_map.clear()
+        _dart_corp_map.update(m)
+        _dart_corp_loaded_at = time.time()
+        print(f"[dart] 고유번호표 {len(m)}개 로드")
+    return _dart_corp_map.get(stock_code.upper())
+
+
+def _to_eok(v):
+    if v is None:
+        return None
+    s = str(v).replace(",", "").strip()
+    if s in ("", "-"):
+        return None
+    try:
+        return round(float(s) / 1e8, 1)
+    except ValueError:
+        return None
+
+
+def _dart_report(corp_code: str, year: int, reprt_code: str):
+    """한 보고서의 주요 계정 → {key: (3개월값, 누적값)} (연결재무제표 우선, 없으면 별도)"""
+    res = requests.get(
+        "https://opendart.fss.or.kr/api/fnlttSinglAcnt.json",
+        params={"crtfc_key": DART_API_KEY, "corp_code": corp_code, "bsns_year": str(year), "reprt_code": reprt_code},
+        timeout=10,
+    )
+    data = res.json()
+    if data.get("status") != "000":
+        return None
+    rows = data.get("list") or []
+    out = {}
+    for fs in ("CFS", "OFS"):
+        sub = [r for r in rows if r.get("fs_div") == fs and r.get("sj_div") in ("IS", "CIS")]
+        if not sub:
+            continue
+        for key, names in ACCOUNT_ALIASES.items():
+            if key in out:
+                continue
+            for nm in names:
+                hit = next((r for r in sub if (r.get("account_nm") or "").replace(" ", "") == nm), None)
+                if hit:
+                    out[key] = (_to_eok(hit.get("thstrm_amount")), _to_eok(hit.get("thstrm_add_amount")))
+                    break
+        if out:
+            out["_fs"] = fs
+            break
+    return out or None
+
+
+def fetch_dart_quarterly(stock_code: str) -> dict:
+    cached = _dart_quarter_cache.get(stock_code)
+    if cached and time.time() - cached[0] < 12 * 3600:
+        return cached[1]
+    corp = _dart_corp_code(stock_code)
+    if not corp:
+        raise ValueError("DART에서 이 종목을 찾지 못했어요 (신규상장 직후이거나 상장사가 아닐 수 있어요).")
+
+    this_year = now_kst().year
+    quarters = []
+    fs_used = None
+    for year in (this_year - 2, this_year - 1, this_year):
+        reps = {}
+        for code_, q in REPORT_CODES:
+            try:
+                r = _dart_report(corp, year, code_)
+            except Exception:
+                r = None
+            if r:
+                reps[q] = r
+                fs_used = fs_used or r.get("_fs")
+            time.sleep(0.1)
+        for key_q in (1, 2, 3, 4):
+            if key_q not in reps:
+                continue
+            row = {"period": f"{year}Q{key_q}"}
+            for key in ("revenue", "op", "net"):
+                if key_q in (1, 2, 3):
+                    three, cum = reps[key_q].get(key, (None, None))
+                    val = three
+                    # 3개월 값이 없고 누적만 있으면 앞 분기 누적과의 차이로 계산
+                    if val is None and cum is not None and key_q > 1 and (key_q - 1) in reps:
+                        prev_three, prev_cum = reps[key_q - 1].get(key, (None, None))
+                        prev_total = prev_cum if prev_cum is not None else prev_three
+                        val = round(cum - prev_total, 1) if prev_total is not None else None
+                else:
+                    annual = reps[4].get(key, (None, None))[0]
+                    parts = [reps[q].get(key, (None, None))[0] if q in reps else None for q in (1, 2, 3)]
+                    val = round(annual - sum(parts), 1) if annual is not None and all(v is not None for v in parts) else None
+                row[key] = val
+            if any(row.get(k) is not None for k in ("revenue", "op", "net")):
+                quarters.append(row)
+
+    quarters = quarters[-8:]
+    status = None
+    if quarters:
+        last = quarters[-1]
+        prev_year_period = f"{int(last['period'][:4]) - 1}{last['period'][4:]}"
+        prev = next((q for q in quarters if q["period"] == prev_year_period), None)
+        ln, pn = last.get("net"), (prev or {}).get("net")
+        if ln is not None and pn is not None:
+            if pn <= 0 < ln:
+                status = "흑자전환"
+            elif pn > 0 >= ln:
+                status = "적자전환"
+            elif ln > 0:
+                status = "흑자지속"
+            else:
+                status = "적자지속"
+        elif ln is not None:
+            status = "흑자" if ln > 0 else "적자"
+    ttm = quarters[-4:]
+    ttm_net = round(sum(q["net"] for q in ttm), 1) if len(ttm) == 4 and all(q.get("net") is not None for q in ttm) else None
+    result = {
+        "ok": True,
+        "code": stock_code,
+        "fs": "연결" if fs_used == "CFS" else "별도" if fs_used == "OFS" else None,
+        "unit": "억원",
+        "quarters": quarters,
+        "latest_status": status,
+        "ttm_net": ttm_net,
+    }
+    _dart_quarter_cache[stock_code] = (time.time(), result)
+    return result
+
+
+@app.get("/api/dart-quarterly")
+def dart_quarterly_endpoint(code: str):
+    """최근 8분기 매출·영업이익·순이익(억원) + 흑자전환/적자전환 판별 (DART 공식 재무제표)"""
+    try:
+        return fetch_dart_quarterly((code or "").strip().upper())
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/api/ping")
