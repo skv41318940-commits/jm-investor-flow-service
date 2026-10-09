@@ -4480,7 +4480,7 @@ def _naver_research_list_html(code: str, page: int = 1) -> str:
         timeout=10,
     )
     res.raise_for_status()
-    return res.content.decode("euc-kr", errors="replace")
+    return _decode_html(res)
 
 
 def _parse_naver_research_list(html: str) -> list:
@@ -4521,21 +4521,93 @@ def _parse_naver_research_list(html: str) -> list:
     return rows
 
 
+def _decode_html(res) -> str:
+    """네이버 옛 페이지는 EUC-KR, 개편된 새 페이지는 UTF-8 → 응답에 맞게 골라서 읽음"""
+    head = res.content[:3000].lower()
+    ctype = (res.headers.get("content-type") or "").lower()
+    if "utf-8" in ctype or b"charset=utf-8" in head or b'charset="utf-8"' in head:
+        return res.content.decode("utf-8", errors="replace")
+    if "euc-kr" in ctype or b"euc-kr" in head:
+        return res.content.decode("euc-kr", errors="replace")
+    try:
+        return res.content.decode("utf-8")
+    except UnicodeDecodeError:
+        return res.content.decode("euc-kr", errors="replace")
+
+
+def _find_in_json(obj, key_re, depth=0):
+    """JSON 안을 전부 돌면서 키 이름이 key_re에 맞는 첫 값(문자열/숫자)을 찾음"""
+    if depth > 8:
+        return None
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if re.search(key_re, str(k), re.I) and isinstance(v, (str, int, float)) and str(v).strip():
+                return v
+        for v in obj.values():
+            found = _find_in_json(v, key_re, depth + 1)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = _find_in_json(v, key_re, depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
 def _naver_research_detail(detail_url: str) -> dict:
-    """리포트 상세 페이지에서 목표가·투자의견만 뽑음 (목록엔 이 두 개가 없어서)"""
+    """
+    리포트 상세 페이지에서 목표가·투자의견·PDF 주소를 뽑음 (목록엔 이게 없어서).
+    ⚠️ 2026-09 개편 후 옛 주소가 새 페이지(UTF-8, "목표주가 500,000원 / 투자의견 Buy / PDF 원문 보기")로
+    넘어가는데, 예전엔 EUC-KR로만 읽고 "목표가" 글자만 찾아서 한 개도 못 뽑았음 (2026-10-09 수정).
+    순서: ① 페이지에 들어있는 데이터(JSON) → ② 화면 글자에서 찾기
+    """
+    out = {"target_price": None, "opinion": None, "pdf_url": None}
     try:
         res = requests.get(detail_url, headers=_naver_headers(), timeout=8)
-        text = res.content.decode("euc-kr", errors="replace")
-        if BeautifulSoup is not None:
-            text = BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
-        tp = re.search(r"목표가\s*[:：]?\s*([\d,]{3,})", text)
-        op = re.search(r"투자의견\s*[:：]?\s*([가-힣A-Za-z]+)", text)
-        return {
-            "target_price": int(tp.group(1).replace(",", "")) if tp else None,
-            "opinion": op.group(1).strip() if op else None,
-        }
-    except Exception:
-        return {"target_price": None, "opinion": None}
+        html = _decode_html(res)
+
+        # ① Next.js 페이지 데이터(__NEXT_DATA__ 등)에 들어있는 값
+        m = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+        if m:
+            try:
+                data = json.loads(m.group(1))
+                tp = _find_in_json(data, r"^(targetPrice|goalPrice|targetStockPrice|tp)$")
+                op = _find_in_json(data, r"^(opinion|investOpinion|recommendation|recomm\w*)$")
+                pdf = _find_in_json(data, r"(pdf|attach|file)\w*(url|path)?$")
+                if tp is not None and str(tp).replace(",", "").replace(".0", "").isdigit():
+                    out["target_price"] = int(float(str(tp).replace(",", "")))
+                if op:
+                    out["opinion"] = str(op).strip()
+                if pdf and ".pdf" in str(pdf).lower():
+                    out["pdf_url"] = str(pdf)
+            except Exception:
+                pass
+
+        # PDF 링크 (화면에 있는 a 태그)
+        if not out["pdf_url"]:
+            pm = re.search(r'href="([^"]+\.pdf[^"]*)"', html, re.I) or re.search(r'(https?://[^"\'\s]+\.pdf)', html, re.I)
+            if pm:
+                out["pdf_url"] = pm.group(1).replace("&amp;", "&")
+
+        # ② 화면 글자에서 찾기 ("목표주가 500,000원", "목표가 500,000", "투자의견 Buy/매수")
+        text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True) if BeautifulSoup is not None else html
+        if out["target_price"] is None:
+            tp = re.search(r"목표\s*주?\s*가\s*[:：]?\s*([\d,]{3,})", text)
+            if tp:
+                out["target_price"] = int(tp.group(1).replace(",", ""))
+        if not out["opinion"]:
+            op = re.search(
+                r"투자\s*의견\s*[:：]?\s*(Strong\s?Buy|Trading\s?Buy|Not\s?Rated|Outperform|Marketperform|Underperform|"
+                r"Overweight|Underweight|Neutral|Buy|Hold|Sell|NR|강력\s?매수|단기\s?매수|매수|중립|보유|매도|비중\s?확대|비중\s?축소)",
+                text,
+                re.I,
+            )
+            if op:
+                out["opinion"] = op.group(1).strip()
+    except Exception as e:
+        print(f"[stock_reports] 상세 페이지 읽기 실패 {detail_url}: {e}")
+    return out
 
 
 def _naver_research_json(code: str) -> list:
@@ -4605,11 +4677,16 @@ def fetch_stock_reports(code: str, limit: int = 30) -> dict:
 
     rows = rows[:limit]
     # 목록에 목표가가 없으면 최근 15개만 상세 페이지에서 목표가·투자의견을 채움 (동시에 6개씩)
-    need = [r for r in rows[:15] if r["target_price"] is None and r.get("detail_url")]
+    need = [
+        r for r in rows[:20]
+        if r.get("detail_url") and (r["target_price"] is None or not r.get("pdf_url") or not r.get("opinion"))
+    ]
     if need:
         with ThreadPoolExecutor(max_workers=6) as ex:
             for r, d in zip(need, ex.map(lambda x: _naver_research_detail(x["detail_url"]), need)):
-                r.update({k: v for k, v in d.items() if v is not None})
+                for k, v in d.items():
+                    if v is not None and not r.get(k):
+                        r[k] = v
 
     result = {"ok": True, "code": code, "source": source, "items": rows}
     if not rows:
@@ -4638,7 +4715,16 @@ def stock_reports_debug(code: str = "005930"):
     try:
         html = _naver_research_list_html(code)
         out["naver_html_len"] = len(html)
-        out["naver_parsed_top3"] = _parse_naver_research_list(html)[:3]
+        top = _parse_naver_research_list(html)[:3]
+        out["naver_parsed_top3"] = top
+        if top and top[0].get("detail_url"):
+            dres = requests.get(top[0]["detail_url"], headers=_naver_headers(), timeout=8)
+            out["detail_final_url"] = dres.url
+            out["detail_parsed"] = _naver_research_detail(top[0]["detail_url"])
+            dhtml = _decode_html(dres)
+            out["detail_has_next_data"] = "__NEXT_DATA__" in dhtml
+            i = dhtml.find("목표")
+            out["detail_text_near_목표"] = dhtml[max(0, i - 300): i + 500] if i >= 0 else dhtml[:800]
         out["naver_html_preview"] = html[:1500]
     except Exception as e:
         out["naver_html_error"] = str(e)
