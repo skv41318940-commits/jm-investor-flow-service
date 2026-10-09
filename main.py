@@ -4825,12 +4825,13 @@ def stock_reports_debug(code: str = "005930"):
 # 안 되면 /api/research-debug 로 실제 응답을 보고 후보를 고치면 됨.
 # ⚠️ PDF는 저장하지 않고 원문 링크만 연결 (저작권).
 # ══════════════════════════════════════════════════════════════════════════
+# 2026-10-09 /api/research-debug 로 실제 주소 확인 완료 (나머지 후보는 404였음)
 RESEARCH_CATEGORIES = {
     "industry": {"label": "산업분석", "paths": ["industry"]},
-    "strategy": {"label": "투자전략", "paths": ["invest", "strategy", "investment"]},
+    "strategy": {"label": "투자전략", "paths": ["invest"]},
     "economy": {"label": "경제분석", "paths": ["economy"]},
-    "bond": {"label": "채권분석", "paths": ["debenture", "bond"]},
-    "market": {"label": "데일리(시황)", "paths": ["market-info", "marketinfo", "market", "daily"]},
+    "bond": {"label": "채권분석", "paths": ["debenture"]},
+    "market": {"label": "데일리(시황)", "paths": ["market", "daily"]},
 }
 _research_path_ok: dict = {}  # category -> 실제로 동작한 경로 이름
 _research_cache: dict = {}  # (category, page) -> (시각, 결과)
@@ -4859,7 +4860,8 @@ def _research_row(it: dict, cat_label: str, path: str):
     tag = None
     for k in ("industryName", "upjongName", "sectorName", "categoryName", "itemName", "category", "researchCategory"):
         v = it.get(k)
-        if isinstance(v, str) and v.strip() and v.strip() != cat_label:
+        # 분류 이름 자체("투자전략", "시황정보" 등)는 태그로 안 씀 — 산업분석의 "자동차/철강금속"만 의미 있음
+        if isinstance(v, str) and v.strip() and v.strip() not in (cat_label, it.get("researchCategory"), "데일리"):
             tag = v.strip()
             break
     return {
