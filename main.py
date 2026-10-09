@@ -5022,10 +5022,14 @@ def _latest_value(table: str, column: str, where: tuple = None):
 def build_health_report() -> dict:
     now = now_kst()
     today = now.strftime("%Y-%m-%d")
+    # "있어야 할 최신 날짜" = KRX 기준 가장 최근 영업일. 휴장일(주말·공휴일)이나 장 마감 전엔
+    # 전 영업일이 기준이라, 그날 데이터가 없다고 ❌로 잘못 알리지 않음 (2026-10-09 한글날에 오탐 확인)
     try:
-        trading_day = _latest_trading_day() == now.strftime("%Y%m%d")
+        ltd = _latest_trading_day()
+        expected = f"{ltd[:4]}-{ltd[4:6]}-{ltd[6:8]}"
     except Exception:
-        trading_day = now.weekday() < 5  # KRX 확인이 안 되면 평일이면 장 열린 날로 봄
+        expected = today
+    trading_day = expected == today
 
     checks = []
 
@@ -5033,11 +5037,11 @@ def build_health_report() -> dict:
         checks.append({"name": name, "latest": latest, "ok": ok, "hint": hint})
 
     mf = _latest_value("market_flow_trend", "trade_date", ("market", "ALL"))
-    add("시장 수급", mf, bool(mf and mf[:10] == today), "KRX(pykrx) 로그인·응답 확인")
+    add("시장 수급", mf, bool(mf and mf[:10] >= expected), "KRX(pykrx) 로그인·응답 확인")
     kr = _latest_value("krx_daily_ranking", "scan_date")
-    add("KRX 거래량 랭킹", kr, bool(kr and kr[:10] == today), "pykrx 응답 확인")
+    add("KRX 거래량 랭킹", kr, bool(kr and kr[:10] >= expected), "pykrx 응답 확인")
     nx = _latest_value("nxt_daily_ranking", "scan_date")
-    add("NXT 스캔", nx, bool(nx and nx[:10] == today), "pykrx 응답 확인")
+    add("NXT 스캔", nx, bool(nx and nx[:10] >= expected), "pykrx 응답 확인")
     fd = _latest_value("stock_fundamentals", "synced_at")
     add("재무제표", fd[:10] if fd else None, bool(fd and fd[:10] == today), "16시 이후 자동 동기화")
     try:
@@ -5050,17 +5054,17 @@ def build_health_report() -> dict:
     add(
         "실시간 체결(정밀 세력평단)",
         f"오늘 {cnt:,}줄" + (f" · 마지막 체결 {last_tick_min:.0f}분 전" if last_tick_min is not None else ""),
-        cnt > 0,
+        cnt > 0 or not trading_day,  # 휴장일엔 체결이 없는 게 정상
         "한투 웹소켓 연결 확인 (ALREADY IN USE 등)",
     )
 
     failed = [c for c in checks if not c["ok"]]
-    return {"date": today, "trading_day": trading_day, "ok": not failed, "checks": checks}
+    return {"date": today, "expected_date": expected, "trading_day": trading_day, "ok": not failed, "checks": checks}
 
 
 def format_health_message(rep: dict) -> str:
     head = "✅ JM 데이터 점검 — 모두 정상" if rep["ok"] else "⚠️ JM 데이터 점검 — 확인 필요"
-    lines = [f"{head} ({rep['date']})"]
+    lines = [f"{head} ({rep['date']}" + ("" if rep.get("trading_day", True) else f" · 휴장일, {rep.get('expected_date')} 기준") + ")"]
     for c in rep["checks"]:
         mark = "✅" if c["ok"] else "❌"
         lines.append(f"{mark} {c['name']}: {c['latest'] or '없음'}" + ("" if c["ok"] else f"  → {c['hint']}"))
