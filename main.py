@@ -4468,7 +4468,7 @@ def sync_fundamentals_market_endpoint():
 # ══════════════════════════════════════════════════════════════════════════
 from concurrent.futures import ThreadPoolExecutor
 
-_report_cache: dict = {}  # code -> (저장시각, 결과)
+_report_cache: dict = {}  # code -> (저장시각, 결과)  ⚠️ 서버 재시작하면 비워짐
 _REPORT_CACHE_SEC = 30 * 60
 
 
@@ -4611,10 +4611,14 @@ def _naver_research_detail(detail_url: str) -> dict:
 
 
 def _naver_research_json(code: str) -> list:
-    """예비 경로 — 개편된 네이버 모바일 증권의 리서치 JSON (주소 후보를 차례로 시도)"""
+    """
+    1순위 경로 — 개편된 네이버 증권의 리서치 JSON (2026-10-09 디버그로 확인됨).
+    /api/research/stock/{종목코드} → [{researchId, title, brokerName, writeDate, readCount, previewContent, ...}]
+    ⚠️ /api/research/company 는 itemCode를 무시하고 "전체 종목" 최신 리포트를 줘서, 종목코드로 꼭 걸러야 함.
+    """
     candidates = [
         (f"https://m.stock.naver.com/api/research/stock/{code}", {"pageSize": 30, "page": 1}),
-        ("https://m.stock.naver.com/api/research/company", {"itemCode": code, "pageSize": 30, "page": 1}),
+        ("https://m.stock.naver.com/api/research/company", {"itemCode": code, "pageSize": 100, "page": 1}),
     ]
     for url, params in candidates:
         try:
@@ -4634,26 +4638,71 @@ def _naver_research_json(code: str) -> list:
         for it in items if isinstance(items, list) else []:
             if not isinstance(it, dict):
                 continue
+            if it.get("itemCode") and str(it.get("itemCode")).upper() != code.upper():
+                continue  # 다른 종목 리포트는 버림
             title = it.get("title") or it.get("researchTitle") or ""
             if not title:
                 continue
             date = str(it.get("writeDate") or it.get("date") or it.get("regDate") or "")[:10].replace(".", "-")
-            nid = it.get("nid") or it.get("researchId") or it.get("id")
+            rid = it.get("researchId") or it.get("nid") or it.get("id")
             tp_raw = str(it.get("targetPrice") or "").replace(",", "")
             rows.append(
                 {
                     "date": date,
                     "title": title,
-                    "broker": it.get("brokerName") or it.get("brokerage") or it.get("company") or "",
-                    "detail_url": f"https://finance.naver.com/research/company_read.naver?nid={nid}" if nid else None,
+                    "broker": it.get("brokerName") or it.get("brokerage") or "",
+                    "research_id": rid,
+                    "detail_url": it.get("endUrl") or (f"https://m.stock.naver.com/research/company/{rid}" if rid else None),
                     "pdf_url": it.get("attachUrl") or it.get("pdfUrl") or it.get("fileUrl"),
                     "target_price": int(tp_raw) if tp_raw.isdigit() else None,
                     "opinion": it.get("opinion") or it.get("investOpinion"),
+                    "summary": (it.get("previewContent") or "").strip() or None,
+                    "read_count": it.get("readCount"),
                 }
             )
         if rows:
             return rows
     return []
+
+
+def _naver_research_detail_json(research_id) -> dict:
+    """리포트 1건의 상세 JSON (목표주가·투자의견·PDF) — 주소 후보를 차례로 시도"""
+    out = {"target_price": None, "opinion": None, "pdf_url": None}
+    if not research_id:
+        return out
+    for url in (
+        f"https://m.stock.naver.com/api/research/company/{research_id}",
+        f"https://m.stock.naver.com/api/research/{research_id}",
+        f"https://m.stock.naver.com/api/research/detail/{research_id}",
+    ):
+        try:
+            res = requests.get(url, headers=_naver_stock_headers(), timeout=6)
+            if not res.ok:
+                continue
+            data = res.json()
+        except Exception:
+            continue
+        tp = _find_in_json(data, r"^(targetPrice|goalPrice|targetStockPrice|tp|targetPriceValue)$")
+        op = _find_in_json(data, r"^(opinion|investOpinion|investmentOpinion|recommendation|recommName|opinionName)$")
+        pdf = None
+        try:
+            m = re.search(r'(https?://[^"\s]+?\.pdf)', json.dumps(data, ensure_ascii=False), re.I)
+            pdf = m.group(1) if m else None
+        except Exception:
+            pass
+        if tp is not None:
+            raw = str(tp).replace(",", "").replace("원", "").strip()
+            try:
+                out["target_price"] = int(float(raw)) if raw and float(raw) > 0 else None
+            except ValueError:
+                pass
+        if op:
+            out["opinion"] = str(op).strip()
+        if pdf:
+            out["pdf_url"] = pdf
+        if any(out.values()):
+            return out
+    return out
 
 
 def fetch_stock_reports(code: str, limit: int = 30) -> dict:
@@ -4663,17 +4712,19 @@ def fetch_stock_reports(code: str, limit: int = 30) -> dict:
 
     rows, source, errors = [], "", []
     try:
-        rows = _parse_naver_research_list(_naver_research_list_html(code))
-        source = "네이버 증권 리서치"
+        rows = _naver_research_json(code)
+        if rows:
+            source = "네이버 증권 리서치"
     except Exception as e:
-        errors.append(f"네이버 리서치 목록: {e}")
+        errors.append(f"네이버 리서치 API: {e}")
     if not rows:
+        # 예비: 개편 전 HTML 목록 (지금은 새 페이지로 바뀌어서 대부분 0건)
         try:
-            rows = _naver_research_json(code)
+            rows = _parse_naver_research_list(_naver_research_list_html(code))
             if rows:
-                source = "네이버 증권 리서치(신규 API)"
+                source = "네이버 증권 리서치(옛 페이지)"
         except Exception as e:
-            errors.append(f"네이버 신규 API: {e}")
+            errors.append(f"네이버 리서치 목록: {e}")
 
     rows = rows[:limit]
     # 목록에 목표가가 없으면 최근 15개만 상세 페이지에서 목표가·투자의견을 채움 (동시에 6개씩)
@@ -4683,7 +4734,16 @@ def fetch_stock_reports(code: str, limit: int = 30) -> dict:
     ]
     if need:
         with ThreadPoolExecutor(max_workers=6) as ex:
-            for r, d in zip(need, ex.map(lambda x: _naver_research_detail(x["detail_url"]), need)):
+            def _detail(x):
+                d = _naver_research_detail_json(x.get("research_id"))
+                if d["target_price"] is None or not d["pdf_url"] or not d["opinion"]:
+                    h = _naver_research_detail(x["detail_url"])
+                    for k, v in h.items():
+                        if v and not d.get(k):
+                            d[k] = v
+                return d
+
+            for r, d in zip(need, ex.map(_detail, need)):
                 for k, v in d.items():
                     if v is not None and not r.get(k):
                         r[k] = v
@@ -4728,7 +4788,27 @@ def stock_reports_debug(code: str = "005930"):
         out["naver_html_preview"] = html[:1500]
     except Exception as e:
         out["naver_html_error"] = str(e)
-    for url in (f"https://m.stock.naver.com/api/research/stock/{code}", "https://m.stock.naver.com/api/research/company"):
+    try:
+        jrows = _naver_research_json(code)
+        out["json_rows_top2"] = jrows[:2]
+        if jrows:
+            rid = jrows[0].get("research_id")
+            out["detail_json_parsed"] = _naver_research_detail_json(rid)
+            for durl in (
+                f"https://m.stock.naver.com/api/research/company/{rid}",
+                f"https://m.stock.naver.com/api/research/{rid}",
+                f"https://m.stock.naver.com/api/research/detail/{rid}",
+            ):
+                try:
+                    dr = requests.get(durl, headers=_naver_stock_headers(), timeout=6)
+                    out[durl] = {"status": dr.status_code, "preview": dr.text[:1200]}
+                except Exception as e:
+                    out[durl] = {"error": str(e)}
+            if jrows[0].get("detail_url"):
+                out["detail_page_parsed"] = _naver_research_detail(jrows[0]["detail_url"])
+    except Exception as e:
+        out["json_error"] = str(e)
+    for url in (f"https://m.stock.naver.com/api/research/stock/{code}",):
         try:
             r = requests.get(url, headers=_naver_stock_headers(), params={"itemCode": code, "pageSize": 5, "page": 1}, timeout=8)
             out[url] = {"status": r.status_code, "preview": r.text[:800]}
