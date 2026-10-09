@@ -4817,6 +4817,157 @@ def stock_reports_debug(code: str = "005930"):
     return out
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 📚 리서치 (산업분석 · 투자전략 · 경제분석 · 채권분석 · 데일리 시황) — 네이버 증권 리서치 무료 공개분
+# ──────────────────────────────────────────────────────────────────────────
+# 종목분석은 /api/research/stock/{코드}, /api/research/company/{id} 로 확인됐는데, 나머지 분류의
+# 정확한 주소는 아직 직접 확인을 못 해서 후보를 차례로 시도하고, 처음 성공한 주소를 기억해둠.
+# 안 되면 /api/research-debug 로 실제 응답을 보고 후보를 고치면 됨.
+# ⚠️ PDF는 저장하지 않고 원문 링크만 연결 (저작권).
+# ══════════════════════════════════════════════════════════════════════════
+RESEARCH_CATEGORIES = {
+    "industry": {"label": "산업분석", "paths": ["industry"]},
+    "strategy": {"label": "투자전략", "paths": ["invest", "strategy", "investment"]},
+    "economy": {"label": "경제분석", "paths": ["economy"]},
+    "bond": {"label": "채권분석", "paths": ["debenture", "bond"]},
+    "market": {"label": "데일리(시황)", "paths": ["market-info", "marketinfo", "market", "daily"]},
+}
+_research_path_ok: dict = {}  # category -> 실제로 동작한 경로 이름
+_research_cache: dict = {}  # (category, page) -> (시각, 결과)
+_RESEARCH_CACHE_SEC = 15 * 60
+
+
+def _research_items_from(data) -> list:
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for k in ("researches", "items", "result", "list", "researchSummaries"):
+            v = data.get(k)
+            if isinstance(v, list):
+                return v
+    return []
+
+
+def _research_row(it: dict, cat_label: str, path: str):
+    if not isinstance(it, dict):
+        return None
+    title = it.get("title") or it.get("researchTitle")
+    if not title:
+        return None
+    rid = it.get("researchId") or it.get("nid") or it.get("id")
+    # 산업분석은 "반도체/자동차" 같은 산업 이름이 들어있는 칸이 있음 — 이름이 확실치 않아 후보를 차례로 봄
+    tag = None
+    for k in ("industryName", "upjongName", "sectorName", "categoryName", "itemName", "category", "researchCategory"):
+        v = it.get(k)
+        if isinstance(v, str) and v.strip() and v.strip() != cat_label:
+            tag = v.strip()
+            break
+    return {
+        "research_id": rid,
+        "date": str(it.get("writeDate") or it.get("date") or "")[:10].replace(".", "-"),
+        "title": title,
+        "broker": it.get("brokerName") or it.get("brokerage") or "",
+        "tag": tag,
+        "summary": (it.get("previewContent") or "").strip() or None,
+        "read_count": it.get("readCount"),
+        "detail_url": it.get("endUrl") or (f"https://m.stock.naver.com/research/{path}/{rid}" if rid else None),
+        "pdf_url": it.get("attachUrl"),
+    }
+
+
+def _research_pdf(path: str, rid):
+    if not rid:
+        return None
+    try:
+        res = requests.get(f"https://m.stock.naver.com/api/research/{path}/{rid}", headers=_naver_stock_headers(), timeout=6)
+        if not res.ok:
+            return None
+        data = res.json()
+        c = data.get("researchContent") if isinstance(data, dict) else None
+        url = (c or {}).get("attachUrl") if isinstance(c, dict) else None
+        if not url:
+            m = re.search(r'(https?://[^"\s]+?\.pdf)', json.dumps(data, ensure_ascii=False), re.I)
+            url = m.group(1) if m else None
+        return url
+    except Exception:
+        return None
+
+
+def fetch_research_list(category: str, page: int = 1, page_size: int = 40) -> dict:
+    cat = RESEARCH_CATEGORIES.get(category)
+    if not cat:
+        raise ValueError(f"category는 {'/'.join(RESEARCH_CATEGORIES)} 중 하나여야 해요.")
+    key = (category, page)
+    cached = _research_cache.get(key)
+    if cached and time.time() - cached[0] < _RESEARCH_CACHE_SEC:
+        return cached[1]
+
+    paths = [_research_path_ok[category]] if category in _research_path_ok else cat["paths"]
+    rows, used, errors = [], None, []
+    for path in paths:
+        try:
+            res = requests.get(
+                f"https://m.stock.naver.com/api/research/{path}",
+                headers=_naver_stock_headers(),
+                params={"page": page, "pageSize": page_size},
+                timeout=8,
+            )
+            if not res.ok:
+                errors.append(f"{path}: HTTP {res.status_code}")
+                continue
+            items = _research_items_from(res.json())
+            rows = [r for r in (_research_row(it, cat["label"], path) for it in items) if r]
+            if rows:
+                used = path
+                _research_path_ok[category] = path
+                break
+            errors.append(f"{path}: 목록 비어있음")
+        except Exception as e:
+            errors.append(f"{path}: {e}")
+
+    # PDF 주소가 목록에 없으면 앞쪽 20개만 상세에서 채움 (동시에 6개씩)
+    need = [r for r in rows[:20] if not r.get("pdf_url") and r.get("research_id")]
+    if need and used:
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            for r, url in zip(need, ex.map(lambda x: _research_pdf(used, x["research_id"]), need)):
+                if url:
+                    r["pdf_url"] = url
+
+    result = {"ok": True, "category": category, "label": cat["label"], "page": page, "items": rows}
+    if not rows:
+        result["note"] = "리포트 목록을 가져오지 못했어요."
+        result["errors"] = errors
+    else:
+        _research_cache[key] = (time.time(), result)
+    return result
+
+
+@app.get("/api/research-list")
+def research_list_endpoint(category: str = "strategy", page: int = 1, refresh: bool = False):
+    """리서치 목록 — category: industry/strategy/economy/bond/market. 15분 캐시."""
+    try:
+        if refresh:
+            _research_cache.pop((category, page), None)
+        return fetch_research_list(category, max(1, page))
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/research-debug")
+def research_debug():
+    """디버그 전용 — 분류별 후보 주소들의 실제 응답 앞부분"""
+    out = {}
+    for cat, info in RESEARCH_CATEGORIES.items():
+        for path in info["paths"]:
+            url = f"https://m.stock.naver.com/api/research/{path}"
+            try:
+                r = requests.get(url, headers=_naver_stock_headers(), params={"page": 1, "pageSize": 3}, timeout=8)
+                out[f"{cat}:{path}"] = {"status": r.status_code, "preview": r.text[:600]}
+            except Exception as e:
+                out[f"{cat}:{path}"] = {"error": str(e)}
+    return out
+
+
 @app.get("/api/ping")
 def ping():
     return {"ok": True}
