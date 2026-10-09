@@ -4588,7 +4588,12 @@ def _naver_research_detail(detail_url: str) -> dict:
         if not out["pdf_url"]:
             pm = re.search(r'href="([^"]+\.pdf[^"]*)"', html, re.I) or re.search(r'(https?://[^"\'\s]+\.pdf)', html, re.I)
             if pm:
-                out["pdf_url"] = pm.group(1).replace("&amp;", "&")
+                link = pm.group(1).replace("&amp;", "&")
+                inner = re.search(r"[?&]url=([^&]+)", link)
+                if inner:
+                    from urllib.parse import unquote
+                    link = unquote(inner.group(1))
+                out["pdf_url"] = link if link.startswith("http") else None
 
         # ② 화면 글자에서 찾기 ("목표주가 500,000원", "목표가 500,000", "투자의견 Buy/매수")
         text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True) if BeautifulSoup is not None else html
@@ -4666,42 +4671,41 @@ def _naver_research_json(code: str) -> list:
 
 
 def _naver_research_detail_json(research_id) -> dict:
-    """리포트 1건의 상세 JSON (목표주가·투자의견·PDF) — 주소 후보를 차례로 시도"""
-    out = {"target_price": None, "opinion": None, "pdf_url": None}
+    """
+    리포트 1건의 상세 JSON — /api/research/company/{researchId} (2026-10-09 디버그로 확인됨).
+    researchContent 안에 goalPrice(목표주가)·prevGoalPrice(직전 목표주가)·opinion(투자의견)·
+    attachUrl(PDF)·priceAtWriteDate(작성일 주가)가 들어있음.
+    """
+    out = {"target_price": None, "opinion": None, "pdf_url": None, "prev_target_price": None, "price_at_write": None}
     if not research_id:
         return out
-    for url in (
-        f"https://m.stock.naver.com/api/research/company/{research_id}",
-        f"https://m.stock.naver.com/api/research/{research_id}",
-        f"https://m.stock.naver.com/api/research/detail/{research_id}",
-    ):
+
+    def to_int(v):
         try:
-            res = requests.get(url, headers=_naver_stock_headers(), timeout=6)
-            if not res.ok:
-                continue
-            data = res.json()
-        except Exception:
-            continue
-        tp = _find_in_json(data, r"^(targetPrice|goalPrice|targetStockPrice|tp|targetPriceValue)$")
-        op = _find_in_json(data, r"^(opinion|investOpinion|investmentOpinion|recommendation|recommName|opinionName)$")
-        pdf = None
-        try:
-            m = re.search(r'(https?://[^"\s]+?\.pdf)', json.dumps(data, ensure_ascii=False), re.I)
-            pdf = m.group(1) if m else None
-        except Exception:
-            pass
-        if tp is not None:
-            raw = str(tp).replace(",", "").replace("원", "").strip()
-            try:
-                out["target_price"] = int(float(raw)) if raw and float(raw) > 0 else None
-            except ValueError:
-                pass
-        if op:
-            out["opinion"] = str(op).strip()
-        if pdf:
-            out["pdf_url"] = pdf
-        if any(out.values()):
+            n = int(float(str(v).replace(",", "").replace("원", "").strip()))
+            return n if n > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    try:
+        res = requests.get(
+            f"https://m.stock.naver.com/api/research/company/{research_id}", headers=_naver_stock_headers(), timeout=6
+        )
+        if not res.ok:
             return out
+        data = res.json()
+    except Exception:
+        return out
+    c = data.get("researchContent") if isinstance(data, dict) else None
+    if not isinstance(c, dict):
+        c = {}
+    out["target_price"] = to_int(c.get("goalPrice")) or to_int(_find_in_json(data, r"^(goalPrice|targetPrice)$"))
+    out["prev_target_price"] = to_int(c.get("prevGoalPrice"))
+    out["price_at_write"] = to_int(c.get("priceAtWriteDate"))
+    op = c.get("opinion") or _find_in_json(data, r"^(opinion|investOpinion)$")
+    out["opinion"] = str(op).strip() if op else None
+    pdf = c.get("attachUrl")
+    out["pdf_url"] = pdf if pdf and ".pdf" in str(pdf).lower() else None
     return out
 
 
@@ -4794,11 +4798,7 @@ def stock_reports_debug(code: str = "005930"):
         if jrows:
             rid = jrows[0].get("research_id")
             out["detail_json_parsed"] = _naver_research_detail_json(rid)
-            for durl in (
-                f"https://m.stock.naver.com/api/research/company/{rid}",
-                f"https://m.stock.naver.com/api/research/{rid}",
-                f"https://m.stock.naver.com/api/research/detail/{rid}",
-            ):
+            for durl in (f"https://m.stock.naver.com/api/research/company/{rid}",):
                 try:
                     dr = requests.get(durl, headers=_naver_stock_headers(), timeout=6)
                     out[durl] = {"status": dr.status_code, "preview": dr.text[:1200]}
