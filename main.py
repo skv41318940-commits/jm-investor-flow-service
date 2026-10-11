@@ -2748,6 +2748,8 @@ async def _daily_jobs_worker():
         ("fundamentals", _ensure_fundamentals_synced_today, ()),
         ("market_flow", _ensure_market_flow_synced_today, ()),
         ("health_report", _ensure_health_report_sent_today, ()),
+        ("telegram_briefs", _run_telegram_briefs, ()),
+        ("target_reach", _check_target_reach, ()),
     ]
     await asyncio.sleep(30)  # 서버 막 켜졌을 때 다른 초기화가 먼저 끝나게 잠깐 대기
     while True:
@@ -4990,14 +4992,16 @@ HEALTH_REPORT_HOUR, HEALTH_REPORT_MINUTE = 18, 40
 _health_sent = {"date": None}
 
 
-def send_telegram(text: str) -> bool:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+def send_telegram(text: str, token: str = None, chat_id: str = None) -> bool:
+    token = token or TELEGRAM_BOT_TOKEN
+    chat_id = chat_id or TELEGRAM_CHAT_ID
+    if not token or not chat_id:
         print("[telegram] 토큰/채팅ID 미설정 — 전송 건너뜀")
         return False
     try:
         res = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True},
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
             timeout=10,
         )
         if not res.ok:
@@ -5266,6 +5270,795 @@ def dart_quarterly_endpoint(code: str):
     """최근 8분기 매출·영업이익·순이익(억원) + 흑자전환/적자전환 판별 (DART 공식 재무제표)"""
     try:
         return fetch_dart_quarterly((code or "").strip().upper())
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 🗓 주요 일정 캘린더 (오늘 + 다가오는 일정)
+# ──────────────────────────────────────────────────────────────────────────
+#   ① 미국 경제지표 발표일 — FRED 공식 발표 일정(releases/dates, FRED_API_KEY 사용).
+#      발표 시각은 지표별 관례(미 동부시간)를 한국시간으로 바꿔서 붙임 (서머타임 자동 반영).
+#   ② 미국 대형주 실적발표 — 나스닥 실적 캘린더 (시가총액 1,000억달러 이상만)
+#   ③ 국내 공모주 청약 — 38커뮤니케이션 공모주 청약일정
+# 출처마다 실패해도 나머지는 보여줌. 문제 생기면 /api/calendar-debug 로 확인.
+# ══════════════════════════════════════════════════════════════════════════
+try:
+    from zoneinfo import ZoneInfo
+
+    _ET = ZoneInfo("America/New_York")
+    _KST_ZONE = ZoneInfo("Asia/Seoul")
+except Exception:  # 서버에 시간대 정보가 없을 때 대비 — 아래 _us_to_kst에서 서머타임을 직접 계산
+    _ET = None
+    _KST_ZONE = KST
+_calendar_cache = {"at": 0.0, "key": None, "data": None}
+
+# (FRED 발표 이름에 들어있는 글자, 한글 이름, 미 동부 발표시각, 중요(⚡), 영향 설명)
+US_RELEASES = [
+    ("Consumer Price Index", "소비자물가지수(CPI)", "08:30", True, "인플레이션·금리 정책에 큰 영향"),
+    ("Employment Situation", "고용보고서(비농업고용·실업률)", "08:30", True, "고용 시장·금리 정책에 큰 영향"),
+    ("Producer Price Index", "생산자물가지수(PPI)", "08:30", True, "인플레이션 선행 지표"),
+    ("Advance Monthly Sales for Retail", "소매판매", "08:30", True, "소비 지출·경기 판단"),
+    ("Gross Domestic Product", "GDP", "08:30", True, "경제 성장률"),
+    ("Personal Income and Outlays", "개인소득·지출(PCE 물가)", "08:30", True, "연준이 보는 핵심 물가"),
+    ("Unemployment Insurance Weekly Claims", "주간 신규 실업수당 청구건수", "08:30", False, "고용 시장 흐름"),
+    ("New Residential Construction", "주택착공·허가", "08:30", False, "주택 경기"),
+    ("Job Openings and Labor Turnover", "JOLTS 구인건수", "10:00", False, "노동 수요"),
+    ("Industrial Production", "산업생산", "09:15", False, "제조업 경기"),
+    ("Existing Home Sales", "기존주택판매", "10:00", False, "부동산 경기·금리 영향"),
+    ("Surveys of Consumers", "미시간대 소비자심리", "10:00", False, "소비 심리"),
+    ("FOMC Press Release", "FOMC 금리 결정", "14:00", True, "기준금리 결정 — 시장 전체에 큰 영향"),
+]
+
+
+def _us_to_kst(date_str: str, hhmm: str) -> datetime:
+    h, m = map(int, hhmm.split(":"))
+    base = datetime.strptime(date_str, "%Y-%m-%d").replace(hour=h, minute=m)
+    if _ET is not None:
+        return base.replace(tzinfo=_ET).astimezone(_KST_ZONE)
+    # 미국 서머타임: 3월 둘째 일요일 ~ 11월 첫째 일요일 (UTC-4), 그 외 UTC-5
+    y = base.year
+    mar = datetime(y, 3, 8) + timedelta(days=(6 - datetime(y, 3, 8).weekday()) % 7)
+    nov = datetime(y, 11, 1) + timedelta(days=(6 - datetime(y, 11, 1).weekday()) % 7)
+    offset = -4 if mar <= base < nov else -5
+    return base.replace(tzinfo=timezone(timedelta(hours=offset))).astimezone(KST)
+
+
+def _fetch_us_economic(start: str, end: str) -> list:
+    if not FRED_API_KEY:
+        raise RuntimeError("FRED_API_KEY 미설정")
+    res = requests.get(
+        "https://api.stlouisfed.org/fred/releases/dates",
+        params={
+            "api_key": FRED_API_KEY,
+            "file_type": "json",
+            "realtime_start": start,
+            "realtime_end": end,
+            "include_release_dates_with_no_data": "true",
+            "sort_order": "asc",
+            "limit": 1000,
+        },
+        timeout=10,
+    )
+    res.raise_for_status()
+    out, seen = [], set()
+    for r in res.json().get("release_dates", []):
+        name = r.get("release_name") or ""
+        for key, kr, et, major, why in US_RELEASES:
+            if key.lower() in name.lower():
+                k = (kr, r["date"])
+                if k in seen:
+                    break
+                seen.add(k)
+                kst = _us_to_kst(r["date"], et)
+                out.append(
+                    {
+                        "date": kst.strftime("%Y-%m-%d"),
+                        "time": kst.strftime("%H:%M"),
+                        "title": f"美) {kr}",
+                        "major": major,
+                        "note": why,
+                        "kind": "us_macro",
+                    }
+                )
+                break
+    return out
+
+
+def _fetch_us_earnings(start: str, end: str, min_cap: float = 100e9) -> list:
+    out = []
+    d = datetime.strptime(start, "%Y-%m-%d")
+    last = datetime.strptime(end, "%Y-%m-%d")
+    while d <= last:
+        if d.weekday() < 5:
+            try:
+                res = requests.get(
+                    "https://api.nasdaq.com/api/calendar/earnings",
+                    params={"date": d.strftime("%Y-%m-%d")},
+                    headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+                    timeout=8,
+                )
+                rows = ((res.json() or {}).get("data") or {}).get("rows") or []
+            except Exception as e:
+                print(f"[calendar] 나스닥 실적 {d.date()} 실패: {e}")
+                rows = []
+            for r in rows:
+                cap = str(r.get("marketCap") or "").replace("$", "").replace(",", "")
+                try:
+                    cap_v = float(cap)
+                except ValueError:
+                    continue
+                if cap_v < min_cap:
+                    continue
+                when = (r.get("time") or "").lower()
+                tlabel = "장전" if "pre" in when else "장후" if "after" in when else ""
+                out.append(
+                    {
+                        "date": d.strftime("%Y-%m-%d"),
+                        "time": None,
+                        "title": f"美) {r.get('name') or r.get('symbol')} 실적발표" + (f" ({tlabel})" if tlabel else ""),
+                        "major": cap_v >= 500e9,
+                        "note": f"{r.get('symbol')} · 시가총액 ${cap_v / 1e9:,.0f}B",
+                        "kind": "us_earnings",
+                    }
+                )
+        d += timedelta(days=1)
+    return out
+
+
+def _fetch_kr_ipo(start: str, end: str) -> list:
+    if BeautifulSoup is None:
+        raise RuntimeError("beautifulsoup4 미설치")
+    res = requests.get(
+        "http://www.38.co.kr/html/fund/index.htm",
+        params={"o": "k"},
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "http://www.38.co.kr/"},
+        timeout=10,
+    )
+    html = res.content.decode("euc-kr", errors="replace")
+    soup = BeautifulSoup(html, "html.parser")
+    out = []
+    for tr in soup.find_all("tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 2:
+            continue
+        texts = [td.get_text(" ", strip=True) for td in tds]
+        m = None
+        for t in texts:
+            m = re.search(r"(\d{4})\.(\d{2})\.(\d{2})\s*~\s*(?:(\d{2})\.)?(\d{2})", t)
+            if m:
+                break
+        if not m:
+            continue
+        name = texts[0].replace("(유가)", "").replace("(코스닥)", "").strip()
+        if not name or len(name) > 30:
+            continue
+        y, mo, d1 = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        mo2 = int(m.group(4)) if m.group(4) else mo
+        d2 = int(m.group(5))
+        try:
+            s1 = datetime(y, mo, d1)
+            s2 = datetime(y if mo2 >= mo else y + 1, mo2, d2)
+        except ValueError:
+            continue
+        day = s1
+        while day <= s2:
+            ds = day.strftime("%Y-%m-%d")
+            if start <= ds <= end and day.weekday() < 5:
+                out.append({"date": ds, "time": None, "title": f"공모청약 : {name}", "major": False, "note": None, "kind": "kr_ipo"})
+            day += timedelta(days=1)
+    return out
+
+
+def fetch_calendar(days: int = 7) -> dict:
+    now = now_kst()
+    start = now.strftime("%Y-%m-%d")
+    end = (now + timedelta(days=days)).strftime("%Y-%m-%d")
+    key = (start, days)
+    if _calendar_cache["key"] == key and time.time() - _calendar_cache["at"] < 30 * 60:
+        return _calendar_cache["data"]
+    events, errors = [], []
+    for label, fn in (("미국 경제지표", _fetch_us_economic), ("미국 실적", _fetch_us_earnings), ("공모주", _fetch_kr_ipo)):
+        try:
+            events += fn(start, end)
+        except Exception as e:
+            errors.append(f"{label}: {e}")
+            print(f"[calendar] {label} 실패: {e}")
+    events.sort(key=lambda e: (e["date"], e["time"] or "99:99", not e["major"]))
+    data = {"ok": True, "start": start, "end": end, "events": events, "errors": errors}
+    _calendar_cache.update({"at": time.time(), "key": key, "data": data})
+    return data
+
+
+@app.get("/api/calendar")
+def calendar_endpoint(days: int = 7):
+    """주요 일정 (오늘부터 days일) — 미국 경제지표·미국 대형주 실적·국내 공모청약"""
+    try:
+        return fetch_calendar(max(1, min(days, 21)))
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/calendar-debug")
+def calendar_debug():
+    now = now_kst()
+    start = now.strftime("%Y-%m-%d")
+    end = (now + timedelta(days=7)).strftime("%Y-%m-%d")
+    out = {}
+    for label, fn in (("us_macro", _fetch_us_economic), ("us_earnings", _fetch_us_earnings), ("kr_ipo", _fetch_kr_ipo)):
+        try:
+            rows = fn(start, end)
+            out[label] = {"count": len(rows), "sample": rows[:5]}
+        except Exception as e:
+            out[label] = {"error": str(e)}
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 📨 텔레그램 정기 브리핑
+# ──────────────────────────────────────────────────────────────────────────
+#   06:15  🌙 미국 증시 모닝 브리핑 (화~토 — 전날 미국장 마감 숫자)
+#   08:00  📋 장전 리포트 (어제 수급 한 줄 + 오늘 주요 일정 + 증권가 목표가 상향·하향·신규)
+#   14:00  🗓 주요 일정 (오늘 + 다가오는 7일)
+#   16:10  💰 오늘의 수급 요약 (코스피·코스닥 개인/외국인/기관 + 연속일수 + 기관 주도 주체 + 사모 TOP5)
+#   20:00  🔥 오늘의 테마 이슈 (등락률 상위 테마 + 테마별 주도주)
+# 보낸 기록은 Supabase telegram_sent_log에 남겨서, 서버가 재시작돼도 같은 알림을 두 번 안 보냄.
+# 수동 미리보기: /api/brief?kind=morning|targets|flow|theme  (&send=true 면 텔레그램으로도 보냄)
+# ══════════════════════════════════════════════════════════════════════════
+BRIEF_SCHEDULE = {
+    "morning": (6, 15),
+    "targets": (8, 0),  # 📋 장전 리포트 (목표가 + 오늘 일정 + 어제 수급)
+    "schedule": (14, 0),
+    "flow": (16, 10),
+    "theme": (20, 0),
+}
+
+
+def _brief_already_sent(kind: str, ref_date: str) -> bool:
+    try:
+        res = supabase.table("telegram_sent_log").select("kind").eq("kind", kind).eq("ref_date", ref_date).limit(1).execute()
+        return bool(res.data)
+    except Exception:
+        return False
+
+
+def _mark_brief_sent(kind: str, ref_date: str):
+    try:
+        supabase.table("telegram_sent_log").upsert({"kind": kind, "ref_date": ref_date}).execute()
+    except Exception as e:
+        print(f"[brief] 발송 기록 실패: {e}")
+
+
+def _fmt_eok(v: float, signed: bool = True) -> str:
+    """억원 → '+3조6,411억' 형태"""
+    sign = ("+" if v > 0 else "-" if v < 0 else "") if signed else ""
+    a = abs(v)
+    if a >= 10000:
+        jo = int(a // 10000)
+        rest = round(a - jo * 10000)
+        return f"{sign}{jo}조{rest:,}억" if rest else f"{sign}{jo}조"
+    return f"{sign}{a:,.0f}억"
+
+
+WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
+
+
+def _kr_date(ymd: str) -> str:
+    d = datetime.strptime(ymd[:10], "%Y-%m-%d")
+    return f"{d.year}.{d.month:02d}.{d.day:02d}.{WEEKDAY_KR[d.weekday()]}"
+
+
+# ── 🌙 미국 증시 모닝 브리핑 ──
+MORNING_SYMBOLS = [
+    ("다우", "^DJI", "p"),
+    ("S&P500", "^GSPC", "p"),
+    ("나스닥", "^IXIC", "p"),
+    ("러셀2000", "^RUT", "p"),
+    ("필라델피아 반도체", "^SOX", "p"),
+    ("VIX", "^VIX", ""),
+    ("미 10년물 금리", "^TNX", "%"),
+    ("달러인덱스", "DX-Y.NYB", ""),
+    ("WTI 유가", "CL=F", "$"),
+    ("금", "GC=F", "$"),
+    ("원/달러", "KRW=X", "원"),
+    ("비트코인", "BTC-USD", "$"),
+]
+
+
+def _yahoo_quote(symbol: str):
+    res = requests.get(
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{requests.utils.quote(symbol)}",
+        params={"range": "5d", "interval": "1d"},
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=8,
+    )
+    res.raise_for_status()
+    r = res.json()["chart"]["result"][0]
+    closes = [c for c in (r["indicators"]["quote"][0].get("close") or []) if c is not None]
+    stamps = r.get("timestamp") or []
+    if len(closes) < 2:
+        return None
+    last, prev = closes[-1], closes[-2]
+    last_day = datetime.fromtimestamp(stamps[len(closes) - 1], tz=timezone(timedelta(hours=-5))).strftime("%Y-%m-%d") if stamps else ""
+    return {"price": last, "pct": (last - prev) / prev * 100 if prev else 0.0, "date": last_day}
+
+
+def build_morning_brief():
+    rows, us_date = [], None
+    for label, sym, unit in MORNING_SYMBOLS:
+        try:
+            q = _yahoo_quote(sym)
+        except Exception as e:
+            print(f"[brief:morning] {sym} 실패: {e}")
+            q = None
+        if not q:
+            continue
+        if sym == "^GSPC":
+            us_date = q["date"]
+        arrow = "🔺" if q["pct"] > 0 else "🔻" if q["pct"] < 0 else "▫️"
+        price = q["price"]
+        if unit == "%":
+            val = f"{price:.3f}%"
+        elif unit == "원":
+            val = f"{price:,.2f}원"
+        elif unit == "$":
+            val = f"${price:,.2f}"
+        else:
+            val = f"{price:,.2f}" + ("p" if unit == "p" else "")
+        rows.append(f"{arrow} {label} {val} ({q['pct']:+.2f}%)")
+    if not rows:
+        return None, None
+    idx = [r for r in rows[:5]]
+    up = sum(1 for r in idx[:3] if r.startswith("🔺"))
+    mood = "3대 지수 모두 상승" if up == 3 else "3대 지수 모두 하락" if up == 0 else "3대 지수 혼조"
+    text = (
+        f"☀️ 미국 증시 모닝 브리핑 ({us_date or '-'} 미국장 마감)\n━━━━━━━━━━━━\n"
+        f"📌 {mood}\n\n" + "\n".join(rows[:5]) + "\n\n" + "\n".join(rows[5:])
+    )
+    return text, us_date
+
+
+# ── 🎯 증권가 목표가 ──
+def build_targets_brief():
+    items = []
+    for page in (1, 2, 3):
+        try:
+            res = requests.get(
+                "https://m.stock.naver.com/api/research/company",
+                headers=_naver_stock_headers(),
+                params={"page": page, "pageSize": 50},
+                timeout=8,
+            )
+            batch = res.json() if res.ok else []
+        except Exception:
+            batch = []
+        if not isinstance(batch, list) or not batch:
+            break
+        items += batch
+    if not items:
+        return None, None
+    latest = max(str(it.get("writeDate", ""))[:10] for it in items)
+    day_items = [it for it in items if str(it.get("writeDate", ""))[:10] == latest][:60]
+
+    def detail(it):
+        d = _naver_research_detail_json(it.get("researchId"))
+        return {**d, "name": it.get("itemName"), "broker": it.get("brokerName"), "title": it.get("title")}
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        rows = list(ex.map(detail, day_items))
+    ups, downs, news = [], [], []
+    for r in rows:
+        tp, prev = r.get("target_price"), r.get("prev_target_price")
+        if not tp:
+            continue
+        if prev and tp > prev:
+            ups.append(((tp / prev - 1) * 100, r))
+        elif prev and tp < prev:
+            downs.append(((tp / prev - 1) * 100, r))
+        else:
+            news.append(r)  # 직전 목표가가 없거나(신규) 같은(유지) 경우
+    ups.sort(key=lambda x: -x[0])
+
+    def line(r, pct=None):
+        tail = f" ({pct:+.0f}%)" if pct is not None else ""
+        prev = f"{r['prev_target_price']:,} → " if r.get("prev_target_price") else ""
+        price_now = r.get("price_at_write")
+        upside = f" · 상승여력 {((r['target_price'] / price_now) - 1) * 100:+.0f}%" if price_now else ""
+        return f"· {r['name']} · {r['broker']}\n   {prev}{r['target_price']:,}원{tail} {r.get('opinion') or ''}{upside}"
+
+    parts = [f"🎯 증권가 목표가 ({_kr_date(latest)} 리포트 {len(day_items)}건)\n━━━━━━━━━━━━"]
+    if ups:
+        parts.append("🔺 목표가 상향 TOP\n" + "\n".join(line(r, pct) for pct, r in ups[:10]))
+    if downs:
+        downs.sort(key=lambda x: x[0])
+        parts.append("🔻 목표가 하향\n" + "\n".join(line(r, pct) for pct, r in downs[:5]))
+    if news:
+        parts.append("🆕 신규·유지\n" + "\n".join(line(r) for r in news[:5]))
+    if len(parts) == 1:
+        parts.append("목표가가 있는 리포트가 없어요.")
+    return "\n\n".join(parts), latest
+
+
+# ── 💰 오늘의 수급 요약 ──
+INST_SUB = ["금융투자", "보험", "투신", "사모", "은행", "기타금융", "연기금"]
+
+
+def _streak(market: str, field: str, today_val: float) -> int:
+    try:
+        rows = (
+            supabase.table("market_flow_trend").select(f"trade_date,{field}").eq("market", market)
+            .order("trade_date", desc=True).limit(30).execute().data
+        )
+    except Exception:
+        return 0
+    sign = 1 if today_val > 0 else -1
+    n = 0
+    for r in rows:
+        v = float(r.get(field) or 0)
+        if v * sign > 0:
+            n += 1
+        else:
+            break
+    return n
+
+
+def build_flow_brief():
+    ltd = _latest_trading_day()
+    day = f"{ltd[:4]}-{ltd[4:6]}-{ltd[6:8]}"
+    sync_market_flow(days=5)  # 오늘 값 확정치로 한 번 더 갱신
+    lines = [f"💰 오늘의 수급 ({_kr_date(day)})\n━━━━━━━━━━━━"]
+    summary = []
+    for market, label in (("KOSPI", "코스피"), ("KOSDAQ", "코스닥")):
+        try:
+            row = (
+                supabase.table("market_flow_trend").select("*").eq("market", market).eq("trade_date", day)
+                .limit(1).execute().data
+            )
+        except Exception:
+            row = []
+        if not row:
+            lines.append(f"▪ {label}: 오늘 데이터 아직 없음")
+            continue
+        r = row[0]
+        lines.append(f"▪ {label}")
+        for nm, field in (("개인", "individual"), ("외국인", "foreign_amt"), ("기관", "institution")):
+            v = float(r.get(field) or 0)
+            st = _streak(market, field, v)
+            st_txt = f" ⟨{st}거래일 연속 순{'매수' if v > 0 else '매도'}⟩" if st >= 2 else ""
+            lines.append(f"  {nm} {_fmt_eok(v)}{st_txt}")
+            if nm == "외국인":
+                summary.append(f"{label} 순{'매수' if v > 0 else '매도'}")
+        # 기관 안에서 누가 주도했는지
+        try:
+            df = _market_flow_df(ltd, ltd, market)
+            if df is not None and not df.empty:
+                last = df.iloc[-1]
+                inst_total = sum(_pick(last, c) for c in INST_SUB)
+                if inst_total:
+                    same = [(c, _pick(last, c)) for c in INST_SUB if _pick(last, c) * inst_total > 0]
+                    if same:
+                        lead, lv = max(same, key=lambda x: abs(x[1]))
+                        share = min(100, abs(lv) / abs(inst_total) * 100)
+                        lines.append(f"  └ 기관 {'매수' if inst_total > 0 else '매도'}는 {lead}가 주도 ({share:.0f}%)")
+        except Exception as e:
+            print(f"[brief:flow] 기관 세부 실패: {e}")
+    if summary:
+        lines.insert(1, "외국인 · " + " / ".join(summary) + "\n")
+    # 사모 TOP5 (최근 2거래일)
+    try:
+        dates = (
+            supabase.table("market_flow_trend").select("trade_date").eq("market", "ALL")
+            .order("trade_date", desc=True).limit(2).execute().data
+        )
+        from_ymd = str(dates[-1]["trade_date"]).replace("-", "") if dates else ltd
+        df = _krx_df(stock.get_market_net_purchases_of_equities, from_ymd, ltd, "ALL", "사모")
+        if df is not None and not df.empty:
+            col = "순매수거래대금" if "순매수거래대금" in df.columns else df.columns[-1]
+            top = df.sort_values(col, ascending=False).head(5)
+            lines.append("\n👽 사모 순매수 TOP5 (2거래일)")
+            for i, (code, rr) in enumerate(top.iterrows(), start=1):
+                nm = rr.get("종목명") if isinstance(rr.get("종목명"), str) else _safe_ticker_name(code)
+                lines.append(f"{i} {nm} {_fmt_eok(float(rr[col]) / 1e8, signed=False)}")
+    except Exception as e:
+        print(f"[brief:flow] 사모 TOP5 실패: {e}")
+    return "\n".join(lines), day
+
+
+# ── 🔥 오늘의 테마 이슈 ──
+def _to_eok_from_naver(v: float) -> float:
+    # 네이버 거래대금 원값 단위가 확실치 않아(원/백만원) 크기로 판단
+    return v / 1e8 if v > 1e9 else v / 100
+
+
+def build_theme_brief(top_n: int = 5):
+    themes = fetch_naver_theme_list(limit=25)
+    themes = sorted(themes, key=lambda t: t["change_pct"], reverse=True)[:top_n]
+    now = now_kst()
+    parts = [f"🔥 오늘의 테마 이슈 {now.month}/{now.day}({WEEKDAY_KR[now.weekday()]})\n━━━━━━━━━━━━"]
+    for t in themes:
+        try:
+            stocks, _ = fetch_naver_theme_detail(t["theme_no"], limit=30)
+        except Exception:
+            stocks = []
+        stocks = sorted(stocks, key=lambda x: x["change_pct"], reverse=True)[:4]
+        total = sum(_to_eok_from_naver(x["trading_value"]) for x in stocks)
+        top_val = max((x["trading_value"] for x in stocks), default=0)
+        lines = [f"📌 {t['theme_name']} {t['change_pct']:+.2f}% · 주도주 거래대금 {_fmt_eok(total, signed=False)}"]
+        for x in stocks:
+            tags = (" 👑" if x["trading_value"] == top_val and top_val else "") + (" 🔥" if x["change_pct"] >= 29 else "")
+            lines.append(f"{x['stock_name']} {x['change_pct']:+.2f}% · {_fmt_eok(_to_eok_from_naver(x['trading_value']), signed=False)}{tags}")
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts), now.strftime("%Y-%m-%d")
+
+
+def _event_line(e: dict) -> str:
+    star = " ⚡" if e.get("major") else ""
+    t = f" ({e['time']})" if e.get("time") else ""
+    line = f"· {e['title']}{star}{t}"
+    if e.get("note") and e.get("kind") == "us_macro":
+        line += f"\n  ↳ {e['note']}"
+    return line
+
+
+def _date_head(ymd: str) -> str:
+    d = datetime.strptime(ymd, "%Y-%m-%d")
+    return f"{d.month}/{d.day}({WEEKDAY_KR[d.weekday()]})"
+
+
+def build_schedule_brief(max_per_day: int = 6):
+    cal = fetch_calendar(7)
+    today = cal["start"]
+    by_day = {}
+    for e in cal["events"]:
+        by_day.setdefault(e["date"], []).append(e)
+    parts = [f"🗓 주요 일정 ({_kr_date(today)})\n━━━━━━━━━━━━"]
+    todays = by_day.get(today, [])
+    parts.append("📅 오늘\n" + ("\n".join(_event_line(e) for e in todays) if todays else "· 큰 일정 없음"))
+    up = []
+    for day in sorted(d for d in by_day if d > today):
+        evs = sorted(by_day[day], key=lambda e: (not e["major"], e["time"] or "99:99"))
+        lines = [_date_head(day)] + [_event_line(e) for e in evs[:max_per_day]]
+        if len(evs) > max_per_day:
+            lines.append(f"외 {len(evs) - max_per_day}건")
+        up.append("\n".join(lines))
+    if up:
+        parts.append("🗓 다가오는 일정\n\n" + "\n\n".join(up))
+    if cal.get("errors"):
+        parts.append("※ 일부 일정 출처를 못 불러왔어요: " + ", ".join(e.split(":")[0] for e in cal["errors"]))
+    return "\n\n".join(parts), today
+
+
+def build_premarket_brief():
+    """📋 장전 리포트 = 어제 수급 한 줄 + 오늘 주요 일정 + 증권가 목표가"""
+    now = now_kst()
+    parts = [f"📋 장전 리포트 ({_kr_date(now.strftime('%Y-%m-%d'))})\n━━━━━━━━━━━━"]
+    # 💰 어제 수급 한 줄
+    try:
+        rows = (
+            supabase.table("market_flow_trend").select("*").eq("market", "KOSPI")
+            .order("trade_date", desc=True).limit(1).execute().data
+        )
+        if rows:
+            r = rows[0]
+            f = float(r.get("foreign_amt") or 0)
+            st = _streak("KOSPI", "foreign_amt", f)
+            parts.append(
+                f"💰 전일({_date_head(str(r['trade_date'])[:10])}) 코스피 수급\n"
+                f"외국인 {_fmt_eok(f)}" + (f" ⟨{st}거래일 연속 순{'매수' if f > 0 else '매도'}⟩" if st >= 2 else "")
+                + f" · 기관 {_fmt_eok(float(r.get('institution') or 0))} · 개인 {_fmt_eok(float(r.get('individual') or 0))}"
+            )
+    except Exception as e:
+        print(f"[brief:premarket] 수급 실패: {e}")
+    # 🗓 오늘 일정
+    try:
+        cal = fetch_calendar(1)
+        todays = [e for e in cal["events"] if e["date"] == cal["start"]]
+        parts.append("🗓 오늘 주요 일정\n" + ("\n".join(_event_line(e).split("\n")[0] for e in todays[:8]) if todays else "· 큰 일정 없음"))
+    except Exception as e:
+        print(f"[brief:premarket] 일정 실패: {e}")
+    # 🎯 증권가 목표가
+    text, ref = build_targets_brief()
+    if text:
+        parts.append(text)
+    return "\n\n".join(parts), ref
+
+
+BRIEF_BUILDERS = {
+    "morning": build_morning_brief,
+    "targets": build_premarket_brief,
+    "schedule": build_schedule_brief,
+    "flow": build_flow_brief,
+    "theme": build_theme_brief,
+}
+
+
+def _run_telegram_briefs():
+    """daily_jobs_worker가 5분마다 부름 — 정해진 시각이 지났고 아직 안 보낸 브리핑만 보냄"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    now = now_kst()
+    wd = now.weekday()  # 0=월 ... 6=일
+    for kind, (h, m) in BRIEF_SCHEDULE.items():
+        if (now.hour, now.minute) < (h, m) or now.hour >= 23:
+            continue
+        if kind == "morning" and wd not in (1, 2, 3, 4, 5):  # 화~토 아침 = 미국 월~금장
+            continue
+        if kind != "morning" and wd >= 5:
+            continue
+        if kind in ("flow", "theme"):  # 일정(14:00)은 장중이라 KRX 오늘 확정 전이어도 평일이면 보냄
+            try:
+                if _latest_trading_day() != now.strftime("%Y%m%d"):
+                    continue  # 오늘 휴장
+            except Exception:
+                continue
+        try:
+            # 기준 날짜를 먼저 정해서 이미 보냈는지 확인 (모닝·목표가는 내용 날짜, 나머지는 오늘)
+            if kind in ("flow", "theme", "schedule") and _brief_already_sent(kind, now.strftime("%Y-%m-%d")):
+                continue
+            text, ref = BRIEF_BUILDERS[kind]()
+            if not text or not ref or _brief_already_sent(kind, ref):
+                continue
+            if send_telegram(text):
+                _mark_brief_sent(kind, ref)
+                print(f"[brief] {kind} 발송 완료 ({ref})")
+        except Exception as e:
+            print(f"[brief] {kind} 만들기 실패: {e}")
+
+
+@app.get("/api/brief")
+def brief_preview_endpoint(kind: str = "flow", send: bool = False):
+    """브리핑 미리보기 — kind: morning/targets(장전 리포트)/schedule/flow/theme. send=true면 텔레그램으로도 보냄(기록 안 남김)"""
+    if kind not in BRIEF_BUILDERS:
+        return {"ok": False, "error": f"kind는 {'/'.join(BRIEF_BUILDERS)} 중 하나예요."}
+    try:
+        text, ref = BRIEF_BUILDERS[kind]()
+        sent = send_telegram(text) if (send and text) else False
+        return {"ok": True, "kind": kind, "ref_date": ref, "sent": sent, "text": text}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 🎯 증권가 목표가 도달 알림
+# ──────────────────────────────────────────────────────────────────────────
+# 관심종목(watchlist)의 "정규장 종가"가 증권사 목표가에 다가가거나 넘으면 텔레그램으로 알림.
+#   · 근접: 최근 3개월 평균 목표가의 95% 이상
+#   · 도달: 평균 목표가 이상
+#   · 돌파: 증권사 중 가장 높은 목표가 이상
+# 정규장 마감(15:30) 뒤 15:40에 하루 1번 종가로 확인 (장중 흔들림에 알림이 오락가락하지 않게 — 2026-10-10 요청).
+# 같은 종목·같은 단계·같은 목표가로는 한 번만 보냄
+# (증권사가 목표가를 올리면 새 목표가 기준으로 다시 알림).
+# 알림 전용 봇을 따로 쓰고 싶으면 Render 환경변수 TARGET_ALERT_BOT_TOKEN / TARGET_ALERT_CHAT_ID
+# (없으면 기본 봇 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID로 보냄)
+# ══════════════════════════════════════════════════════════════════════════
+TARGET_ALERT_BOT_TOKEN = os.environ.get("TARGET_ALERT_BOT_TOKEN")
+TARGET_ALERT_CHAT_ID = os.environ.get("TARGET_ALERT_CHAT_ID")
+
+
+def _kis_current_price(code: str):
+    try:
+        data = kis_get(
+            "/uapi/domestic-stock/v1/quotations/inquire-price",
+            "FHKST01010100",
+            {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code},
+        )
+        out = data.get("output") or {}
+        p = float(out.get("stck_prpr") or 0)
+        return p if p > 0 else None
+    except Exception as e:
+        print(f"[target_reach] {code} 현재가 조회 실패: {e}")
+        return None
+
+
+def evaluate_target_reach(code: str, name: str) -> dict:
+    rep_ = fetch_stock_reports(code)
+    cutoff = (now_kst() - timedelta(days=92)).strftime("%Y-%m-%d")
+    recent = [r for r in rep_.get("items", []) if r.get("target_price") and (r.get("date") or "") >= cutoff]
+    if not recent:
+        return {"code": code, "name": name, "status": "no_target"}
+    tps = [r["target_price"] for r in recent]
+    avg = round(sum(tps) / len(tps))
+    top = max(tps)
+    top_broker = next((r["broker"] for r in recent if r["target_price"] == top), "")
+    price = _kis_current_price(code)
+    if not price:
+        return {"code": code, "name": name, "status": "no_price", "avg": avg, "top": top}
+    level = None
+    if price >= top:
+        level = "break_top"
+    elif price >= avg:
+        level = "reach_avg"
+    elif price >= avg * 0.95:
+        level = "near_avg"
+    return {
+        "code": code, "name": name, "price": price, "avg": avg, "top": top, "top_broker": top_broker,
+        "count": len(recent), "level": level, "pct_of_avg": price / avg * 100,
+    }
+
+
+def _target_reach_message(e: dict) -> str:
+    head = {
+        "near_avg": "🟡 목표가 근접",
+        "reach_avg": "🎯 평균 목표가 도달",
+        "break_top": "🚀 최고 목표가 돌파",
+    }[e["level"]] + " (종가 기준)"
+    return (
+        f"{head} — {e['name']} ({e['code']})\n"
+        f"종가 {e['price']:,.0f}원 · 평균 목표가의 {e['pct_of_avg']:.1f}%\n"
+        f"· 3개월 평균 목표가 {e['avg']:,}원 (리포트 {e['count']}건)\n"
+        f"· 최고 목표가 {e['top']:,}원 ({e['top_broker']})"
+    )
+
+
+def _check_target_reach():
+    token = TARGET_ALERT_BOT_TOKEN or TELEGRAM_BOT_TOKEN
+    chat = TARGET_ALERT_CHAT_ID or TELEGRAM_CHAT_ID
+    if not token or not chat:
+        return
+    now = now_kst()
+    today = now.strftime("%Y-%m-%d")
+    # 평일 15:40~18:00 사이에 하루 1번 (마감 직후 KRX 확정이 늦으면 5분마다 다시 시도, 18시 넘으면 그날은 휴장으로 봄)
+    if now.weekday() >= 5 or not ((15, 40) <= (now.hour, now.minute) < (18, 0)):
+        return
+    if _brief_already_sent("reach_run", today):
+        return
+    try:
+        if _latest_trading_day() != now.strftime("%Y%m%d"):
+            return  # 아직 오늘 종가 확정 전이거나 휴장일
+    except Exception:
+        return
+    try:
+        wl = supabase.table("watchlist").select("code,name").execute().data or []
+    except Exception as e:
+        print(f"[target_reach] 관심종목 조회 실패: {e}")
+        return
+    order = {"near_avg": 1, "reach_avg": 2, "break_top": 3}
+    for w in wl:
+        code = w.get("code")
+        if not code:
+            continue
+        try:
+            e = evaluate_target_reach(code, w.get("name") or code)
+        except Exception as ex:
+            print(f"[target_reach] {code} 확인 실패: {ex}")
+            continue
+        if not e.get("level"):
+            continue
+        # 같은 목표가 기준으로 이미 같은(또는 더 높은) 단계를 보냈으면 건너뜀
+        ref = f"{code}:{e['avg']}:{e['top']}"
+        try:
+            sent = (
+                supabase.table("telegram_sent_log").select("kind").like("kind", "reach_%").eq("ref_date", ref).execute().data
+            ) or []
+        except Exception:
+            sent = []
+        best_sent = max((order.get(x["kind"].replace("reach_", ""), 0) for x in sent), default=0)
+        if order[e["level"]] <= best_sent:
+            continue
+        if send_telegram(_target_reach_message(e), token=token, chat_id=chat):
+            _mark_brief_sent(f"reach_{e['level']}", ref)
+        time.sleep(0.2)
+    _mark_brief_sent("reach_run", today)
+
+
+@app.get("/api/target-reach")
+def target_reach_endpoint(code: str = "", send: bool = False):
+    """목표가 도달 확인 — code를 주면 그 종목만, 비우면 관심종목 전체. send=true면 해당되는 알림을 지금 보냄(기록 안 남김)"""
+    try:
+        if code:
+            targets = [{"code": code.strip().upper(), "name": _safe_ticker_name(code.strip().upper())}]
+        else:
+            targets = supabase.table("watchlist").select("code,name").execute().data or []
+        results = [evaluate_target_reach(t["code"], t.get("name") or t["code"]) for t in targets]
+        if send:
+            for e in results:
+                if e.get("level"):
+                    send_telegram(
+                        _target_reach_message(e),
+                        token=TARGET_ALERT_BOT_TOKEN or TELEGRAM_BOT_TOKEN,
+                        chat_id=TARGET_ALERT_CHAT_ID or TELEGRAM_CHAT_ID,
+                    )
+        return {"ok": True, "results": results}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
