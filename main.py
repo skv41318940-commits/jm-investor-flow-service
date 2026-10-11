@@ -4709,7 +4709,9 @@ def _naver_research_detail_json(research_id) -> dict:
     if not isinstance(c, dict):
         c = {}
     out["target_price"] = to_int(c.get("goalPrice")) or to_int(_find_in_json(data, r"^(goalPrice|targetPrice)$"))
-    out["prev_target_price"] = to_int(c.get("prevGoalPrice"))
+    # ⚠️ prevGoalPrice는 "직전 목표가"가 아니라 작성일 주가와 같은 값이 들어와서(2026-10-11 확인) 쓰지 않음.
+    # 직전 목표가는 같은 증권사의 이전 리포트에서 직접 찾음.
+    out["prev_target_price"] = None
     out["price_at_write"] = to_int(c.get("priceAtWriteDate"))
     op = c.get("opinion") or _find_in_json(data, r"^(opinion|investOpinion)$")
     out["opinion"] = str(op).strip() if op else None
@@ -4761,6 +4763,11 @@ def fetch_stock_reports(code: str, limit: int = 40) -> dict:
                     if v is not None and not r.get(k):
                         r[k] = v
 
+    for i, r in enumerate(rows):
+        r["prev_target_price"] = next(
+            (o["target_price"] for o in rows[i + 1:] if o.get("broker") == r.get("broker") and o.get("target_price")),
+            None,
+        )
     result = {"ok": True, "code": code, "source": source, "items": rows}
     if not rows:
         result["note"] = "최근 리포트가 없어요. 증권사가 분석하지 않는 소형주는 리포트가 아예 없는 경우가 많아요."
@@ -5642,6 +5649,14 @@ def build_targets_brief():
 
     def detail(it):
         d = _naver_research_detail_json(it.get("researchId"))
+        d["prev_target_price"] = None
+        try:  # 같은 증권사가 이 종목에 낸 직전 리포트의 목표가
+            hist = _naver_research_json(str(it.get("itemCode") or ""))
+            older = [h for h in hist if h.get("broker") == it.get("brokerName") and str(h.get("research_id")) != str(it.get("researchId")) and (h.get("date") or "") <= str(it.get("writeDate"))[:10]]
+            if older:
+                d["prev_target_price"] = _naver_research_detail_json(older[0]["research_id"]).get("target_price")
+        except Exception:
+            pass
         return {**d, "name": it.get("itemName"), "broker": it.get("brokerName"), "title": it.get("title")}
 
     with ThreadPoolExecutor(max_workers=6) as ex:
@@ -5739,7 +5754,9 @@ def build_flow_brief():
                     if same:
                         lead, lv = max(same, key=lambda x: abs(x[1]))
                         share = min(100, abs(lv) / abs(inst_total) * 100)
-                        lines.append(f"  └ 기관 {'매수' if inst_total > 0 else '매도'}는 {lead}가 주도 ({share:.0f}%)")
+                        last_ch = lead[-1]
+                        josa = "이" if "가" <= last_ch <= "힣" and (ord(last_ch) - 0xAC00) % 28 else "가"
+                        lines.append(f"  └ 기관 {'매수' if inst_total > 0 else '매도'}는 {lead}{josa} 주도 ({share:.0f}%)")
         except Exception as e:
             print(f"[brief:flow] 기관 세부 실패: {e}")
     if summary:
@@ -5765,9 +5782,17 @@ def build_flow_brief():
 
 
 # ── 🔥 오늘의 테마 이슈 ──
-def _to_eok_from_naver(v: float) -> float:
-    # 네이버 거래대금 원값 단위가 확실치 않아(원/백만원) 크기로 판단
-    return v / 1e8 if v > 1e9 else v / 100
+def _to_eok_from_naver(v: float, price: float = 0, volume: float = 0) -> float:
+    """네이버 거래대금 단위가 종목마다 원/백만원으로 섞여 와서, 주가×거래량과 더 가까운 쪽으로 판단"""
+    import math
+    est = price * volume
+    if v <= 0:
+        return 0.0
+    if est > 0:
+        won = v if abs(math.log(v / est)) <= abs(math.log(v * 1e6 / est)) else v * 1e6
+    else:
+        won = v * 1e6 if v < 1e7 else v
+    return won / 1e8
 
 
 def build_theme_brief(top_n: int = 5):
@@ -5781,12 +5806,14 @@ def build_theme_brief(top_n: int = 5):
         except Exception:
             stocks = []
         stocks = sorted(stocks, key=lambda x: x["change_pct"], reverse=True)[:4]
-        total = sum(_to_eok_from_naver(x["trading_value"]) for x in stocks)
-        top_val = max((x["trading_value"] for x in stocks), default=0)
+        for x in stocks:
+            x["eok"] = _to_eok_from_naver(x["trading_value"], x.get("price", 0), x.get("volume", 0))
+        total = sum(x["eok"] for x in stocks)
+        top_val = max((x["eok"] for x in stocks), default=0)
         lines = [f"📌 {t['theme_name']} {t['change_pct']:+.2f}% · 주도주 거래대금 {_fmt_eok(total, signed=False)}"]
         for x in stocks:
-            tags = (" 👑" if x["trading_value"] == top_val and top_val else "") + (" 🔥" if x["change_pct"] >= 29 else "")
-            lines.append(f"{x['stock_name']} {x['change_pct']:+.2f}% · {_fmt_eok(_to_eok_from_naver(x['trading_value']), signed=False)}{tags}")
+            tags = (" 👑" if x["eok"] == top_val and top_val else "") + (" 🔥" if x["change_pct"] >= 29 else "")
+            lines.append(f"{x['stock_name']} {x['change_pct']:+.2f}% · {_fmt_eok(x['eok'], signed=False)}{tags}")
         parts.append("\n".join(lines))
     return "\n\n".join(parts), now.strftime("%Y-%m-%d")
 
@@ -5824,7 +5851,7 @@ def build_schedule_brief(max_per_day: int = 6):
     if up:
         parts.append("🗓 다가오는 일정\n\n" + "\n\n".join(up))
     if cal.get("errors"):
-        parts.append("※ 일부 일정 출처를 못 불러왔어요: " + ", ".join(e.split(":")[0] for e in cal["errors"]))
+        parts.append("※ 일부 일정 출처를 못 불러왔어요: " + " / ".join(e[:120] for e in cal["errors"]))
     return "\n\n".join(parts), today
 
 
