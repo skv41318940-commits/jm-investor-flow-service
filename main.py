@@ -5047,7 +5047,7 @@ def build_health_report() -> dict:
     nx = _latest_value("nxt_daily_ranking", "scan_date")
     add("NXT 스캔", nx, bool(nx and nx[:10] >= expected), "pykrx 응답 확인")
     fd = _latest_value("stock_fundamentals", "synced_at")
-    add("재무제표", fd[:10] if fd else None, bool(fd and fd[:10] == today), "16시 이후 자동 동기화")
+    add("재무제표", fd[:10] if fd else None, bool(fd and fd[:10] >= expected), "16시 이후 자동 동기화")
     try:
         cnt = (
             supabase.table("tick_minute_flow").select("stock_code", count="exact").eq("trade_date", today).limit(1).execute().count
