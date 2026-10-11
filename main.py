@@ -5331,25 +5331,55 @@ def _us_to_kst(date_str: str, hhmm: str) -> datetime:
     return base.replace(tzinfo=timezone(timedelta(hours=offset))).astimezone(KST)
 
 
+_us_macro_cache = {"at": 0.0, "rows": None}  # FRED 발표일 원본 (6시간 보관, 실패하면 마지막 성공값 사용)
+
+
+def _fred_release_dates(start: str, end: str) -> list:
+    """
+    FRED 발표 일정 원본. ⚠️ FRED 서버가 가끔 10초 넘게 걸려서 타임아웃이 났음(2026-10-11) →
+    25초까지 기다리고 2번 더 시도, 그래도 실패하면 마지막으로 성공했던 값을 씀.
+    발표 일정은 자주 안 바뀌니 성공하면 6시간 보관.
+    """
+    c = _us_macro_cache
+    if c["rows"] is not None and time.time() - c["at"] < 6 * 3600 and c.get("start") <= start and c.get("end") >= end:
+        return c["rows"]
+    wide_end = (datetime.strptime(end, "%Y-%m-%d") + timedelta(days=14)).strftime("%Y-%m-%d")  # 넉넉히 받아둠
+    last_err = None
+    for attempt in range(3):
+        try:
+            res = requests.get(
+                "https://api.stlouisfed.org/fred/releases/dates",
+                params={
+                    "api_key": FRED_API_KEY,
+                    "file_type": "json",
+                    "realtime_start": start,
+                    "realtime_end": wide_end,
+                    "include_release_dates_with_no_data": "true",
+                    "sort_order": "asc",
+                    "limit": 1000,
+                },
+                timeout=25,
+            )
+            res.raise_for_status()
+            rows = res.json().get("release_dates", [])
+            c.update({"at": time.time(), "rows": rows, "start": start, "end": wide_end})
+            return rows
+        except Exception as e:
+            last_err = e
+            time.sleep(2 * (attempt + 1))
+    if c["rows"] is not None:
+        print(f"[calendar] FRED 실패, 마지막 성공값 사용: {last_err}")
+        return c["rows"]
+    raise last_err
+
+
 def _fetch_us_economic(start: str, end: str) -> list:
     if not FRED_API_KEY:
         raise RuntimeError("FRED_API_KEY 미설정")
-    res = requests.get(
-        "https://api.stlouisfed.org/fred/releases/dates",
-        params={
-            "api_key": FRED_API_KEY,
-            "file_type": "json",
-            "realtime_start": start,
-            "realtime_end": end,
-            "include_release_dates_with_no_data": "true",
-            "sort_order": "asc",
-            "limit": 1000,
-        },
-        timeout=10,
-    )
-    res.raise_for_status()
     out, seen = [], set()
-    for r in res.json().get("release_dates", []):
+    for r in _fred_release_dates(start, end):
+        if not (start <= (r.get("date") or "") <= end):
+            continue
         name = r.get("release_name") or ""
         for key, kr, et, major, why in US_RELEASES:
             if key.lower() in name.lower():
@@ -5473,7 +5503,8 @@ def fetch_calendar(days: int = 7) -> dict:
             print(f"[calendar] {label} 실패: {e}")
     events.sort(key=lambda e: (e["date"], e["time"] or "99:99", not e["major"]))
     data = {"ok": True, "start": start, "end": end, "events": events, "errors": errors}
-    _calendar_cache.update({"at": time.time(), "key": key, "data": data})
+    # 실패한 출처가 있으면 5분만 기억 → 다음 요청 때 금방 다시 시도
+    _calendar_cache.update({"at": time.time() - (25 * 60 if errors else 0), "key": key, "data": data})
     return data
 
 
