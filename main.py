@@ -5314,7 +5314,13 @@ US_RELEASES = [
     ("Industrial Production", "산업생산", "09:15", False, "제조업 경기"),
     ("Existing Home Sales", "기존주택판매", "10:00", False, "부동산 경기·금리 영향"),
     ("Surveys of Consumers", "미시간대 소비자심리", "10:00", False, "소비 심리"),
-    ("FOMC Press Release", "FOMC 금리 결정", "14:00", True, "기준금리 결정 — 시장 전체에 큰 영향"),
+]
+
+# FOMC 금리 결정일 (회의 둘째 날, 미 동부 14:00 발표) — FRED의 "FOMC Press Release"는 매일 날짜가 잡혀서
+# 못 씀(2026-10-11 매일 FOMC로 뜨는 오류 확인). 연준 공식 일정표 기준으로 직접 적어둠 → ⚠️ 매년 갱신 필요
+FOMC_DECISION_DATES = [
+    "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
+    "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09",
 ]
 
 
@@ -5377,9 +5383,34 @@ def _fetch_us_economic(start: str, end: str) -> list:
     if not FRED_API_KEY:
         raise RuntimeError("FRED_API_KEY 미설정")
     out, seen = [], set()
-    for r in _fred_release_dates(start, end):
-        if not (start <= (r.get("date") or "") <= end):
+    rows = [r for r in _fred_release_dates(start, end) if start <= (r.get("date") or "") <= end]
+    # 매일 날짜가 잡히는 발표(데이터 없는 날 포함)는 실제 발표일이 아니라서 걸러냄:
+    # 같은 지표가 기간 안에 3번 넘게 나오면 버리고, 주간 실업수당은 목요일만 남김
+    from collections import Counter
+    cnt = Counter()
+    for r in rows:
+        for key, *_ in US_RELEASES:
+            if key.lower() in (r.get("release_name") or "").lower():
+                cnt[key] += 1
+                break
+    filtered = []
+    for r in rows:
+        name = (r.get("release_name") or "").lower()
+        key = next((k for k, *_ in US_RELEASES if k.lower() in name), None)
+        if not key:
             continue
+        if key == "Unemployment Insurance Weekly Claims":
+            if datetime.strptime(r["date"], "%Y-%m-%d").weekday() != 3:
+                continue
+        elif cnt[key] > 2:
+            continue
+        filtered.append(r)
+    for d in FOMC_DECISION_DATES:
+        if start <= d <= end:
+            kst = _us_to_kst(d, "14:00")
+            out.append({"date": kst.strftime("%Y-%m-%d"), "time": kst.strftime("%H:%M"), "title": "美) FOMC 금리 결정",
+                        "major": True, "note": "기준금리 결정 — 시장 전체에 큰 영향", "kind": "us_macro"})
+    for r in filtered:
         name = r.get("release_name") or ""
         for key, kr, et, major, why in US_RELEASES:
             if key.lower() in name.lower():
