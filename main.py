@@ -5518,6 +5518,49 @@ def _fetch_kr_ipo(start: str, end: str) -> list:
     return out
 
 
+# 🇰🇷 국내 일정 — 한국은행 금통위(연 8회, ⚠️ 매년 갱신), 옵션만기일·동시만기일(매월 둘째 목요일),
+# 수출입 동향(매월 1일 산업부, 11일·21일 관세청 잠정)
+BOK_MPC_DATES = [
+    "2026-01-15", "2026-02-26", "2026-04-10", "2026-05-28",
+    "2026-07-16", "2026-08-27", "2026-10-22", "2026-11-26",
+]
+
+
+def _second_thursday(y: int, m: int) -> datetime:
+    d = datetime(y, m, 1)
+    first_thu = d + timedelta(days=(3 - d.weekday()) % 7)
+    return first_thu + timedelta(days=7)
+
+
+def _fetch_kr_schedule(start: str, end: str) -> list:
+    out = []
+    for d in BOK_MPC_DATES:
+        if start <= d <= end:
+            out.append({"date": d, "time": "10:00", "title": "韓) 한국은행 금통위 기준금리 결정", "major": True,
+                        "note": "기준금리·환율·은행주에 영향 (총재 기자간담회 오전 11시경)", "kind": "kr_macro"})
+    s_dt = datetime.strptime(start, "%Y-%m-%d")
+    e_dt = datetime.strptime(end, "%Y-%m-%d")
+    y, m = s_dt.year, s_dt.month
+    while datetime(y, m, 1) <= e_dt:
+        thu = _second_thursday(y, m).strftime("%Y-%m-%d")
+        if start <= thu <= end:
+            quad = m in (3, 6, 9, 12)
+            out.append({"date": thu, "time": None,
+                        "title": "韓) 선물·옵션 동시만기일" if quad else "韓) 옵션만기일",
+                        "major": quad, "note": "장 마감 무렵 프로그램 매물·변동성 주의", "kind": "kr_macro"})
+        for day, title, t in ((1, "韓) 월간 수출입 동향 (산업부)", "09:00"),
+                              (11, "韓) 1~10일 수출 잠정치 (관세청)", "09:00"),
+                              (21, "韓) 1~20일 수출 잠정치 (관세청)", "09:00")):
+            ds = f"{y}-{m:02d}-{day:02d}"
+            if start <= ds <= end:
+                out.append({"date": ds, "time": t, "title": title, "major": day == 1,
+                            "note": "반도체 등 수출 흐름 확인", "kind": "kr_macro"})
+        m += 1
+        if m > 12:
+            y, m = y + 1, 1
+    return out
+
+
 def fetch_calendar(days: int = 7) -> dict:
     now = now_kst()
     start = now.strftime("%Y-%m-%d")
@@ -5526,7 +5569,12 @@ def fetch_calendar(days: int = 7) -> dict:
     if _calendar_cache["key"] == key and time.time() - _calendar_cache["at"] < 30 * 60:
         return _calendar_cache["data"]
     events, errors = [], []
-    for label, fn in (("미국 경제지표", _fetch_us_economic), ("미국 실적", _fetch_us_earnings), ("공모주", _fetch_kr_ipo)):
+    for label, fn in (
+        ("국내 일정", _fetch_kr_schedule),
+        ("미국 경제지표", _fetch_us_economic),
+        ("미국 실적", _fetch_us_earnings),
+        ("공모주", _fetch_kr_ipo),
+    ):
         try:
             events += fn(start, end)
         except Exception as e:
@@ -5577,6 +5625,7 @@ def calendar_debug():
 BRIEF_SCHEDULE = {
     "morning": (6, 15),
     "targets": (8, 0),  # 📋 장전 리포트 (목표가 + 오늘 일정 + 어제 수급)
+    "rally": (10, 0),  # 🚀 아침 상승 랭킹 (09:00~10:00)
     "schedule": (14, 0),
     "flow": (16, 10),
     "theme": (20, 0),
@@ -5884,7 +5933,7 @@ def _event_line(e: dict) -> str:
     star = " ⚡" if e.get("major") else ""
     t = f" ({e['time']})" if e.get("time") else ""
     line = f"· {e['title']}{star}{t}"
-    if e.get("note") and e.get("kind") == "us_macro":
+    if e.get("note") and e.get("kind") in ("us_macro", "kr_macro"):
         line += f"\n  ↳ {e['note']}"
     return line
 
@@ -5952,7 +6001,115 @@ def build_premarket_brief():
     return "\n\n".join(parts), ref
 
 
+# ── 🚀 아침 상승 랭킹 (09:00~10:00) ──
+# 거래대금 상위·상승률 상위에서 후보를 모은 뒤, "시가 대비 상승률"로 다시 줄 세움(갭상승 말고 장 시작 후
+# 실제로 끌어올린 종목). 상위 10개는 09:00부터의 분봉으로 근사 세력평단·1시간 고점을 계산해서
+# 지금 가격이 평단·고점 대비 어디쯤인지(눌림목 여지) 같이 보여줌.
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://jm-tracker.vercel.app")
+_ETF_NAME_RE = re.compile(r"KODEX|TIGER|KBSTAR|RISE|ACE|SOL|HANARO|ARIRANG|KOSEF|PLUS|KIWOOM|TIMEFOLIO|ETN|레버리지|인버스|선물|스팩")
+
+
+def _kis_quote(code: str) -> dict:
+    data = kis_get(
+        "/uapi/domestic-stock/v1/quotations/inquire-price",
+        "FHKST01010100",
+        {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code},
+    )
+    o = data.get("output") or {}
+    f = lambda k: float(o.get(k) or 0)
+    return {"price": f("stck_prpr"), "open": f("stck_oprc"), "high": f("stck_hgpr"),
+            "pct": f("prdy_ctrt"), "value_eok": f("acml_tr_pbmn") / 1e8}
+
+
+def _kis_rank_candidates() -> dict:
+    """거래대금 상위 + 상승률 상위 종목코드 → 이름"""
+    cands = {}
+    try:
+        d = kis_get(
+            "/uapi/domestic-stock/v1/quotations/volume-rank",
+            "FHPST01710000",
+            {
+                "FID_COND_MRKT_DIV_CODE": "J", "FID_COND_SCR_DIV_CODE": "20171", "FID_INPUT_ISCD": "0000",
+                "FID_DIV_CLS_CODE": "1", "FID_BLNG_CLS_CODE": "3", "FID_TRGT_CLS_CODE": "111111111",
+                "FID_TRGT_EXLS_CLS_CODE": "0000000000", "FID_INPUT_PRICE_1": "", "FID_INPUT_PRICE_2": "",
+                "FID_VOL_CNT": "", "FID_INPUT_DATE_1": "",
+            },
+        )
+        for r in d.get("output") or []:
+            c = r.get("mksc_shrn_iscd") or r.get("stck_shrn_iscd")
+            if c:
+                cands[c] = r.get("hts_kor_isnm") or c
+    except Exception as e:
+        print(f"[brief:rally] 거래대금 순위 실패: {e}")
+    try:
+        d = kis_get(
+            "/uapi/domestic-stock/v1/ranking/fluctuation",
+            "FHPST01700000",
+            {
+                "fid_cond_mrkt_div_code": "J", "fid_cond_scr_div_code": "20170", "fid_input_iscd": "0000",
+                "fid_rank_sort_cls_code": "0", "fid_input_cnt_1": "0", "fid_prc_cls_code": "1",
+                "fid_input_price_1": "", "fid_input_price_2": "", "fid_vol_cnt": "", "fid_trgt_cls_code": "0",
+                "fid_trgt_exls_cls_code": "0", "fid_div_cls_code": "0", "fid_rsfl_rate1": "", "fid_rsfl_rate2": "",
+            },
+        )
+        for r in d.get("output") or []:
+            c = r.get("stck_shrn_iscd") or r.get("mksc_shrn_iscd")
+            if c:
+                cands.setdefault(c, r.get("hts_kor_isnm") or c)
+    except Exception as e:
+        print(f"[brief:rally] 상승률 순위 실패: {e}")
+    return cands
+
+
+def build_rally_brief(top_n: int = 10, min_value_eok: float = 50):
+    now = now_kst()
+    today = now.strftime("%Y-%m-%d")
+    cands = _kis_rank_candidates()
+    etf = _get_krx_etf_codes()
+    rows = []
+    for code, name in list(cands.items())[:70]:
+        if code in etf or _ETF_NAME_RE.search(name or "") or _is_preferred_stock_name(name):
+            continue
+        try:
+            q = _kis_quote(code)
+        except Exception:
+            continue
+        time.sleep(0.06)  # 한투 초당 호출 한도 여유
+        if q["open"] <= 0 or q["price"] <= 0 or q["value_eok"] < min_value_eok:
+            continue
+        q.update({"code": code, "name": name, "from_open": (q["price"] / q["open"] - 1) * 100})
+        rows.append(q)
+    rows = sorted([r for r in rows if r["from_open"] > 0], key=lambda r: -r["from_open"])[:top_n]
+    if not rows:
+        return None, None
+
+    lines = [f"🚀 아침 상승 랭킹 ({now.month}/{now.day} 09:00~{now.strftime('%H:%M')})\n━━━━━━━━━━━━",
+             "시가 대비 상승률 순 · 거래대금 50억 이상 · ETF·스팩·우선주 제외"]
+    for i, r in enumerate(rows, start=1):
+        extra = ""
+        try:
+            candles, latest, *_ = fetch_minute_candles_paginated(r["code"], "J", "09:00")
+            if latest and latest != now.strftime("%Y%m%d"):
+                return None, None  # 오늘 분봉이 없음 = 휴장
+            est = estimate_force_avg([{"date": c["time"], "open": c["open"], "close": c["close"], "volume": c["volume"]} for c in candles])
+            hi = max(c["high"] for c in candles) if candles else r["high"]
+            avg = est[-1]["avg_price"] if est else 0
+            if avg:
+                extra = (f"\n   세력평단(근사) {avg:,.0f} · 평단 대비 {(r['price'] / avg - 1) * 100:+.1f}%"
+                         f" · 1시간 고점 대비 {(r['price'] / hi - 1) * 100:+.1f}%")
+        except Exception as e:
+            print(f"[brief:rally] {r['code']} 분봉 실패: {e}")
+        lines.append(
+            f"\n{i}. {r['name']} 시가대비 {r['from_open']:+.1f}% (전일비 {r['pct']:+.1f}%) · {_fmt_eok(r['value_eok'], signed=False)}"
+            f"{extra}\n   🔗 {FRONTEND_URL}/stock-analysis?code={r['code']}"
+        )
+        time.sleep(0.1)
+    lines.append("\n※ 평단 대비 +가 작고 고점 대비 -가 적당하면 눌림목 후보 — 링크로 분봉·세력평단 확인")
+    return "\n".join(lines), today
+
+
 BRIEF_BUILDERS = {
+    "rally": build_rally_brief,
     "morning": build_morning_brief,
     "targets": build_premarket_brief,
     "schedule": build_schedule_brief,
