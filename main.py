@@ -6586,11 +6586,19 @@ def earnings_disclosures_endpoint(days: int = 3, send: bool = False):
 # ══════════════════════════════════════════════════════════════════════════
 _fin_cache: dict = {}
 BS_ACC = {
-    "assets": ["자산총계"],
-    "liabilities": ["부채총계"],
-    "equity": ["자본총계"],
+    "assets": ["자산총계", "자산합계", "총자산"],
+    "liabilities": ["부채총계", "부채합계", "총부채"],
+    "equity": ["자본총계", "자본합계", "총자본"],
     "cur_assets": ["유동자산"],
     "cur_liabilities": ["유동부채"],
+}
+# 회사마다 계정 이름이 조금씩 달라서(2026-10-12 로보티즈 부채·자본 누락 확인) 국제표준 계정코드로도 찾음
+BS_IDS = {
+    "assets": ["ifrs-full_Assets"],
+    "liabilities": ["ifrs-full_Liabilities"],
+    "equity": ["ifrs-full_Equity"],
+    "cur_assets": ["ifrs-full_CurrentAssets"],
+    "cur_liabilities": ["ifrs-full_CurrentLiabilities"],
 }
 CF_ACC = {
     "cfo": ["영업활동현금흐름", "영업활동으로인한현금흐름", "영업활동순현금흐름"],
@@ -6613,7 +6621,13 @@ def _dart_full(corp: str, year: int, reprt_code: str):
     return None, None
 
 
-def _pick_acc(rows: list, sj: tuple, names: list, field: str = "thstrm_amount"):
+def _pick_acc(rows: list, sj: tuple, names: list, field: str = "thstrm_amount", ids: list = None):
+    if ids:  # 계정코드가 정확히 맞는 줄이 있으면 그걸 우선
+        for r in rows:
+            if r.get("sj_div") in sj and r.get("account_id") in ids:
+                v = _to_eok(r.get(field))
+                if v is not None:
+                    return v
     for r in rows:
         if r.get("sj_div") not in sj:
             continue
@@ -6651,7 +6665,13 @@ def fetch_dart_financials(stock_code: str) -> dict:
     stability, cashflow = {}, {}
     if rows:
         for k, names in BS_ACC.items():
-            stability[k] = _pick_acc(rows, ("BS",), names)
+            stability[k] = _pick_acc(rows, ("BS",), names, ids=BS_IDS.get(k))
+        # 하나가 빠지면 "자산 = 부채 + 자본"으로 채움
+        a_, l_, e_ = stability.get("assets"), stability.get("liabilities"), stability.get("equity")
+        if e_ is None and a_ is not None and l_ is not None:
+            stability["equity"] = round(a_ - l_, 1)
+        elif l_ is None and a_ is not None and e_ is not None:
+            stability["liabilities"] = round(a_ - e_, 1)
         for k, names in CF_ACC.items():
             cashflow[k] = _pick_acc(rows, ("CF",), names)
         if stability.get("liabilities") is not None and stability.get("equity"):
