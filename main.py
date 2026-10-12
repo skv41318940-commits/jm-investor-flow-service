@@ -6537,9 +6537,290 @@ def earnings_disclosures_endpoint(days: int = 3, send: bool = False):
     try:
         text, rows = build_earnings_digest(days=max(1, min(days, 14)))
         sent = send_telegram(text) if (send and text) else False
-        return {"ok": True, "count": len(rows), "sent": sent, "text": text or "해당 기간 실적 공시가 없어요."}
+        items = [
+            {
+                "date": f"{r['rcept_dt'][:4]}-{r['rcept_dt'][4:6]}-{r['rcept_dt'][6:8]}" if r.get("rcept_dt") else None,
+                "corp_name": r.get("corp_name"),
+                "stock_code": r.get("stock_code"),
+                "market": {"Y": "코스피", "K": "코스닥"}.get(r.get("corp_cls"), ""),
+                "report_nm": re.sub(r"\s+", " ", r.get("report_nm") or "").strip(),
+                "type": _classify_disclosure(r.get("report_nm")),
+                "link": f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={r.get('rcept_no')}",
+            }
+            for r in rows
+        ]
+        return {"ok": True, "count": len(rows), "sent": sent, "items": items, "text": text or "해당 기간 실적 공시가 없어요."}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 📑 재무 상세 (DART 공식) — 수익성·안정성·현금흐름·배당
+# ──────────────────────────────────────────────────────────────────────────
+#   · 수익성: 분기 영업이익률·순이익률 (fetch_dart_quarterly 재사용), 최근 4분기 ROE
+#   · 안정성: 부채비율·유동비율·자본총계 — 가장 최근 보고서의 재무상태표
+#   · 현금흐름: 영업·투자·재무활동 현금흐름(올해 누적), 잉여현금흐름(영업CF + 투자CF, 근사)
+#   · 배당: 최근 사업보고서의 주당배당금·배당수익률·배당성향 (alotMatter)
+# ══════════════════════════════════════════════════════════════════════════
+_fin_cache: dict = {}
+BS_ACC = {
+    "assets": ["자산총계"],
+    "liabilities": ["부채총계"],
+    "equity": ["자본총계"],
+    "cur_assets": ["유동자산"],
+    "cur_liabilities": ["유동부채"],
+}
+CF_ACC = {
+    "cfo": ["영업활동현금흐름", "영업활동으로인한현금흐름", "영업활동순현금흐름"],
+    "cfi": ["투자활동현금흐름", "투자활동으로인한현금흐름", "투자활동순현금흐름"],
+    "cff": ["재무활동현금흐름", "재무활동으로인한현금흐름", "재무활동순현금흐름"],
+}
+
+
+def _dart_full(corp: str, year: int, reprt_code: str):
+    """전체 재무제표 — 연결(CFS) 먼저, 없으면 별도(OFS)"""
+    for fs in ("CFS", "OFS"):
+        res = requests.get(
+            "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json",
+            params={"crtfc_key": DART_API_KEY, "corp_code": corp, "bsns_year": str(year), "reprt_code": reprt_code, "fs_div": fs},
+            timeout=15,
+        )
+        data = res.json()
+        if data.get("status") == "000" and data.get("list"):
+            return data["list"], fs
+    return None, None
+
+
+def _pick_acc(rows: list, sj: tuple, names: list, field: str = "thstrm_amount"):
+    for r in rows:
+        if r.get("sj_div") not in sj:
+            continue
+        nm = (r.get("account_nm") or "").replace(" ", "")
+        if any(nm == n or nm.startswith(n) for n in names):
+            v = _to_eok(r.get(field))
+            if v is not None:
+                return v
+    return None
+
+
+def fetch_dart_financials(stock_code: str) -> dict:
+    cached = _fin_cache.get(stock_code)
+    if cached and time.time() - cached[0] < 12 * 3600:
+        return cached[1]
+    corp = _dart_corp_code(stock_code)
+    if not corp:
+        raise ValueError("DART에서 이 종목을 찾지 못했어요.")
+
+    # 가장 최근 보고서 찾기 (올해 3분기 → 반기 → 1분기 → 작년 사업보고서 …)
+    y = now_kst().year
+    order = [(y, "11014", "3분기"), (y, "11012", "반기"), (y, "11013", "1분기"),
+             (y - 1, "11011", "사업보고서"), (y - 1, "11014", "3분기"), (y - 1, "11012", "반기")]
+    rows, fs, period = None, None, None
+    for yy, rc, label in order:
+        try:
+            rows, fs = _dart_full(corp, yy, rc)
+        except Exception:
+            rows = None
+        if rows:
+            period = f"{yy}년 {label}"
+            break
+        time.sleep(0.1)
+
+    stability, cashflow = {}, {}
+    if rows:
+        for k, names in BS_ACC.items():
+            stability[k] = _pick_acc(rows, ("BS",), names)
+        for k, names in CF_ACC.items():
+            cashflow[k] = _pick_acc(rows, ("CF",), names)
+        if stability.get("liabilities") is not None and stability.get("equity"):
+            stability["debt_ratio"] = round(stability["liabilities"] / stability["equity"] * 100, 1)
+        if stability.get("cur_assets") is not None and stability.get("cur_liabilities"):
+            stability["current_ratio"] = round(stability["cur_assets"] / stability["cur_liabilities"] * 100, 1)
+        if cashflow.get("cfo") is not None and cashflow.get("cfi") is not None:
+            cashflow["fcf"] = round(cashflow["cfo"] + cashflow["cfi"], 1)
+
+    # 수익성 (분기 실적 재사용)
+    margins, ttm_roe = [], None
+    try:
+        q = fetch_dart_quarterly(stock_code)
+        for row in q.get("quarters", []):
+            rev = row.get("revenue")
+            margins.append({
+                "period": row["period"],
+                "op_margin": round(row["op"] / rev * 100, 1) if rev and row.get("op") is not None else None,
+                "net_margin": round(row["net"] / rev * 100, 1) if rev and row.get("net") is not None else None,
+            })
+        if q.get("ttm_net") is not None and stability.get("equity"):
+            ttm_roe = round(q["ttm_net"] / stability["equity"] * 100, 1)
+    except Exception as e:
+        print(f"[financials] 수익성 실패: {e}")
+
+    # 배당 (작년 사업보고서 → 재작년)
+    dividend = None
+    for yy in (y - 1, y - 2):
+        try:
+            res = requests.get(
+                "https://opendart.fss.or.kr/api/alotMatter.json",
+                params={"crtfc_key": DART_API_KEY, "corp_code": corp, "bsns_year": str(yy), "reprt_code": "11011"},
+                timeout=10,
+            )
+            data = res.json()
+        except Exception:
+            continue
+        if data.get("status") != "000":
+            continue
+        d = {"year": yy}
+        for r in data.get("list") or []:
+            se = (r.get("se") or "").replace(" ", "")
+            kind = r.get("stock_knd") or ""
+            val = (r.get("thstrm") or "").replace(",", "").strip()
+            try:
+                v = float(val)
+            except ValueError:
+                continue
+            if "주당현금배당금" in se and ("보통" in kind or not kind) and "dps" not in d:
+                d["dps"] = v
+            elif "현금배당수익률" in se and ("보통" in kind or not kind) and "yield" not in d:
+                d["yield"] = v
+            elif "현금배당성향" in se and "payout" not in d:
+                d["payout"] = v
+        dividend = d
+        break
+
+    result = {
+        "ok": True, "code": stock_code, "fs": "연결" if fs == "CFS" else "별도" if fs == "OFS" else None,
+        "period": period, "unit": "억원",
+        "stability": stability, "cashflow": cashflow, "margins": margins[-8:], "ttm_roe": ttm_roe, "dividend": dividend,
+    }
+    _fin_cache[stock_code] = (time.time(), result)
+    return result
+
+
+@app.get("/api/dart-financials")
+def dart_financials_endpoint(code: str):
+    """재무 상세 — 수익성(이익률·ROE)·안정성(부채비율·유동비율)·현금흐름·배당 (DART 공식)"""
+    try:
+        return fetch_dart_financials((code or "").strip().upper())
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 🌡 시장심리 — 고객예탁금·신용융자 잔고·반대매매 (금융투자협회 통계)
+# ──────────────────────────────────────────────────────────────────────────
+# ⚠️ 출처 응답 모양을 이 작업 환경에서 직접 확인하지 못해서 후보 2곳을 차례로 시도함.
+# 안 나오면 /api/market-sentiment-debug 로 실제 응답을 보고 맞춰야 함. 하루 1번(18시 이후) 갱신되는 통계라 6시간 보관.
+# ══════════════════════════════════════════════════════════════════════════
+_sentiment_cache = {"at": 0.0, "data": None}
+
+
+def _num_kr(t):
+    t = str(t or "").replace(",", "").strip()
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def _sentiment_from_naver() -> list:
+    """네이버 증시자금동향 (옛 페이지) — 날짜·고객예탁금·신용잔고 (단위 억원)"""
+    res = requests.get("https://finance.naver.com/sise/sise_deposit.naver", headers=_naver_headers(), timeout=10)
+    html = _decode_html(res)
+    soup = BeautifulSoup(html, "html.parser")
+    rows = []
+    for tr in soup.find_all("tr"):
+        cells = [td.get_text(strip=True) for td in tr.find_all("td")]
+        if len(cells) < 4 or not re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", cells[0]):
+            continue
+        nums = [_num_kr(c) for c in cells[1:]]
+        rows.append({
+            "date": f"20{cells[0][:2]}-{cells[0][3:5]}-{cells[0][6:8]}",
+            "deposit": nums[0] if nums else None,
+            "credit": nums[2] if len(nums) > 2 else None,
+        })
+    return rows
+
+
+def _sentiment_from_kofia() -> list:
+    """금융투자협회 FreeSIS 증시자금추이 (주소·필드명 확인 필요)"""
+    end = now_kst()
+    start = end - timedelta(days=60)
+    res = requests.post(
+        "https://freesis.kofia.or.kr/meta/getMetaDataList.do",
+        json={"dmSearch": {"tmpV40": "1000000", "tmpV41": "1", "tmpV1": "D", "tmpV45": start.strftime("%Y%m%d"),
+                           "tmpV46": end.strftime("%Y%m%d"), "OBJ_NM": "STATSCU0100000060BO"}},
+        headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"},
+        timeout=12,
+    )
+    data = res.json()
+    rows = []
+    for r in data.get("ds1") or []:
+        d = str(r.get("TMPV1") or "")
+        if len(d) != 8:
+            continue
+        rows.append({
+            "date": f"{d[:4]}-{d[4:6]}-{d[6:]}",
+            "deposit": _num_kr(r.get("TMPV2")),  # 투자자예탁금 (백만원으로 올 수 있음 — 아래에서 단위 보정)
+            "credit": _num_kr(r.get("TMPV6")),
+            "forced_sale": _num_kr(r.get("TMPV9")),
+        })
+    for r in rows:  # 백만원이면 억원으로
+        for k in ("deposit", "credit", "forced_sale"):
+            if r.get(k) and r[k] > 3_000_000:
+                r[k] = round(r[k] / 100, 0)
+    return rows
+
+
+def fetch_market_sentiment() -> dict:
+    c = _sentiment_cache
+    if c["data"] and time.time() - c["at"] < 6 * 3600:
+        return c["data"]
+    rows, source, errors = [], None, []
+    for label, fn in (("금융투자협회", _sentiment_from_kofia), ("네이버 증시자금동향", _sentiment_from_naver)):
+        try:
+            rows = fn()
+            if rows:
+                source = label
+                break
+        except Exception as e:
+            errors.append(f"{label}: {e}")
+    rows = sorted([r for r in rows if r.get("date")], key=lambda r: r["date"])[-60:]
+    data = {"ok": True, "source": source, "rows": rows, "errors": errors}
+    if rows:
+        c.update({"at": time.time(), "data": data})
+    return data
+
+
+@app.get("/api/market-sentiment")
+def market_sentiment_endpoint():
+    """시장심리 — 고객예탁금·신용융자 잔고·반대매매 (최근 60일, 억원)"""
+    try:
+        return fetch_market_sentiment()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/market-sentiment-debug")
+def market_sentiment_debug():
+    out = {}
+    for label, fn in (("kofia", _sentiment_from_kofia), ("naver", _sentiment_from_naver)):
+        try:
+            rows = fn()
+            out[label] = {"count": len(rows), "sample": rows[-3:]}
+        except Exception as e:
+            out[label] = {"error": str(e)}
+    try:
+        r = requests.post(
+            "https://freesis.kofia.or.kr/meta/getMetaDataList.do",
+            json={"dmSearch": {"tmpV40": "1000000", "tmpV41": "1", "tmpV1": "D", "tmpV45": "20261001",
+                               "tmpV46": "20261012", "OBJ_NM": "STATSCU0100000060BO"}},
+            headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"},
+            timeout=12,
+        )
+        out["kofia_raw"] = {"status": r.status_code, "preview": r.text[:800]}
+    except Exception as e:
+        out["kofia_raw"] = {"error": str(e)}
+    return out
 
 
 @app.get("/api/ping")
