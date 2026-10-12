@@ -2750,6 +2750,7 @@ async def _daily_jobs_worker():
         ("health_report", _ensure_health_report_sent_today, ()),
         ("telegram_briefs", _run_telegram_briefs, ()),
         ("target_reach", _check_target_reach, ()),
+        ("earnings_disclosure", _check_earnings_disclosures, ()),
     ]
     await asyncio.sleep(30)  # 서버 막 켜졌을 때 다른 초기화가 먼저 끝나게 잠깐 대기
     while True:
@@ -5005,6 +5006,21 @@ def send_telegram(text: str, token: str = None, chat_id: str = None) -> bool:
     if not token or not chat_id:
         print("[telegram] 토큰/채팅ID 미설정 — 전송 건너뜀")
         return False
+    # 텔레그램 한 메시지 최대 4096자 → 길면 줄 단위로 나눠서 여러 번 보냄
+    if len(text) > 3800:
+        chunks, cur = [], ""
+        for line in text.split("\n"):
+            if len(cur) + len(line) + 1 > 3800:
+                chunks.append(cur)
+                cur = ""
+            cur += line + "\n"
+        if cur.strip():
+            chunks.append(cur)
+        return all([_send_telegram_once(c, token, chat_id) for c in chunks])
+    return _send_telegram_once(text, token, chat_id)
+
+
+def _send_telegram_once(text: str, token: str, chat_id: str) -> bool:
     try:
         res = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
@@ -5961,6 +5977,14 @@ def build_schedule_brief(max_per_day: int = 6):
         up.append("\n".join(lines))
     if up:
         parts.append("🗓 다가오는 일정\n\n" + "\n\n".join(up))
+    # 📢 최근 7일 실적발표 예고·IR 공시 (날짜는 공시 원문에 있어서 링크로 확인)
+    try:
+        _, rows = build_earnings_digest(days=7)
+        plans = [r for r in rows if _classify_disclosure(r.get("report_nm")) == "plan"][:10]
+        if plans:
+            parts.append("📢 실적발표 예고·IR 공시 (최근 7일)\n" + "\n".join(_disclosure_line(r, set()) for r in plans))
+    except Exception as e:
+        print(f"[brief:schedule] 실적 예고 실패: {e}")
     if cal.get("errors"):
         parts.append("※ 일부 일정 출처를 못 불러왔어요: " + " / ".join(e[:120] for e in cal["errors"]))
     return "\n\n".join(parts), today
@@ -6061,13 +6085,13 @@ def _kis_rank_candidates() -> dict:
     return cands
 
 
-def build_rally_brief(top_n: int = 10, min_value_eok: float = 50):
+def build_rally_brief(top_n: int = 20, min_value_eok: float = 50):
     now = now_kst()
     today = now.strftime("%Y-%m-%d")
     cands = _kis_rank_candidates()
     etf = _get_krx_etf_codes()
     rows = []
-    for code, name in list(cands.items())[:70]:
+    for code, name in list(cands.items())[:90]:  # 20개를 채울 수 있게 후보를 넉넉히
         if code in etf or _ETF_NAME_RE.search(name or "") or _is_preferred_stock_name(name):
             continue
         try:
@@ -6305,6 +6329,116 @@ def target_reach_endpoint(code: str = "", send: bool = False):
                         chat_id=TARGET_ALERT_CHAT_ID or TELEGRAM_CHAT_ID,
                     )
         return {"ok": True, "results": results}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 📊 실적 공시 알림 (DART) — 실적 발표한 종목 + 실적발표 예고·IR 개최 공시
+# ──────────────────────────────────────────────────────────────────────────
+# 평일 07:30~20:30 사이 10분마다 오늘 올라온 거래소 공시(DART list.json)를 확인해서,
+#   📊 잠정실적·영업실적 공정공시, 매출액/손익구조 30%(15%) 이상 변경  → "실적 발표"
+#   📢 결산실적공시 예고, 기업설명회(IR) 개최                       → "실적 발표 예정"
+# 새로 나온 것만 모아서 한 번에 보냄 (관심종목은 ⭐로 맨 위). 이미 보낸 공시는 다시 안 보냄.
+# 필요: Render 환경변수 DART_API_KEY
+# ══════════════════════════════════════════════════════════════════════════
+EARN_RESULT_RE = re.compile(r"잠정\)?\s*실적|영업\s*\(잠정\)\s*실적|손익구조\s*\d+%|매출액또는손익구조")
+EARN_PLAN_RE = re.compile(r"결산실적공시\s*예고|기업설명회\s*\(IR\)\s*개최")
+_earn_last = {"at": 0.0}
+
+
+def _dart_list(bgn: str, end: str, max_pages: int = 6) -> list:
+    """DART 거래소공시(I) 목록 — bgn/end: YYYYMMDD"""
+    if not DART_API_KEY:
+        raise RuntimeError("DART_API_KEY 미설정")
+    out = []
+    for page in range(1, max_pages + 1):
+        res = requests.get(
+            "https://opendart.fss.or.kr/api/list.json",
+            params={"crtfc_key": DART_API_KEY, "bgn_de": bgn, "end_de": end, "pblntf_ty": "I",
+                    "page_no": page, "page_count": 100, "sort": "date", "sort_mth": "desc"},
+            timeout=15,
+        )
+        data = res.json()
+        if data.get("status") != "000":
+            break
+        rows = data.get("list") or []
+        out += rows
+        if page >= int(data.get("total_page") or 1):
+            break
+    return out
+
+
+def _classify_disclosure(report_nm: str):
+    if EARN_RESULT_RE.search(report_nm or ""):
+        return "result"
+    if EARN_PLAN_RE.search(report_nm or ""):
+        return "plan"
+    return None
+
+
+def _disclosure_line(r: dict, watch: set) -> str:
+    star = "⭐" if r.get("stock_code") in watch else ""
+    mkt = {"Y": "코스피", "K": "코스닥"}.get(r.get("corp_cls"), "")
+    name = re.sub(r"\s+", " ", r.get("report_nm") or "").strip()
+    return (f"{star}{r.get('corp_name')}" + (f" ({mkt})" if mkt else "") + f"\n   {name}"
+            f"\n   🔗 https://dart.fss.or.kr/dsaf001/main.do?rcpNo={r.get('rcept_no')}")
+
+
+def build_earnings_digest(days: int = 1, only_new: bool = False):
+    now = now_kst()
+    bgn = (now - timedelta(days=days - 1)).strftime("%Y%m%d")
+    rows = _dart_list(bgn, now.strftime("%Y%m%d"))
+    rows = [r for r in rows if r.get("stock_code") and _classify_disclosure(r.get("report_nm"))]
+    if only_new:
+        rows = [r for r in rows if not _brief_already_sent("dart_earn", r["rcept_no"])]
+    try:
+        watch = {w["code"] for w in (supabase.table("watchlist").select("code").execute().data or [])}
+    except Exception:
+        watch = set()
+    results = [r for r in rows if _classify_disclosure(r["report_nm"]) == "result"]
+    plans = [r for r in rows if _classify_disclosure(r["report_nm"]) == "plan"]
+    key = lambda r: (r.get("stock_code") not in watch, r.get("corp_cls") not in ("Y", "K"))
+    results.sort(key=key)
+    plans.sort(key=key)
+    if not results and not plans:
+        return None, rows
+    parts = [f"📊 실적 공시 알림 ({now.strftime('%m/%d %H:%M')})\n━━━━━━━━━━━━"]
+    if results:
+        parts.append(f"📊 실적 발표 ({len(results)}건)\n" + "\n".join(_disclosure_line(r, watch) for r in results[:25])
+                     + (f"\n외 {len(results) - 25}건" if len(results) > 25 else ""))
+    if plans:
+        parts.append(f"📢 실적 발표 예고·IR ({len(plans)}건)\n" + "\n".join(_disclosure_line(r, watch) for r in plans[:15])
+                     + (f"\n외 {len(plans) - 15}건" if len(plans) > 15 else ""))
+    return "\n\n".join(parts), rows
+
+
+def _check_earnings_disclosures():
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or not DART_API_KEY:
+        return
+    now = now_kst()
+    if now.weekday() >= 5 or not ((7, 30) <= (now.hour, now.minute) <= (20, 30)):
+        return
+    if time.time() - _earn_last["at"] < 10 * 60:
+        return
+    _earn_last["at"] = time.time()
+    try:
+        text, rows = build_earnings_digest(days=1, only_new=True)
+    except Exception as e:
+        print(f"[earnings] 공시 확인 실패: {e}")
+        return
+    if text and send_telegram(text):
+        for r in rows:
+            _mark_brief_sent("dart_earn", r["rcept_no"])
+
+
+@app.get("/api/earnings-disclosures")
+def earnings_disclosures_endpoint(days: int = 3, send: bool = False):
+    """최근 days일 실적 공시(발표·예고·IR) 미리보기 — send=true면 텔레그램으로도 보냄(기록 안 남김)"""
+    try:
+        text, rows = build_earnings_digest(days=max(1, min(days, 14)))
+        sent = send_telegram(text) if (send and text) else False
+        return {"ok": True, "count": len(rows), "sent": sent, "text": text or "해당 기간 실적 공시가 없어요."}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
