@@ -5631,6 +5631,8 @@ def calendar_debug():
 # 📨 텔레그램 정기 브리핑
 # ──────────────────────────────────────────────────────────────────────────
 #   06:15  🌙 미국 증시 모닝 브리핑 (화~토 — 전날 미국장 마감 숫자)
+#   09:30  🚀 아침 상승 랭킹 (시가 대비 상승률 상위 20)
+#   10:00  🌅 오전장 테마 이슈
 #   08:00  📋 장전 리포트 (어제 수급 한 줄 + 오늘 주요 일정 + 증권가 목표가 상향·하향·신규)
 #   14:00  🗓 주요 일정 (오늘 + 다가오는 7일)
 #   16:10  💰 오늘의 수급 요약 (코스피·코스닥 개인/외국인/기관 + 연속일수 + 기관 주도 주체 + 사모 TOP5)
@@ -5641,7 +5643,8 @@ def calendar_debug():
 BRIEF_SCHEDULE = {
     "morning": (6, 15),
     "targets": (8, 0),  # 📋 장전 리포트 (목표가 + 오늘 일정 + 어제 수급)
-    "rally": (10, 0),  # 🚀 아침 상승 랭킹 (09:00~10:00)
+    "rally": (9, 30),  # 🚀 아침 상승 랭킹 (09:00~09:30)
+    "theme_am": (10, 0),  # 🌅 오전장 테마 이슈 (20:00 테마 이슈의 오전판 — 변동성 미리 보기)
     "schedule": (14, 0),
     "flow": (16, 10),
     "theme": (20, 0),
@@ -5922,11 +5925,11 @@ def _to_eok_from_naver(v: float, price: float = 0, volume: float = 0) -> float:
     return won / 1e8
 
 
-def build_theme_brief(top_n: int = 5):
+def build_theme_brief(top_n: int = 5, title: str = "🔥 오늘의 테마 이슈"):
     themes = fetch_naver_theme_list(limit=25)
     themes = sorted(themes, key=lambda t: t["change_pct"], reverse=True)[:top_n]
     now = now_kst()
-    parts = [f"🔥 오늘의 테마 이슈 {now.month}/{now.day}({WEEKDAY_KR[now.weekday()]})\n━━━━━━━━━━━━"]
+    parts = [f"{title} {now.month}/{now.day}({WEEKDAY_KR[now.weekday()]} {now.strftime('%H:%M')})\n━━━━━━━━━━━━"]
     for t in themes:
         try:
             stocks, _ = fetch_naver_theme_detail(t["theme_no"], limit=30)
@@ -6107,7 +6110,7 @@ def build_rally_brief(top_n: int = 20, min_value_eok: float = 50):
     if not rows:
         return None, None
 
-    lines = [f"🚀 아침 상승 랭킹 ({now.month}/{now.day} 09:00~{now.strftime('%H:%M')})\n━━━━━━━━━━━━",
+    lines = [f"🚀 아침 상승 랭킹 ({now.month}/{now.day} 09:00~{now.strftime('%H:%M')} 기준)\n━━━━━━━━━━━━",
              "시가 대비 상승률 순 · 거래대금 50억 이상 · ETF·스팩·우선주 제외"]
     for i, r in enumerate(rows, start=1):
         extra = ""
@@ -6120,7 +6123,7 @@ def build_rally_brief(top_n: int = 20, min_value_eok: float = 50):
             avg = est[-1]["avg_price"] if est else 0
             if avg:
                 extra = (f"\n   세력평단(근사) {avg:,.0f} · 평단 대비 {(r['price'] / avg - 1) * 100:+.1f}%"
-                         f" · 1시간 고점 대비 {(r['price'] / hi - 1) * 100:+.1f}%")
+                         f" · 장중 고점 대비 {(r['price'] / hi - 1) * 100:+.1f}%")
         except Exception as e:
             print(f"[brief:rally] {r['code']} 분봉 실패: {e}")
         lines.append(
@@ -6132,8 +6135,25 @@ def build_rally_brief(top_n: int = 20, min_value_eok: float = 50):
     return "\n".join(lines), today
 
 
+def _is_trading_today() -> bool:
+    """장중에도 쓸 수 있는 휴장일 확인 — 삼성전자 오늘 분봉이 있으면 장 열린 날"""
+    try:
+        rows = _kis_minute_page("005930", "J", now_kst().strftime("%H%M%S"))
+        return bool(rows) and max(r.get("stck_bsop_date", "") for r in rows) == now_kst().strftime("%Y%m%d")
+    except Exception:
+        return now_kst().weekday() < 5
+
+
+def build_theme_am_brief():
+    text, ref = build_theme_brief(title="🌅 오전장 테마 이슈")
+    if text:
+        text += "\n\n※ 오전 10시 기준이라 20:00 마감 테마 이슈와 비교하면 장중 변동성(지속·소멸)을 볼 수 있어요."
+    return text, ref
+
+
 BRIEF_BUILDERS = {
     "rally": build_rally_brief,
+    "theme_am": build_theme_am_brief,
     "morning": build_morning_brief,
     "targets": build_premarket_brief,
     "schedule": build_schedule_brief,
@@ -6155,6 +6175,8 @@ def _run_telegram_briefs():
             continue
         if kind != "morning" and wd >= 5:
             continue
+        if kind == "theme_am" and not _is_trading_today():
+            continue
         if kind in ("flow", "theme"):  # 일정(14:00)은 장중이라 KRX 오늘 확정 전이어도 평일이면 보냄
             try:
                 if _latest_trading_day() != now.strftime("%Y%m%d"):
@@ -6163,7 +6185,7 @@ def _run_telegram_briefs():
                 continue
         try:
             # 기준 날짜를 먼저 정해서 이미 보냈는지 확인 (모닝·목표가는 내용 날짜, 나머지는 오늘)
-            if kind in ("flow", "theme", "schedule") and _brief_already_sent(kind, now.strftime("%Y-%m-%d")):
+            if kind in ("flow", "theme", "schedule", "theme_am", "rally") and _brief_already_sent(kind, now.strftime("%Y-%m-%d")):
                 continue
             text, ref = BRIEF_BUILDERS[kind]()
             if not text or not ref or _brief_already_sent(kind, ref):
