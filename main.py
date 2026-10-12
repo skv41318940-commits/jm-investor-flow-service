@@ -5700,6 +5700,14 @@ MORNING_SYMBOLS = [
     ("원/달러", "KRW=X", "원"),
     ("비트코인", "BTC-USD", "$"),
 ]
+# 🇪🇺 유럽 — 프랑스 재정 이슈 등 유럽발 금리·위험 흐름 확인용 (애널리스트 시황에 자주 나오는 지수)
+EUROPE_SYMBOLS = [
+    ("유로스톡스50", "^STOXX50E", "p"),
+    ("독일 DAX", "^GDAXI", "p"),
+    ("프랑스 CAC40", "^FCHI", "p"),
+    ("영국 FTSE100", "^FTSE", "p"),
+    ("유로/달러", "EURUSD=X", ""),
+]
 
 
 def _yahoo_quote(symbol: str):
@@ -5748,9 +5756,22 @@ def build_morning_brief():
     idx = [r for r in rows[:5]]
     up = sum(1 for r in idx[:3] if r.startswith("🔺"))
     mood = "3대 지수 모두 상승" if up == 3 else "3대 지수 모두 하락" if up == 0 else "3대 지수 혼조"
+    eu_rows = []
+    for label, sym, unit in EUROPE_SYMBOLS:
+        try:
+            q = _yahoo_quote(sym)
+        except Exception:
+            q = None
+        if not q:
+            continue
+        arrow = "🔺" if q["pct"] > 0 else "🔻" if q["pct"] < 0 else "▫️"
+        val = f"{q['price']:,.2f}" + ("p" if unit == "p" else "") if label != "유로/달러" else f"{q['price']:.4f}"
+        eu_rows.append(f"{arrow} {label} {val} ({q['pct']:+.2f}%)")
     text = (
         f"☀️ 미국 증시 모닝 브리핑 ({us_date or '-'} 미국장 마감)\n━━━━━━━━━━━━\n"
-        f"📌 {mood}\n\n" + "\n".join(rows[:5]) + "\n\n" + "\n".join(rows[5:])
+        f"📌 {mood}\n\n" + "\n".join(rows[:5])
+        + ("\n\n🇪🇺 유럽 마감\n" + "\n".join(eu_rows) if eu_rows else "")
+        + "\n\n" + "\n".join(rows[5:])
     )
     return text, us_date
 
