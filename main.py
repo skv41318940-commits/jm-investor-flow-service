@@ -6377,11 +6377,110 @@ def _classify_disclosure(report_nm: str):
     return None
 
 
+# ── 잠정실적 숫자 꺼내기 (DART 공식 "공시서류원본파일" API — document.xml) ──
+# ⚠️ DART 웹 뷰어(dart.fss.or.kr) 페이지는 자동 수집을 막아둬서(robots) 쓰지 않고, OpenDART 공식 API로만 받음.
+# 원문 표에서 매출액·영업이익·당기순이익 줄을 찾아 [당기, 전기, 전기대비%, 전년동기, 전년동기대비%] 순서로 읽음.
+_earn_num_cache: dict = {}
+_ACC_ROWS = [("매출", ("매출액", "수익(매출액)", "영업수익")), ("영업이익", ("영업이익",)), ("순이익", ("당기순이익", "지배기업소유주지분순이익", "지배기업 소유주지분 순이익"))]
+_UNIT_TO_EOK = {"억원": 1.0, "백만원": 0.01, "천원": 1e-5, "원": 1e-8}
+
+
+def _parse_num(t: str):
+    t = (t or "").replace(",", "").replace(" ", "").strip()
+    if t in ("", "-"):
+        return None
+    neg = t.startswith("(") and t.endswith(")") or t.startswith("△") or t.startswith("-")
+    t = t.strip("()△-")
+    try:
+        v = float(t)
+    except ValueError:
+        return t if ("흑자" in t or "적자" in t) else None
+    return -v if neg else v
+
+
+def fetch_earnings_numbers(rcept_no: str):
+    if rcept_no in _earn_num_cache:
+        return _earn_num_cache[rcept_no]
+    out = None
+    try:
+        res = requests.get(
+            "https://opendart.fss.or.kr/api/document.xml",
+            params={"crtfc_key": DART_API_KEY, "rcept_no": rcept_no},
+            timeout=15,
+        )
+        if res.content[:2] != b"PK":  # zip이 아니면 오류 응답(지원 안 되는 공시 등)
+            _earn_num_cache[rcept_no] = None
+            return None
+        with zipfile.ZipFile(io.BytesIO(res.content)) as zf:
+            raw = b"".join(zf.read(n) for n in zf.namelist())
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("euc-kr", errors="replace")
+        unit_m = re.search(r"단위\s*[:：]?\s*(억원|백만원|천원|원)", text)
+        mul = _UNIT_TO_EOK.get(unit_m.group(1), None) if unit_m else None
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # DART 원문은 XML이라 HTML 파서 경고가 뜨는데, 표 읽기엔 문제없음
+            soup = BeautifulSoup(text, "html.parser")
+        found = {}
+        for tr in soup.find_all(["tr", "TR"]):
+            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th", "te", "tu", "TD", "TH", "TE", "TU"])]
+            if not cells:
+                continue
+            head = cells[0].replace(" ", "")
+            key = next((k for k, names in _ACC_ROWS if any(head.startswith(n.replace(" ", "")) for n in names)), None)
+            if not key or key in found:
+                continue
+            nums = [_parse_num(c) for c in cells[1:]]
+            nums = [n for n in nums if n is not None]
+            if not nums or not isinstance(nums[0], float):
+                continue
+            cur = nums[0]
+            yoy = qoq = None
+            if len(nums) >= 5:  # 당기, 전기, 전기대비%, 전년동기, 전년동기대비%
+                qoq, yoy = nums[2], nums[4]
+            elif len(nums) >= 2 and isinstance(nums[1], float) and nums[1]:  # 당기, 전기(또는 전년)
+                yoy = (cur / nums[1] - 1) * 100 if nums[1] > 0 else ("흑자전환" if cur > 0 > nums[1] else None)
+            found[key] = {"cur": cur * mul if mul else None, "raw": cur, "qoq": qoq, "yoy": yoy}
+        out = found or None
+    except Exception as e:
+        print(f"[earnings] {rcept_no} 숫자 읽기 실패: {e}")
+    _earn_num_cache[rcept_no] = out
+    return out
+
+
+def _earnings_numbers_text(nums: dict) -> str:
+    parts = []
+    for key, _ in _ACC_ROWS:
+        v = nums.get(key)
+        if not v:
+            continue
+        amount = _fmt_eok(v["cur"], signed=False) if v.get("cur") is not None else f"{v['raw']:,.0f}"
+        if v["cur"] is not None and v["cur"] < 0:
+            amount = "-" + amount
+        yoy = v.get("yoy")
+        if isinstance(yoy, float):
+            yoy_txt = f" (YoY {yoy:+.0f}%)"
+        elif isinstance(yoy, str):
+            yoy_txt = f" ({yoy})"
+        else:
+            yoy_txt = ""
+        parts.append(f"{key} {amount}{yoy_txt}")
+    return " · ".join(parts)
+
+
 def _disclosure_line(r: dict, watch: set) -> str:
     star = "⭐" if r.get("stock_code") in watch else ""
     mkt = {"Y": "코스피", "K": "코스닥"}.get(r.get("corp_cls"), "")
     name = re.sub(r"\s+", " ", r.get("report_nm") or "").strip()
-    return (f"{star}{r.get('corp_name')}" + (f" ({mkt})" if mkt else "") + f"\n   {name}"
+    nums_line = ""
+    if _classify_disclosure(r.get("report_nm")) == "result":
+        nums = fetch_earnings_numbers(r.get("rcept_no"))
+        if nums:
+            nums_line = f"\n   💰 {_earnings_numbers_text(nums)}"
+    return (f"{star}{r.get('corp_name')}" + (f" ({mkt})" if mkt else "") + f"\n   {name}{nums_line}"
             f"\n   🔗 https://dart.fss.or.kr/dsaf001/main.do?rcpNo={r.get('rcept_no')}")
 
 
