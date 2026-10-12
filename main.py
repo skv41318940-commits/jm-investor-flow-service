@@ -6778,11 +6778,14 @@ def _sentiment_from_kofia() -> list:
     try:
         for r in _kofia_rows("STATSCU0100000070BO"):
             d = str(r.get("TMPV1") or "")
-            v = _num_kr(r.get("TMPV2"))
+            v = _num_kr(r.get("TMPV2"))  # 신용거래융자 합계 (2026-10-12 확인: TMPV3 코스피 · TMPV4 코스닥)
             if d in by_date and v is not None:
                 eok = v / 100
                 if 50_000 <= eok <= 1_000_000:  # 5조~100조 사이일 때만 신용융자로 인정 (칸이 틀리면 안 씀)
                     by_date[d]["credit"] = round(eok)
+                    k, q = _num_kr(r.get("TMPV3")), _num_kr(r.get("TMPV4"))
+                    by_date[d]["credit_kospi"] = round(k / 100) if k is not None else None
+                    by_date[d]["credit_kosdaq"] = round(q / 100) if q is not None else None
     except Exception as e:
         print(f"[sentiment] 신용잔고 실패: {e}")
     return list(by_date.values())
