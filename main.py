@@ -5774,8 +5774,12 @@ def build_targets_brief():
         items += batch
     if not items:
         return None, None
-    latest = max(str(it.get("writeDate", ""))[:10] for it in items)
-    day_items = [it for it in items if str(it.get("writeDate", ""))[:10] == latest][:60]
+    # 아침 8시엔 오늘 리포트가 몇 개 안 올라와 있어서(2026-10-12 1건만 잡힘), 직전 영업일 리포트 전체 + 오늘 것까지 봄
+    today_s = now_kst().strftime("%Y-%m-%d")
+    dates = sorted({str(it.get("writeDate", ""))[:10] for it in items}, reverse=True)
+    prev_dates = [d for d in dates if d < today_s]
+    latest = prev_dates[0] if prev_dates else dates[0]
+    day_items = [it for it in items if str(it.get("writeDate", ""))[:10] >= latest][:70]
 
     def detail(it):
         d = _naver_research_detail_json(it.get("researchId"))
@@ -5787,7 +5791,7 @@ def build_targets_brief():
                 d["prev_target_price"] = _naver_research_detail_json(older[0]["research_id"]).get("target_price")
         except Exception:
             pass
-        return {**d, "name": it.get("itemName"), "broker": it.get("brokerName"), "title": it.get("title")}
+        return {**d, "name": it.get("itemName"), "code": it.get("itemCode"), "broker": it.get("brokerName"), "title": it.get("title")}
 
     with ThreadPoolExecutor(max_workers=6) as ex:
         rows = list(ex.map(detail, day_items))
@@ -5809,9 +5813,10 @@ def build_targets_brief():
         prev = f"{r['prev_target_price']:,} → " if r.get("prev_target_price") else ""
         price_now = r.get("price_at_write")
         upside = f" · 상승여력 {((r['target_price'] / price_now) - 1) * 100:+.0f}%" if price_now else ""
-        return f"· {r['name']} · {r['broker']}\n   {prev}{r['target_price']:,}원{tail} {r.get('opinion') or ''}{upside}"
+        link = f"\n   🔗 {FRONTEND_URL}/stock-analysis?code={r['code']}" if r.get("code") else ""
+        return f"· {r['name']} · {r['broker']}\n   {prev}{r['target_price']:,}원{tail} {r.get('opinion') or ''}{upside}{link}"
 
-    parts = [f"🎯 증권가 목표가 ({_kr_date(latest)} 리포트 {len(day_items)}건)\n━━━━━━━━━━━━"]
+    parts = [f"🎯 증권가 목표가 ({_kr_date(latest)}~ 리포트 {len(day_items)}건)\n━━━━━━━━━━━━"]
     if ups:
         parts.append("🔺 목표가 상향 TOP\n" + "\n".join(line(r, pct) for pct, r in ups[:10]))
     if downs:
@@ -5993,6 +5998,79 @@ def build_schedule_brief(max_per_day: int = 6):
     return "\n\n".join(parts), today
 
 
+def _stock_link(code: str) -> str:
+    return f"{FRONTEND_URL}/stock-analysis?code={code}"
+
+
+def _build_watch_candidates() -> str:
+    """
+    장전 리포트용 "오늘 볼 만한 후보" — 예측이 아니라, 밤사이·전일 데이터에서 눈에 띄는 것만 모음:
+      ① 밤사이 미국 섹터 힌트 (필라델피아 반도체·나스닥·유가 → 국내 관련 업종)
+      ② 전일 강세 테마 TOP3 + 주도주
+      ③ 전일 장 마감 후~오늘 아침 실적 공시 종목 (숫자 포함)
+      ④ 전일 외국인 순매수 TOP5
+    """
+    lines = ["📌 오늘 볼 만한 후보 (데이터로 고른 것 · 추천 아님)"]
+    # ① 미국 섹터 힌트
+    hints = []
+    for sym, label, kr in (("^SOX", "필라델피아 반도체", "반도체"), ("^IXIC", "나스닥", "성장·기술주"), ("CL=F", "WTI 유가", "정유·에너지")):
+        try:
+            q = _yahoo_quote(sym)
+        except Exception:
+            q = None
+        if q and abs(q["pct"]) >= 1.0:
+            hints.append(f"{label} {q['pct']:+.1f}% → {kr} {'강세' if q['pct'] > 0 else '약세'} 가능성")
+    if hints:
+        lines.append("🌙 밤사이 미국: " + " / ".join(hints))
+    # ② 전일 강세 테마
+    try:
+        themes = sorted(fetch_naver_theme_list(limit=25), key=lambda t: t["change_pct"], reverse=True)[:3]
+        tl = []
+        for t in themes:
+            try:
+                stocks, _ = fetch_naver_theme_detail(t["theme_no"], limit=20)
+            except Exception:
+                stocks = []
+            top = sorted(stocks, key=lambda x: x["change_pct"], reverse=True)[:2]
+            tl.append(f"· {t['theme_name']} {t['change_pct']:+.1f}%")
+            for x in top:
+                tl.append(f"   {x['stock_name']} {x['change_pct']:+.1f}% 🔗 {_stock_link(x['stock_code'])}")
+        if tl:
+            lines.append("🔥 전일 강세 테마\n" + "\n".join(tl))
+    except Exception as e:
+        print(f"[brief:candidates] 테마 실패: {e}")
+    # ③ 전일 장 마감 후 ~ 오늘 아침 실적 공시
+    if DART_API_KEY:
+        try:
+            ltd = _latest_trading_day()
+            rows = _dart_list(ltd, now_kst().strftime("%Y%m%d"), max_pages=3)
+            res = [r for r in rows if r.get("stock_code") and _classify_disclosure(r.get("report_nm")) == "result"][:5]
+            if res:
+                el = []
+                for r in res:
+                    nums = fetch_earnings_numbers(r["rcept_no"])
+                    num_txt = f" · {_earnings_numbers_text(nums)}" if nums else ""
+                    el.append(f"· {r['corp_name']}{num_txt}\n   🔗 {_stock_link(r['stock_code'])}")
+                lines.append("📊 최근 실적 공시\n" + "\n".join(el))
+        except Exception as e:
+            print(f"[brief:candidates] 실적 공시 실패: {e}")
+    # ④ 전일 외국인 순매수 TOP5
+    try:
+        ltd = _latest_trading_day()
+        df = _krx_df(stock.get_market_net_purchases_of_equities, ltd, ltd, "ALL", "외국인")
+        if df is not None and not df.empty:
+            col = "순매수거래대금" if "순매수거래대금" in df.columns else df.columns[-1]
+            top = df.sort_values(col, ascending=False).head(5)
+            fl = []
+            for code, rr in top.iterrows():
+                nm = rr.get("종목명") if isinstance(rr.get("종목명"), str) else _safe_ticker_name(code)
+                fl.append(f"· {nm} {_fmt_eok(float(rr[col]) / 1e8)} 🔗 {_stock_link(code)}")
+            lines.append("🌏 전일 외국인 순매수 TOP5\n" + "\n".join(fl))
+    except Exception as e:
+        print(f"[brief:candidates] 외국인 순매수 실패: {e}")
+    return "\n\n".join(lines)
+
+
 def build_premarket_brief():
     """📋 장전 리포트 = 어제 수급 한 줄 + 오늘 주요 일정 + 증권가 목표가"""
     now = now_kst()
@@ -6021,6 +6099,11 @@ def build_premarket_brief():
         parts.append("🗓 오늘 주요 일정\n" + ("\n".join(_event_line(e).split("\n")[0] for e in todays[:8]) if todays else "· 큰 일정 없음"))
     except Exception as e:
         print(f"[brief:premarket] 일정 실패: {e}")
+    # 📌 오늘 볼 만한 후보 (데이터로 고른 것 — 추천 아님, 링크로 바로 종목분석)
+    try:
+        parts.append(_build_watch_candidates())
+    except Exception as e:
+        print(f"[brief:premarket] 후보 실패: {e}")
     # 🎯 증권가 목표가
     text, ref = build_targets_brief()
     if text:
