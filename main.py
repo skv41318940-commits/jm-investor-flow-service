@@ -6741,34 +6741,51 @@ def _sentiment_from_naver() -> list:
     return rows
 
 
-def _sentiment_from_kofia() -> list:
-    """금융투자협회 FreeSIS 증시자금추이 (주소·필드명 확인 필요)"""
+def _kofia_rows(obj_nm: str, days: int = 90) -> list:
     end = now_kst()
-    start = end - timedelta(days=60)
+    start = end - timedelta(days=days)
     res = requests.post(
         "https://freesis.kofia.or.kr/meta/getMetaDataList.do",
         json={"dmSearch": {"tmpV40": "1000000", "tmpV41": "1", "tmpV1": "D", "tmpV45": start.strftime("%Y%m%d"),
-                           "tmpV46": end.strftime("%Y%m%d"), "OBJ_NM": "STATSCU0100000060BO"}},
+                           "tmpV46": end.strftime("%Y%m%d"), "OBJ_NM": obj_nm}},
         headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"},
         timeout=12,
     )
-    data = res.json()
-    rows = []
-    for r in data.get("ds1") or []:
+    return res.json().get("ds1") or []
+
+
+def _sentiment_from_kofia() -> list:
+    """
+    금융투자협회 FreeSIS (2026-10-12 디버그로 확인, 단위 백만원 → 억원으로 바꿈)
+    ① 증시자금추이(STATSCU0100000060BO): TMPV2 투자자예탁금 · TMPV5 위탁매매 미수금 ·
+       TMPV6 미수금 대비 실제 반대매매 금액 · TMPV7 반대매매 비중(%)
+    ② 신용공여 잔고추이(STATSCU0100000070BO): TMPV2 신용거래융자 합계 (⚠️ 칸 위치 확인 필요 — 크기로 검증)
+    """
+    by_date = {}
+    for r in _kofia_rows("STATSCU0100000060BO"):
         d = str(r.get("TMPV1") or "")
         if len(d) != 8:
             continue
-        rows.append({
+        dep, misu, forced = _num_kr(r.get("TMPV2")), _num_kr(r.get("TMPV5")), _num_kr(r.get("TMPV6"))
+        by_date[d] = {
             "date": f"{d[:4]}-{d[4:6]}-{d[6:]}",
-            "deposit": _num_kr(r.get("TMPV2")),  # 투자자예탁금 (백만원으로 올 수 있음 — 아래에서 단위 보정)
-            "credit": _num_kr(r.get("TMPV6")),
-            "forced_sale": _num_kr(r.get("TMPV9")),
-        })
-    for r in rows:  # 백만원이면 억원으로
-        for k in ("deposit", "credit", "forced_sale"):
-            if r.get(k) and r[k] > 3_000_000:
-                r[k] = round(r[k] / 100, 0)
-    return rows
+            "deposit": round(dep / 100) if dep is not None else None,
+            "misu": round(misu / 100) if misu is not None else None,
+            "forced_sale": round(forced / 100, 1) if forced is not None else None,
+            "forced_ratio": _num_kr(r.get("TMPV7")),
+            "credit": None,
+        }
+    try:
+        for r in _kofia_rows("STATSCU0100000070BO"):
+            d = str(r.get("TMPV1") or "")
+            v = _num_kr(r.get("TMPV2"))
+            if d in by_date and v is not None:
+                eok = v / 100
+                if 50_000 <= eok <= 1_000_000:  # 5조~100조 사이일 때만 신용융자로 인정 (칸이 틀리면 안 씀)
+                    by_date[d]["credit"] = round(eok)
+    except Exception as e:
+        print(f"[sentiment] 신용잔고 실패: {e}")
+    return list(by_date.values())
 
 
 def fetch_market_sentiment() -> dict:
@@ -6810,16 +6827,9 @@ def market_sentiment_debug():
         except Exception as e:
             out[label] = {"error": str(e)}
     try:
-        r = requests.post(
-            "https://freesis.kofia.or.kr/meta/getMetaDataList.do",
-            json={"dmSearch": {"tmpV40": "1000000", "tmpV41": "1", "tmpV1": "D", "tmpV45": "20261001",
-                               "tmpV46": "20261012", "OBJ_NM": "STATSCU0100000060BO"}},
-            headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"},
-            timeout=12,
-        )
-        out["kofia_raw"] = {"status": r.status_code, "preview": r.text[:800]}
+        out["credit_raw_top3"] = _kofia_rows("STATSCU0100000070BO", days=10)[:3]
     except Exception as e:
-        out["kofia_raw"] = {"error": str(e)}
+        out["credit_raw"] = {"error": str(e)}
     return out
 
 
