@@ -6878,6 +6878,98 @@ def market_sentiment_debug():
     return out
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 🇺🇸 미국 핵심 지표 결과표 (고용·실업률·CPI·PCE) — FRED 공식 값
+# ──────────────────────────────────────────────────────────────────────────
+# 예전 매크로 화면 표(PC 프로그램이 채우던 econ_calendar)를 서버가 직접 채우는 방식으로 대체.
+# 실제값·이전값은 FRED 관측치로 계산하고, 다음 발표일은 FRED 발표 일정(45일 앞까지)에서 찾음.
+# ══════════════════════════════════════════════════════════════════════════
+US_INDICATORS = [
+    # (키, 이름, FRED 시리즈, 계산 방식, FRED 발표 이름, 단위)
+    ("nfp", "비농업 고용 증감", "PAYEMS", "diff", "Employment Situation", "만명"),
+    ("unrate", "실업률", "UNRATE", "level", "Employment Situation", "%"),
+    ("cpi", "CPI (전년비)", "CPIAUCSL", "yoy", "Consumer Price Index", "%"),
+    ("core_cpi", "근원 CPI (전년비)", "CPILFESL", "yoy", "Consumer Price Index", "%"),
+    ("pce", "PCE 물가 (전년비)", "PCEPI", "yoy", "Personal Income and Outlays", "%"),
+    ("core_pce", "근원 PCE (전년비)", "PCEPILFE", "yoy", "Personal Income and Outlays", "%"),
+]
+_us_ind_cache = {"at": 0.0, "data": None}
+
+
+def _fred_obs(series: str, limit: int = 15) -> list:
+    res = requests.get(
+        "https://api.stlouisfed.org/fred/series/observations",
+        params={"series_id": series, "api_key": FRED_API_KEY, "file_type": "json", "sort_order": "desc", "limit": limit},
+        timeout=20,
+    )
+    res.raise_for_status()
+    out = []
+    for o in res.json().get("observations", []):
+        try:
+            out.append((o["date"], float(o["value"])))
+        except (ValueError, KeyError):
+            continue
+    return out  # 최신순
+
+
+def fetch_us_indicators() -> dict:
+    c = _us_ind_cache
+    if c["data"] and time.time() - c["at"] < 3 * 3600:
+        return c["data"]
+    if not FRED_API_KEY:
+        raise RuntimeError("FRED_API_KEY 미설정")
+    # 다음 발표일 (45일 앞까지)
+    now = now_kst()
+    start = now.strftime("%Y-%m-%d")
+    end = (now + timedelta(days=45)).strftime("%Y-%m-%d")
+    next_release = {}
+    try:
+        for r in _fred_release_dates(start, end):
+            nm = (r.get("release_name") or "").lower()
+            for _, _, _, _, rel, _ in US_INDICATORS:
+                if rel.lower() in nm and r["date"] >= start and rel not in next_release:
+                    et = next((t for k, _, t, *_ in US_RELEASES if k == rel), "08:30")
+                    kst = _us_to_kst(r["date"], et)
+                    next_release[rel] = kst.strftime("%Y-%m-%d %H:%M")
+    except Exception as e:
+        print(f"[us_indicators] 다음 발표일 실패: {e}")
+
+    rows = []
+    for key, name, series, mode, rel, unit in US_INDICATORS:
+        try:
+            obs = _fred_obs(series)
+        except Exception as e:
+            rows.append({"key": key, "name": name, "error": str(e)})
+            continue
+        if len(obs) < 14:
+            continue
+        (d0, v0), (d1, v1) = obs[0], obs[1]
+        if mode == "diff":  # 만 명 단위 증감 (FRED는 천 명)
+            actual, prev = round((v0 - v1) / 10, 1), round((v1 - obs[2][1]) / 10, 1)
+        elif mode == "yoy":
+            actual = round((v0 / obs[12][1] - 1) * 100, 1)
+            prev = round((v1 / obs[13][1] - 1) * 100, 1)
+        else:
+            actual, prev = v0, v1
+        rows.append({
+            "key": key, "name": name, "ref_month": d0[:7], "actual": actual, "prev": prev,
+            "change": round(actual - prev, 2), "unit": unit, "next_release": next_release.get(rel),
+        })
+        time.sleep(0.2)
+    data = {"ok": True, "rows": rows}
+    c.update({"at": time.time(), "data": data})
+    return data
+
+
+@app.get("/api/us-indicators")
+def us_indicators_endpoint():
+    """미국 핵심 지표 결과 — 비농업 고용·실업률·CPI·근원CPI·PCE·근원PCE (실제·이전·다음 발표일)"""
+    try:
+        return fetch_us_indicators()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/ping")
 def ping():
     return {"ok": True}
