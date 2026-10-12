@@ -5449,6 +5449,58 @@ def _fetch_us_economic(start: str, end: str) -> list:
     return out
 
 
+# 🇺🇸 미국 대형주 한글 이름 (실적발표 일정용) — 목록에 없으면 영문 이름을 깔끔하게 줄여서 씀
+US_KR_NAMES = {
+    "AAPL": "애플", "MSFT": "마이크로소프트", "NVDA": "엔비디아", "GOOGL": "알파벳(구글)", "GOOG": "알파벳(구글)",
+    "AMZN": "아마존", "META": "메타", "TSLA": "테슬라", "AVGO": "브로드컴", "TSM": "TSMC", "BRK.B": "버크셔해서웨이",
+    "JPM": "JP모건", "V": "비자", "MA": "마스터카드", "LLY": "일라이릴리", "UNH": "유나이티드헬스", "XOM": "엑슨모빌",
+    "JNJ": "존슨앤드존슨", "WMT": "월마트", "PG": "P&G", "HD": "홈디포", "ORCL": "오라클", "COST": "코스트코",
+    "ABBV": "애브비", "BAC": "뱅크오브아메리카", "KO": "코카콜라", "PEP": "펩시코", "MRK": "머크", "CVX": "셰브론",
+    "NFLX": "넷플릭스", "AMD": "AMD", "ADBE": "어도비", "CRM": "세일즈포스", "TMO": "써모피셔", "ASML": "ASML",
+    "SAP": "SAP", "NVO": "노보노디스크", "AZN": "아스트라제네카", "TM": "도요타", "WFC": "웰스파고",
+    "MS": "모건스탠리", "GS": "골드만삭스", "C": "씨티그룹", "BLK": "블랙록", "SCHW": "찰스슈왑",
+    "AXP": "아메리칸익스프레스", "IBM": "IBM", "INTC": "인텔", "QCOM": "퀄컴", "TXN": "텍사스인스트루먼트",
+    "MU": "마이크론", "AMAT": "어플라이드머티리얼즈", "LRCX": "램리서치", "KLAC": "KLA", "CSCO": "시스코",
+    "ACN": "액센츄어", "NOW": "서비스나우", "INTU": "인튜이트", "UBER": "우버", "PLTR": "팔란티어",
+    "SHOP": "쇼피파이", "DIS": "디즈니", "MCD": "맥도날드", "NKE": "나이키", "SBUX": "스타벅스",
+    "CAT": "캐터필러", "GE": "GE에어로스페이스", "BA": "보잉", "RTX": "RTX", "LMT": "록히드마틴",
+    "HON": "하니웰", "UNP": "유니언퍼시픽", "UPS": "UPS", "T": "AT&T", "VZ": "버라이즌", "TMUS": "T모바일",
+    "CMCSA": "컴캐스트", "PFE": "화이자", "ABT": "애보트", "DHR": "다나허", "AMGN": "암젠",
+    "ISRG": "인튜이티브서지컬", "BMY": "BMS", "GILD": "길리어드", "CVS": "CVS헬스", "PGR": "프로그레시브",
+    "PLD": "프로로지스", "HDB": "HDFC은행", "BABA": "알리바바", "PDD": "PDD(테무)", "SONY": "소니",
+    "HSBC": "HSBC", "RY": "캐나다왕립은행", "TD": "TD뱅크", "SHEL": "셸", "BHP": "BHP", "RIO": "리오틴토",
+    "LIN": "린데", "NEE": "넥스트에라에너지", "SPGI": "S&P글로벌", "BX": "블랙스톤", "KKR": "KKR",
+    "COP": "코노코필립스", "ARM": "ARM", "ANET": "아리스타네트웍스", "PANW": "팔로알토네트웍스",
+    "CRWD": "크라우드스트라이크", "ADP": "ADP", "MDT": "메드트로닉", "SYK": "스트라이커", "VRTX": "버텍스",
+    "REGN": "리제네론", "MELI": "메르카도리브레", "BKNG": "부킹홀딩스", "ABNB": "에어비앤비", "DELL": "델",
+    "MRVL": "마벨", "APP": "앱러빈", "SNOW": "스노우플레이크", "COIN": "코인베이스", "UL": "유니레버",
+    "DEO": "디아지오", "NVS": "노바티스", "SAN": "산탄데르", "MUFG": "미쓰비시UFJ", "SMFG": "미쓰이스미토모",
+    "IBN": "ICICI은행", "INFY": "인포시스", "TTE": "토탈에너지스", "BP": "BP", "HMC": "혼다", "ETN": "이튼",
+    "DE": "디어앤컴퍼니", "MMM": "3M", "TJX": "TJX", "LOW": "로우스", "ELV": "엘레반스헬스", "CI": "시그나",
+    "MO": "알트리아", "PM": "필립모리스", "USB": "US뱅코프", "PNC": "PNC", "COF": "캐피털원", "MMC": "마시앤드매클레넌",
+    "CB": "처브", "ICE": "ICE", "CME": "CME그룹", "GEV": "GE버노바", "VRT": "버티브", "TT": "트레인",
+    "WM": "웨이스트매니지먼트", "AMT": "아메리칸타워", "EQIX": "에퀴닉스", "TSCO": "트랙터서플라이",
+    "LULU": "룰루레몬", "ADI": "아날로그디바이시스", "SNPS": "시놉시스", "CDNS": "케이던스", "FI": "파이서브",
+    "WDAY": "워크데이", "TEAM": "아틀라시안", "DDOG": "데이터독", "ZS": "지스케일러", "SPOT": "스포티파이",
+    "NTES": "넷이즈", "JD": "징둥닷컴", "BIDU": "바이두", "TCEHY": "텐센트", "RACE": "페라리", "STLA": "스텔란티스",
+    "GM": "GM", "F": "포드", "LVS": "라스베이거스샌즈", "MAR": "메리어트", "HLT": "힐튼", "DAL": "델타항공",
+    "UAL": "유나이티드항공", "FDX": "페덱스", "NOC": "노스롭그루먼", "GD": "제너럴다이내믹스",
+}
+_NAME_SUFFIX_RE = re.compile(
+    r"(,?\s*(Inc\.?|Incorporated|Corporation|Corp\.?|Company|Co\.?|Ltd\.?|Limited|plc|PLC|N\.V\.|S\.A\.|AG|SE|Holdings?|Group|& Co))+\s*$"
+)
+
+
+def _us_name(symbol: str, name: str) -> str:
+    if symbol in US_KR_NAMES:
+        return US_KR_NAMES[symbol]
+    n = re.sub(r"\(The\)", "", name or symbol).strip()
+    n = re.sub(r"^The\s+", "", n)
+    for _ in range(3):
+        n = _NAME_SUFFIX_RE.sub("", n).strip(" ,")
+    return n or symbol
+
+
 def _fetch_us_earnings(start: str, end: str, min_cap: float = 100e9) -> list:
     out = []
     d = datetime.strptime(start, "%Y-%m-%d")
@@ -5480,7 +5532,7 @@ def _fetch_us_earnings(start: str, end: str, min_cap: float = 100e9) -> list:
                     {
                         "date": d.strftime("%Y-%m-%d"),
                         "time": None,
-                        "title": f"美) {r.get('name') or r.get('symbol')} 실적발표" + (f" ({tlabel})" if tlabel else ""),
+                        "title": f"美) {_us_name(r.get('symbol') or '', r.get('name') or '')} 실적발표" + (f" ({tlabel})" if tlabel else ""),
                         "major": cap_v >= 500e9,
                         "note": f"{r.get('symbol')} · 시가총액 ${cap_v / 1e9:,.0f}B",
                         "kind": "us_earnings",
