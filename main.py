@@ -5698,6 +5698,11 @@ BRIEF_SCHEDULE = {
     "rally": (9, 30),  # 🚀 아침 상승 랭킹 (09:00~09:30)
     "theme_am": (10, 0),  # 🌅 오전장 테마 이슈 (20:00 테마 이슈의 오전판 — 변동성 미리 보기)
     "schedule": (14, 0),
+    "news_11": (11, 0),  # 🌍 세계 증시 이슈 (오전)
+    "news_15": (15, 0),  # 🌍 세계 증시 이슈 (오후)
+    "ir_16": (16, 0),  # 📢 실적발표 예고·IR (오전~16시 분)
+    "ir_2010": (20, 10),  # 📢 실적발표 예고·IR (16시 이후 분)
+    "news_2020": (20, 20),  # 🌍 세계 증시 이슈 (저녁)
     "flow": (16, 10),
     "theme": (20, 0),
 }
@@ -6061,7 +6066,7 @@ def build_schedule_brief(max_per_day: int = 6):
     # 📢 최근 7일 실적발표 예고·IR 공시 (날짜는 공시 원문에 있어서 링크로 확인)
     try:
         _, rows = build_earnings_digest(days=7)
-        plans = [r for r in rows if _classify_disclosure(r.get("report_nm")) == "plan"][:10]
+        plans = _dedup_by_corp([r for r in rows if _classify_disclosure(r.get("report_nm")) == "plan"])[:10]
         if plans:
             parts.append("📢 실적발표 예고·IR 공시 (최근 7일)\n" + "\n".join(_disclosure_line(r, set()) for r in plans))
     except Exception as e:
@@ -6307,7 +6312,112 @@ def build_theme_am_brief():
     return text, ref
 
 
+# ── 📢 실적발표 예고·IR 모아보기 (16:00 · 20:10) ──
+def build_plan_digest():
+    if not DART_API_KEY:
+        return None, None
+    text, rows = build_earnings_digest(days=2, only_new=True, types=("plan",), sent_kind="dart_plan")
+    if not text:
+        return None, None
+    for r in rows:  # 보낸 것으로 기록 (정정 중복 포함) — 실제 발송 성공 여부와 상관없이 다음 회차 중복 방지
+        _mark_brief_sent("dart_plan", r["rcept_no"])
+    return text.replace("📊 실적 공시 알림", "📢 실적발표 예고·IR 모아보기"), now_kst().strftime("%Y-%m-%d")
+
+
+# ── 🌍 세계 증시 이슈 (11:00 · 15:00 · 20:20) ──
+# 구글 뉴스 RSS(무료, 키 없음)에서 지역별로 최근 기사를 모아 "주가에 영향 줄 만한" 단어가 들어간 것 위주로 추림.
+# AI 요약 없이 제목·출처·링크만 (비용 0). 한 번 보낸 기사는 다음 회차에 다시 안 보냄.
+NEWS_REGIONS = [
+    ("🇺🇸 미국", "뉴욕증시 OR 미국증시 OR 연준 OR 나스닥 OR 미국 국채"),
+    ("🇰🇷 국내", "코스피 OR 코스닥 OR 외국인 순매도 OR 외국인 순매수"),
+    ("🇨🇳 중국·아시아", "중국 증시 OR 중국 반도체 OR 홍콩증시 OR 일본증시 OR 대만 증시 OR 닛케이"),
+    ("🇪🇺 유럽", "유럽증시 OR 유로존 OR ECB OR 프랑스 국채 OR 독일 경제"),
+    ("🌍 중동·원자재", "중동 OR 국제유가 OR 이란 OR 이스라엘 OR OPEC"),
+    ("💱 환율·금리", "원달러 환율 OR 국채금리 OR 달러 강세 OR 엔화"),
+]
+NEWS_IMPACT_WORDS = [
+    "급락", "급등", "폭락", "폭등", "쇼크", "사상 최고", "최저", "관세", "금리", "연준", "인상", "인하", "제재", "전쟁",
+    "공습", "반도체", "실적", "어닝", "부진", "충격", "위기", "디폴트", "국채", "유가", "환율", "규제", "수출", "AI",
+]
+NEWS_MAJOR_SOURCES = ["연합뉴스", "한국경제", "매일경제", "머니투데이", "이데일리", "서울경제", "뉴스1", "조선비즈", "한경", "블룸버그", "로이터"]
+
+
+def _google_news(query: str, hours: int = 8) -> list:
+    from email.utils import parsedate_to_datetime
+
+    res = requests.get(
+        "https://news.google.com/rss/search",
+        params={"q": f"{query} when:{hours}h", "hl": "ko", "gl": "KR", "ceid": "KR:ko"},
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=10,
+    )
+    res.raise_for_status()
+    root = ET.fromstring(res.content)
+    out = []
+    for it in root.iter("item"):
+        title = (it.findtext("title") or "").strip()
+        src = (it.findtext("source") or "").strip()
+        if src and title.endswith(f" - {src}"):
+            title = title[: -len(src) - 3].strip()
+        try:
+            pub = parsedate_to_datetime(it.findtext("pubDate")).astimezone(KST)
+        except Exception:
+            pub = None
+        out.append({"title": title, "source": src, "link": (it.findtext("link") or "").strip(), "pub": pub})
+    return out
+
+
+def _news_score(n: dict) -> float:
+    t = n["title"]
+    score = sum(2 for w in NEWS_IMPACT_WORDS if w in t)
+    score += 1.5 if any(sname in n["source"] for sname in NEWS_MAJOR_SOURCES) else 0
+    if n.get("pub"):
+        score += max(0.0, 3 - (now_kst() - n["pub"]).total_seconds() / 3600 / 2)  # 최근일수록 가산
+    return score
+
+
+def build_world_news_brief(per_region: int = 3, hours: int = 8):
+    now = now_kst()
+    parts = [f"🌍 세계 증시 이슈 ({now.month}/{now.day} {now.strftime('%H:%M')})\n━━━━━━━━━━━━"]
+    seen_titles, sent_links = set(), []
+    for label, q in NEWS_REGIONS:
+        try:
+            items = _google_news(q, hours)
+        except Exception as e:
+            print(f"[news] {label} 실패: {e}")
+            continue
+        picked = []
+        for n in sorted(items, key=_news_score, reverse=True):
+            key = re.sub(r"[^가-힣A-Za-z0-9]", "", n["title"])[:22]
+            if not n["title"] or key in seen_titles:
+                continue
+            if _brief_already_sent("news", n["link"][:200]):
+                continue
+            seen_titles.add(key)
+            picked.append(n)
+            if len(picked) >= per_region:
+                break
+        if picked:
+            lines = [label]
+            for n in picked:
+                tm = n["pub"].strftime("%H:%M") if n.get("pub") else ""
+                lines.append(f"· {n['title']} ({n['source']} {tm})\n  🔗 {n['link']}")
+                sent_links.append(n["link"][:200])
+            parts.append("\n".join(lines))
+    if len(parts) == 1:
+        return None, None
+    for l in sent_links:
+        _mark_brief_sent("news", l)
+    parts.append("※ 제목만 모은 거라, 영향이 클 것 같은 기사는 링크로 내용 확인하세요.")
+    return "\n\n".join(parts), now.strftime("%Y-%m-%d")
+
+
 BRIEF_BUILDERS = {
+    "news_11": build_world_news_brief,
+    "news_15": build_world_news_brief,
+    "news_2020": build_world_news_brief,
+    "ir_16": build_plan_digest,
+    "ir_2010": build_plan_digest,
     "rally": build_rally_brief,
     "theme_am": build_theme_am_brief,
     "morning": build_morning_brief,
@@ -6341,7 +6451,7 @@ def _run_telegram_briefs():
                 continue
         try:
             # 기준 날짜를 먼저 정해서 이미 보냈는지 확인 (모닝·목표가는 내용 날짜, 나머지는 오늘)
-            if kind in ("flow", "theme", "schedule", "theme_am", "rally") and _brief_already_sent(kind, now.strftime("%Y-%m-%d")):
+            if kind in ("flow", "theme", "schedule", "theme_am", "rally", "news_11", "news_15", "news_2020", "ir_16", "ir_2010") and _brief_already_sent(kind, now.strftime("%Y-%m-%d")):
                 continue
             text, ref = BRIEF_BUILDERS[kind]()
             if not text or not ref or _brief_already_sent(kind, ref):
@@ -6662,13 +6772,27 @@ def _disclosure_line(r: dict, watch: set) -> str:
             f"\n   🔗 https://dart.fss.or.kr/dsaf001/main.do?rcpNo={r.get('rcept_no')}")
 
 
-def build_earnings_digest(days: int = 1, only_new: bool = False):
+def _dedup_by_corp(rows: list) -> list:
+    """같은 회사의 원공시와 [기재정정]이 따로 잡히면 가장 최근(접수번호 큰) 것 하나만 남김"""
+    best = {}
+    for r in rows:
+        k = (r.get("stock_code"), _classify_disclosure(r.get("report_nm")))
+        if k not in best or str(r.get("rcept_no")) > str(best[k].get("rcept_no")):
+            best[k] = r
+    keep = {id(v) for v in best.values()}
+    return [r for r in rows if id(r) in keep]
+
+
+def build_earnings_digest(days: int = 1, only_new: bool = False, types: tuple = ("result", "plan"), sent_kind: str = "dart_earn"):
     now = now_kst()
     bgn = (now - timedelta(days=days - 1)).strftime("%Y%m%d")
     rows = _dart_list(bgn, now.strftime("%Y%m%d"))
     rows = [r for r in rows if r.get("stock_code") and _classify_disclosure(r.get("report_nm"))]
+    rows = [r for r in rows if _classify_disclosure(r.get("report_nm")) in types]
     if only_new:
-        rows = [r for r in rows if not _brief_already_sent("dart_earn", r["rcept_no"])]
+        rows = [r for r in rows if not _brief_already_sent(sent_kind, r["rcept_no"])]
+    all_rows = rows
+    rows = _dedup_by_corp(rows)
     try:
         watch = {w["code"] for w in (supabase.table("watchlist").select("code").execute().data or [])}
     except Exception:
@@ -6679,7 +6803,7 @@ def build_earnings_digest(days: int = 1, only_new: bool = False):
     results.sort(key=key)
     plans.sort(key=key)
     if not results and not plans:
-        return None, rows
+        return None, all_rows
     parts = [f"📊 실적 공시 알림 ({now.strftime('%m/%d %H:%M')})\n━━━━━━━━━━━━"]
     if results:
         parts.append(f"📊 실적 발표 ({len(results)}건)\n" + "\n".join(_disclosure_line(r, watch) for r in results[:25])
@@ -6687,7 +6811,7 @@ def build_earnings_digest(days: int = 1, only_new: bool = False):
     if plans:
         parts.append(f"📢 실적 발표 예고·IR ({len(plans)}건)\n" + "\n".join(_disclosure_line(r, watch) for r in plans[:15])
                      + (f"\n외 {len(plans) - 15}건" if len(plans) > 15 else ""))
-    return "\n\n".join(parts), rows
+    return "\n\n".join(parts), all_rows
 
 
 def _check_earnings_disclosures():
@@ -6700,7 +6824,8 @@ def _check_earnings_disclosures():
         return
     _earn_last["at"] = time.time()
     try:
-        text, rows = build_earnings_digest(days=1, only_new=True)
+        # 📊 주가에 바로 영향 주는 "실적 발표"만 실시간(10분마다). 예고·IR은 16:00·20:10에 모아서 보냄
+        text, rows = build_earnings_digest(days=1, only_new=True, types=("result",))
     except Exception as e:
         print(f"[earnings] 공시 확인 실패: {e}")
         return
