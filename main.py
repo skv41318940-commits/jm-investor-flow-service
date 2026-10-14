@@ -2749,6 +2749,7 @@ async def _daily_jobs_worker():
         ("market_flow", _ensure_market_flow_synced_today, ()),
         ("health_report", _ensure_health_report_sent_today, ()),
         ("telegram_briefs", _run_telegram_briefs, ()),
+        ("sector_map", _ensure_sector_jobs, ()),
         ("target_reach", _check_target_reach, ()),
         ("earnings_disclosure", _check_earnings_disclosures, ()),
     ]
@@ -5703,6 +5704,7 @@ BRIEF_SCHEDULE = {
     "ir_16": (16, 0),  # 📢 실적발표 예고·IR (오전~16시 분)
     "ir_2010": (20, 10),  # 📢 실적발표 예고·IR (16시 이후 분)
     "news_2020": (20, 20),  # 🌍 세계 증시 이슈 (저녁)
+    "closing": (20, 40),  # 📝 오늘의 마감 리포트 초안 (피날레)
     "flow": (16, 10),
     "theme": (20, 0),
 }
@@ -6416,7 +6418,123 @@ def build_world_news_brief(per_region: int = 2, hours: int = 8):
     return "\n\n".join(parts), now.strftime("%Y-%m-%d")
 
 
+# ── 📝 오늘의 마감 리포트 초안 (20:40) ──
+# 매일 장 마감 후 리포트를 쓰기 위한 "재료 정리본". 지수·수급·업종·테마·시장심리·관심종목·뉴스·내일 일정을
+# 한 장으로 모으고, 숫자 기준으로 짚어볼 포인트를 덧붙임 (AI 문장 생성 아님, 비용 0).
+def build_closing_report():
+    now = now_kst()
+    ltd = _latest_trading_day()
+    if ltd != now.strftime("%Y%m%d"):
+        return None, None
+    day = f"{ltd[:4]}-{ltd[4:6]}-{ltd[6:]}"
+    P = [f"📝 오늘의 마감 리포트 초안 ({_kr_date(day)})\n━━━━━━━━━━━━"]
+    checks = []
+    # 1) 지수
+    try:
+        il = []
+        for code, nm in (("1001", "코스피"), ("2001", "코스닥")):
+            df = _krx_df(stock.get_index_ohlcv_by_date, (now - timedelta(days=10)).strftime("%Y%m%d"), ltd, code)
+            c0, c1 = float(df["종가"].iloc[-1]), float(df["종가"].iloc[-2])
+            pct = (c0 / c1 - 1) * 100
+            il.append(f"{'🔴▲' if pct > 0 else '🔵▼'} {nm} {c0:,.2f} ({pct:+.2f}%)")
+        P.append("① 지수\n" + "\n".join(il))
+    except Exception as e:
+        print(f"[closing] 지수 실패: {e}")
+    # 2) 수급
+    try:
+        r = supabase.table("market_flow_trend").select("*").eq("market", "KOSPI").eq("trade_date", day).limit(1).execute().data
+        if r:
+            r = r[0]
+            fl = []
+            for nm, f in (("외국인", "foreign_amt"), ("기관", "institution"), ("개인", "individual")):
+                v = float(r.get(f) or 0)
+                st = _streak("KOSPI", f, v)
+                fl.append(f"{nm} {_fmt_eok(v)}" + (f" ⟨{st}일 연속⟩" if st >= 2 else ""))
+                if nm == "외국인" and st >= 5:
+                    checks.append(f"외국인 코스피 {st}거래일 연속 순{'매수' if v > 0 else '매도'} — 추세 지속 여부 확인")
+            P.append("② 코스피 수급\n" + " · ".join(fl))
+    except Exception as e:
+        print(f"[closing] 수급 실패: {e}")
+    # 3) 업종 강약
+    try:
+        tm = supabase.table("sector_treemap").select("market,name,pct,trading_value").execute().data or []
+        tm = [t for t in tm if (t.get("trading_value") or 0) >= 300]
+        if tm:
+            top = sorted(tm, key=lambda t: -t["pct"])[:3]
+            bot = sorted(tm, key=lambda t: t["pct"])[:3]
+            P.append("③ 업종 강약 (거래대금 300억 이상)\n강세: " + ", ".join(f"{t['name']}({t['market'][:2]}) {t['pct']:+.1f}%" for t in top)
+                     + "\n약세: " + ", ".join(f"{t['name']}({t['market'][:2]}) {t['pct']:+.1f}%" for t in bot))
+    except Exception as e:
+        print(f"[closing] 업종 실패: {e}")
+    # 4) 테마
+    try:
+        th = sorted(fetch_naver_theme_list(limit=25), key=lambda t: -t["change_pct"])[:3]
+        P.append("④ 강세 테마\n" + ", ".join(f"{t['theme_name']} {t['change_pct']:+.1f}%" for t in th))
+    except Exception as e:
+        print(f"[closing] 테마 실패: {e}")
+    # 5) 외국인 순매수 TOP5
+    try:
+        rows = (supabase.table("investor_flow").select("name,amount,streak_days").eq("investor_type", "foreign")
+                .eq("period", "daily").eq("side", "buy").order("rank").limit(5).execute().data) or []
+        if rows:
+            P.append("⑤ 외국인 순매수 TOP5\n" + ", ".join(f"{r['name']} {_fmt_eok(r['amount'])}" for r in rows))
+    except Exception as e:
+        print(f"[closing] TOP5 실패: {e}")
+    # 6) 시장심리·공포
+    try:
+        ms = fetch_market_sentiment()
+        last = (ms.get("rows") or [])[-1] if ms.get("rows") else None
+        fear = fear_indices_endpoint()
+        parts = []
+        if last and last.get("credit") and last.get("deposit"):
+            ratio = last["credit"] / last["deposit"] * 100
+            parts.append(f"신용/예탁 {ratio:.1f}% ({last['date'][5:]} 기준)")
+            if ratio >= 40:
+                checks.append("신용/예탁 비율 40% 이상 — 과열, 급락 시 반대매매 주의")
+        vk = fear.get("vkospi") if isinstance(fear, dict) else None
+        if vk:
+            parts.append(f"VKOSPI {vk['value']} (60일 평균 {vk['avg60']})")
+            if vk["value"] >= vk["avg60"] * 1.3:
+                checks.append("VKOSPI가 평균보다 30% 이상 높음 — 공포 구간, 변동성 확대")
+        cnn = fear.get("cnn") if isinstance(fear, dict) else None
+        if cnn:
+            parts.append(f"CNN 공포·탐욕 {cnn['score']} ({cnn['rating']})")
+        if parts:
+            P.append("⑥ 시장심리\n" + " · ".join(parts))
+    except Exception as e:
+        print(f"[closing] 심리 실패: {e}")
+    # 7) 관심종목 오늘 성적
+    try:
+        wl = supabase.table("watchlist").select("code,name").execute().data or []
+        if wl:
+            df = _krx_df(stock.get_market_ohlcv_by_ticker, ltd, market="ALL")
+            res = []
+            for w in wl:
+                if w["code"] in df.index:
+                    res.append((float(df.loc[w["code"], "등락률"]), w["name"]))
+            res.sort(reverse=True)
+            if res:
+                P.append("⑦ 관심종목 (등락률 순)\n" + ", ".join(f"{n} {p:+.1f}%" for p, n in res))
+    except Exception as e:
+        print(f"[closing] 관심종목 실패: {e}")
+    # 8) 내일 주요 일정
+    try:
+        cal = fetch_calendar(4)
+        nxt = sorted({e["date"] for e in cal["events"] if e["date"] > day})
+        if nxt:
+            evs = [e for e in cal["events"] if e["date"] == nxt[0] and (e["major"] or e["kind"] == "kr_macro")][:6]
+            if evs:
+                P.append(f"⑧ 다음 일정 ({_date_head(nxt[0])})\n" + "\n".join(_event_line(e).split("\n")[0] for e in evs))
+    except Exception as e:
+        print(f"[closing] 일정 실패: {e}")
+    if checks:
+        P.append("🔎 체크 포인트\n" + "\n".join(f"· {c}" for c in checks))
+    P.append("✍️ 내 생각 (직접 작성)\n· 오늘 시장 한 줄 요약:\n· 내일 전략:\n· 관심종목 대응:")
+    return "\n\n".join(P), day
+
+
 BRIEF_BUILDERS = {
+    "closing": build_closing_report,
     "news_11": build_world_news_brief,
     "news_15": build_world_news_brief,
     "news_2020": build_world_news_brief,
@@ -6459,7 +6577,7 @@ def _run_telegram_briefs():
                 continue
         try:
             # 기준 날짜를 먼저 정해서 이미 보냈는지 확인 (모닝·목표가는 내용 날짜, 나머지는 오늘)
-            if kind in ("flow", "theme", "schedule", "theme_am", "rally", "news_11", "news_15", "news_2020", "ir_16", "ir_2010") and _brief_already_sent(kind, now.strftime("%Y-%m-%d")):
+            if kind in ("flow", "theme", "schedule", "theme_am", "rally", "news_11", "news_15", "news_2020", "ir_16", "ir_2010", "closing") and _brief_already_sent(kind, now.strftime("%Y-%m-%d")):
                 continue
             text, ref = BRIEF_BUILDERS[kind]()
             if not text or not ref or _brief_already_sent(kind, ref):
@@ -7255,6 +7373,482 @@ def us_indicators_endpoint():
     """미국 핵심 지표 결과 — 비농업 고용·실업률·CPI·근원CPI·PCE·근원PCE (실제·이전·다음 발표일)"""
     try:
         return fetch_us_indicators()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 🗺 시장분석 지도·업종 분류·업종별 수급·투자자별 TOP30 — PC 프로그램 → 클라우드 이전 (2026-10-14)
+# ──────────────────────────────────────────────────────────────────────────
+# 예전엔 PC 프로그램이 채워서 PC를 안 켠 8/15 이후로 멈춰 있었음. 이제 서버가 매일 자동으로 채움.
+#   · sector_stocks / sector_treemap : 네이버 업종(반도체와반도체장비 등) 구성 종목 + 등락률·거래대금 (15:50 이후)
+#   · sector_flow_trend              : 업종별 외국인·기관·개인·연기금 순매수 (KRX 종목별 순매수를 업종으로 합산, 16:20 이후)
+#   · investor_flow / _summary      : 외국인·기관·연기금 순매수/순매도 TOP30 (당일·1주) + 연속 순매수 일수
+# 테이블 모양은 기존 화면이 읽던 그대로 맞춰서, 화면 코드는 안 바꿔도 됨.
+# ══════════════════════════════════════════════════════════════════════════
+def _naver_industry_list() -> list:
+    res = requests.get("https://m.stock.naver.com/api/stocks/industry", headers=_naver_stock_headers(),
+                       params={"page": 1, "pageSize": 100}, timeout=10)
+    res.raise_for_status()
+    data = res.json()
+    groups = data.get("groups") if isinstance(data, dict) else data
+    return [g for g in (groups or []) if isinstance(g, dict) and g.get("no") and g.get("name")]
+
+
+def _naver_industry_stocks(no) -> list:
+    out = []
+    for page in range(1, 6):
+        res = requests.get(f"https://m.stock.naver.com/api/stocks/industry/{no}", headers=_naver_stock_headers(),
+                           params={"page": page, "pageSize": 100}, timeout=10)
+        if not res.ok:
+            break
+        stocks = (res.json() or {}).get("stocks") or []
+        out += stocks
+        if len(stocks) < 100:
+            break
+    return out
+
+
+def _kosdaq_codes() -> set:
+    try:
+        return set(stock.get_market_ticker_list(_latest_trading_day(), market="KOSDAQ"))
+    except Exception as e:
+        print(f"[sector_map] 코스닥 종목 목록 실패: {e}")
+        return set()
+
+
+def sync_sector_map(dry: bool = False) -> dict:
+    industries = _naver_industry_list()
+    kosdaq = _kosdaq_codes()
+    now_iso = now_kst().isoformat()
+    stock_rows, agg = [], {}
+
+    def f(v):
+        try:
+            return float(str(v).replace(",", ""))
+        except (TypeError, ValueError):
+            return 0.0
+
+    for ind in industries:
+        try:
+            stocks = _naver_industry_stocks(ind["no"])
+        except Exception as e:
+            print(f"[sector_map] {ind['name']} 실패: {e}")
+            continue
+        for st in stocks:
+            code = st.get("itemCode")
+            if not code:
+                continue
+            exch = (st.get("stockExchangeType") or {}).get("code") if isinstance(st.get("stockExchangeType"), dict) else None
+            market = "KOSDAQ" if (exch in ("KQ", "KOSDAQ") or code in kosdaq) else "KOSPI"
+            pct = f(st.get("fluctuationsRatio"))
+            val = _to_eok_from_naver(f(st.get("accumulatedTradingValueRaw")), f(st.get("closePriceRaw")),
+                                     f(st.get("accumulatedTradingVolumeRaw")))
+            stock_rows.append({"market": market, "sector_name": ind["name"], "code": code, "name": st.get("stockName") or code,
+                               "pct": round(pct, 2), "trading_value": round(val, 1), "updated_at": now_iso})
+            a = agg.setdefault((market, ind["name"]), {"val": 0.0, "wpct": 0.0})
+            a["val"] += val
+            a["wpct"] += pct * val
+        time.sleep(0.1)
+    tree_rows = [
+        {"market": m, "name": n, "ticker": "", "pct": round(a["wpct"] / a["val"], 2) if a["val"] else 0.0,
+         "trading_value": round(a["val"], 1), "updated_at": now_iso}
+        for (m, n), a in agg.items()
+    ]
+    if dry:
+        return {"industries": len(industries), "stocks": len(stock_rows), "treemap": len(tree_rows),
+                "sample_stocks": stock_rows[:3], "sample_treemap": sorted(tree_rows, key=lambda r: -r["trading_value"])[:5]}
+    if len(stock_rows) < 1000:
+        raise ValueError(f"업종 구성 종목이 {len(stock_rows)}개뿐이라 저장 안 함 (네이버 응답 확인 필요)")
+    supabase.table("sector_stocks").delete().neq("code", "").execute()
+    for i in range(0, len(stock_rows), 500):
+        supabase.table("sector_stocks").insert(stock_rows[i:i + 500]).execute()
+    supabase.table("sector_treemap").delete().neq("name", "").execute()
+    supabase.table("sector_treemap").insert(tree_rows).execute()
+    return {"ok": True, "stocks": len(stock_rows), "treemap": len(tree_rows)}
+
+
+INVESTOR_TYPES = {"foreign": "외국인", "institution": "기관합계", "pension": "연기금"}
+
+
+def _net_purchases(fromd: str, tod: str, investor: str):
+    df = _krx_df(stock.get_market_net_purchases_of_equities, fromd, tod, "ALL", investor)
+    if df is None or df.empty:
+        return None
+    col = "순매수거래대금" if "순매수거래대금" in df.columns else df.columns[-1]
+    return df[[col] + (["종목명"] if "종목명" in df.columns else [])].rename(columns={col: "net"})
+
+
+def sync_investor_top30() -> dict:
+    dates = [str(r["trade_date"]).replace("-", "") for r in (
+        supabase.table("market_flow_trend").select("trade_date").eq("market", "ALL")
+        .order("trade_date", desc=True).limit(10).execute().data or [])]
+    if len(dates) < 5:
+        raise ValueError("거래일 목록이 부족해요 (시장 수급 데이터 확인)")
+    today, week_start = dates[0], dates[4]
+    now_iso = now_kst().isoformat()
+    flow_rows, sum_rows = [], []
+    for key, inv in INVESTOR_TYPES.items():
+        daily_by_day = {}
+        for d in dates:  # 연속 순매수 일수 계산용 (최근 10거래일)
+            df = _net_purchases(d, d, inv)
+            if df is not None:
+                daily_by_day[d] = df["net"]
+            time.sleep(0.3)
+        for period, (fd, td) in {"daily": (today, today), "weekly": (week_start, today)}.items():
+            df = _net_purchases(fd, td, inv)
+            if df is None:
+                continue
+            df = df.copy()
+            df["eok"] = df["net"] / 1e8
+            buys = df.sort_values("eok", ascending=False).head(30)
+            sells = df.sort_values("eok").head(30)
+            for side, part in (("buy", buys), ("sell", sells)):
+                for rank, (code, r) in enumerate(part.iterrows(), start=1):
+                    sign = 1 if side == "buy" else -1
+                    streak = 0
+                    for d in dates:
+                        v = daily_by_day.get(d)
+                        if v is None or code not in v.index or v[code] * sign <= 0:
+                            break
+                        streak += 1
+                    nm = r.get("종목명") if isinstance(r.get("종목명"), str) else _safe_ticker_name(code, allow_remote=False)
+                    flow_rows.append({"investor_type": key, "period": period, "side": side, "rank": rank, "code": code,
+                                      "name": nm, "streak_days": streak, "amount": round(float(r["eok"]), 1), "updated_at": now_iso})
+            label = today if period == "daily" else f"{week_start} ~ {today}"
+            sum_rows.append({"investor_type": key, "period": period, "label": label,
+                             "total_buy": round(float(buys["eok"].sum()), 1), "total_sell": round(abs(float(sells["eok"].sum())), 1),
+                             "updated_at": now_iso})
+    if not flow_rows:
+        raise ValueError("KRX 투자자별 순매수를 가져오지 못했어요")
+    supabase.table("investor_flow").delete().neq("code", "").execute()
+    for i in range(0, len(flow_rows), 500):
+        supabase.table("investor_flow").insert(flow_rows[i:i + 500]).execute()
+    supabase.table("investor_flow_summary").delete().neq("label", "").execute()
+    supabase.table("investor_flow_summary").insert(sum_rows).execute()
+    return {"ok": True, "rows": len(flow_rows)}
+
+
+def sync_sector_flow() -> dict:
+    """업종별 투자자 순매수 = KRX 종목별 순매수(외국인·기관·개인·연기금)를 sector_stocks 업종으로 합산"""
+    ltd = _latest_trading_day()
+    day = f"{ltd[:4]}-{ltd[4:6]}-{ltd[6:]}"
+    mapping = {}
+    start = 0
+    while True:
+        rows = supabase.table("sector_stocks").select("code, market, sector_name").range(start, start + 999).execute().data or []
+        for r in rows:
+            mapping[r["code"]] = (r["market"], r["sector_name"])
+        if len(rows) < 1000:
+            break
+        start += 1000
+    totals = {}
+    for field, inv in (("foreign_amt", "외국인"), ("institution", "기관합계"), ("individual", "개인"), ("pension", "연기금")):
+        df = _net_purchases(ltd, ltd, inv)
+        if df is None:
+            continue
+        for code, v in df["net"].items():
+            key = mapping.get(code)
+            if key:
+                t = totals.setdefault(key, {"foreign_amt": 0.0, "institution": 0.0, "individual": 0.0, "pension": 0.0})
+                t[field] += float(v) / 1e8
+        time.sleep(0.3)
+    rows = [{"trade_date": day, "market": m, "sector_name": n, **{k: round(v, 1) for k, v in t.items()}} for (m, n), t in totals.items()]
+    if not rows:
+        raise ValueError("업종별 수급을 계산하지 못했어요")
+    supabase.table("sector_flow_trend").delete().eq("trade_date", day).execute()
+    supabase.table("sector_flow_trend").insert(rows).execute()
+    return {"ok": True, "date": day, "sectors": len(rows)}
+
+
+def _ensure_sector_jobs():
+    """평일 15:50 이후 업종 지도, 16:20 이후 TOP30·업종별 수급 — 하루 1번씩 (실패하면 5분 뒤 다시)"""
+    now = now_kst()
+    if now.weekday() >= 5 or now.hour >= 22:
+        return
+    today = now.strftime("%Y-%m-%d")
+    jobs = [("job_sector_map", (15, 50), sync_sector_map), ("job_investor_top30", (16, 20), sync_investor_top30),
+            ("job_sector_flow", (16, 25), sync_sector_flow)]
+    for kind, (h, m), fn in jobs:
+        if (now.hour, now.minute) < (h, m) or _brief_already_sent(kind, today):
+            continue
+        try:
+            if _latest_trading_day() != now.strftime("%Y%m%d"):
+                return  # 휴장일 또는 아직 KRX 확정 전
+            res = fn()
+            _mark_brief_sent(kind, today)
+            print(f"[sector_jobs] {kind} 완료: {res}")
+        except Exception as e:
+            print(f"[sector_jobs] {kind} 실패 (5분 뒤 재시도): {e}")
+
+
+@app.get("/api/sync-sector-map")
+def sync_sector_map_endpoint(dry: bool = True):
+    """업종 지도 동기화 — dry=true(기본)는 저장 없이 미리보기, dry=false면 실제 저장"""
+    try:
+        return sync_sector_map(dry=dry)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/sync-investor-top30")
+def sync_investor_top30_endpoint():
+    try:
+        return sync_investor_top30()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/sync-sector-flow")
+def sync_sector_flow_endpoint():
+    try:
+        return sync_sector_flow()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ⚡ 실시간(장중) 수급 — 한투 "국내기관·외국인 매매종목 가집계" (FHPTJ04400000)
+# ──────────────────────────────────────────────────────────────────────────
+# 장중 증권사들이 집계한 외국인·기관 잠정 순매수 상위/하위 종목 (확정치는 장 마감 후 KRX).
+# 📈 선물 투자자별 동향은 한투 "시장별 투자자매매동향(시세)"(FHPTJ04030000)인데 파라미터를 확인해야 해서
+#    /api/futures-investor-debug 로 후보를 시험해 보고 맞추는 중.
+# ══════════════════════════════════════════════════════════════════════════
+_live_cache: dict = {}
+
+
+def fetch_live_investor_top(market: str = "ALL", who: str = "foreign", side: str = "buy", n: int = 15) -> dict:
+    key = (market, who, side)
+    c = _live_cache.get(key)
+    if c and time.time() - c[0] < 120:
+        return c[1]
+    iscd = {"ALL": "0000", "KOSPI": "0001", "KOSDAQ": "1001"}.get(market, "0000")
+    etc = {"all": "0", "foreign": "1", "institution": "2"}.get(who, "1")
+    data = kis_get(
+        "/uapi/domestic-stock/v1/quotations/foreign-institution-total",
+        "FHPTJ04400000",
+        {"FID_COND_MRKT_DIV_CODE": "V", "FID_COND_SCR_DIV_CODE": "16449", "FID_INPUT_ISCD": iscd,
+         "FID_DIV_CLS_CODE": "1", "FID_RANK_SORT_CLS_CODE": "0" if side == "buy" else "1", "FID_ETC_CLS_CODE": etc},
+    )
+    rows = []
+    for r in (data.get("output") or [])[:n]:
+        f = lambda k: float(r.get(k) or 0)
+        frgn = f("frgn_ntby_tr_pbmn")
+        orgn = f("orgn_ntby_tr_pbmn")
+        rows.append({
+            "code": r.get("mksc_shrn_iscd"), "name": r.get("hts_kor_isnm"),
+            "price": f("stck_prpr"), "pct": f("prdy_ctrt"),
+            # 금액은 백만원 단위로 옴 → 억원
+            "foreign_eok": round(frgn / 100, 1), "institution_eok": round(orgn / 100, 1),
+        })
+    out = {"ok": True, "market": market, "who": who, "side": side, "at": now_kst().strftime("%H:%M"), "rows": rows,
+           "rt_cd": data.get("rt_cd"), "msg": data.get("msg1")}
+    _live_cache[key] = (time.time(), out)
+    return out
+
+
+@app.get("/api/live-investor-top")
+def live_investor_top_endpoint(market: str = "ALL", who: str = "foreign", side: str = "buy"):
+    """장중 외국인·기관 잠정 순매수(buy)/순매도(sell) 상위 — 2분 캐시"""
+    try:
+        return fetch_live_investor_top(market, who, side)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+FUT_CANDIDATES = [
+    {"FID_INPUT_ISCD": "K2I", "FID_INPUT_ISCD_2": "F001"},
+    {"FID_INPUT_ISCD": "999", "FID_INPUT_ISCD_2": "F001"},
+    {"FID_INPUT_ISCD": "K2I", "FID_INPUT_ISCD_2": "S001"},
+    {"FID_INPUT_ISCD": "0001", "FID_INPUT_ISCD_2": "S001"},
+]
+
+
+@app.get("/api/futures-investor-debug")
+def futures_investor_debug():
+    """선물 투자자별 동향 — 한투 시장별 투자자매매동향 파라미터 후보를 차례로 시험해서 원본 응답을 보여줌"""
+    out = {}
+    for i, extra in enumerate(FUT_CANDIDATES):
+        try:
+            data = kis_get("/uapi/domestic-stock/v1/quotations/inquire-investor-time-by-market", "FHPTJ04030000", extra)
+            out[f"try{i}:{extra}"] = {"rt_cd": data.get("rt_cd"), "msg": data.get("msg1"),
+                                      "preview": json.dumps(data.get("output") or data.get("output1") or data, ensure_ascii=False)[:600]}
+        except Exception as e:
+            out[f"try{i}:{extra}"] = {"error": str(e)}
+        time.sleep(0.3)
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 📈 FRED 일별 히스토리 (美 2년물 등 야후에 없는 지표 차트용)
+# ══════════════════════════════════════════════════════════════════════════
+@app.get("/api/fred-history")
+def fred_history_endpoint(series_id: str = "DGS2", weekly: bool = False):
+    try:
+        obs = list(reversed(_fred_obs(series_id, limit=900)))  # 오래된 순
+        pts, seen_week = [], {}
+        for d, v in obs:
+            dt = datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            t = int(dt.timestamp())
+            if weekly:
+                seen_week[dt.isocalendar()[:2]] = {"time": t, "open": v, "high": v, "low": v, "close": v}
+            else:
+                pts.append({"time": t, "open": v, "high": v, "low": v, "close": v})
+        if weekly:
+            pts = sorted(seen_week.values(), key=lambda p: p["time"])
+        return {"ok": True, "series_id": series_id, "points": pts}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 😨 공포지수 — 국내 VKOSPI(코스피200 변동성지수) + 세계 CNN 공포·탐욕 지수
+# ══════════════════════════════════════════════════════════════════════════
+_fear_cache = {"at": 0.0, "data": None}
+_vkospi_ticker = {"code": None}
+
+
+def _find_vkospi_ticker():
+    if _vkospi_ticker["code"]:
+        return _vkospi_ticker["code"]
+    ymd = _latest_trading_day()
+    for mkt in ("KRX", "KOSPI", "테마"):
+        try:
+            for t in stock.get_index_ticker_list(ymd, market=mkt):
+                nm = stock.get_index_ticker_name(t) or ""
+                if "변동성" in nm or "VKOSPI" in nm.upper():
+                    _vkospi_ticker["code"] = t
+                    return t
+        except Exception:
+            continue
+    return None
+
+
+def fetch_vkospi():
+    t = _find_vkospi_ticker()
+    if not t:
+        raise ValueError("KRX 지수 목록에서 VKOSPI를 찾지 못했어요")
+    end = _latest_trading_day()
+    start = (datetime.strptime(end, "%Y%m%d") - timedelta(days=90)).strftime("%Y%m%d")
+    df = _krx_df(stock.get_index_ohlcv_by_date, start, end, t)
+    closes = [(i.strftime("%Y-%m-%d"), float(r["종가"])) for i, r in df.iterrows()]
+    if len(closes) < 2:
+        raise ValueError("VKOSPI 데이터가 부족해요")
+    last, prev = closes[-1][1], closes[-2][1]
+    return {"date": closes[-1][0], "value": round(last, 2), "change_pct": round((last / prev - 1) * 100, 2),
+            "avg60": round(sum(v for _, v in closes[-60:]) / len(closes[-60:]), 2), "history": closes[-60:]}
+
+
+def fetch_cnn_fear_greed():
+    res = requests.get(
+        "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://edition.cnn.com/"},
+        timeout=10,
+    )
+    res.raise_for_status()
+    fg = res.json().get("fear_and_greed") or {}
+    kr = {"extreme fear": "극도의 공포", "fear": "공포", "neutral": "중립", "greed": "탐욕", "extreme greed": "극도의 탐욕"}
+    return {
+        "score": round(float(fg.get("score") or 0), 1),
+        "rating": kr.get(str(fg.get("rating") or "").lower(), fg.get("rating")),
+        "prev_close": round(float(fg.get("previous_close") or 0), 1),
+        "week_ago": round(float(fg.get("previous_1_week") or 0), 1),
+        "month_ago": round(float(fg.get("previous_1_month") or 0), 1),
+        "updated": str(fg.get("timestamp") or "")[:16],
+    }
+
+
+@app.get("/api/fear-indices")
+def fear_indices_endpoint():
+    c = _fear_cache
+    if c["data"] and time.time() - c["at"] < 30 * 60:
+        return c["data"]
+    out = {"ok": True}
+    for key, fn in (("vkospi", fetch_vkospi), ("cnn", fetch_cnn_fear_greed)):
+        try:
+            out[key] = fn()
+        except Exception as e:
+            out[key] = None
+            out[f"{key}_error"] = str(e)
+    if out.get("vkospi") or out.get("cnn"):
+        c.update({"at": time.time(), "data": out})
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 📒 회사 소개 (내 관심종목 사전용) — DART 기업개황 + 최근 사업보고서 "사업의 개요"
+# ══════════════════════════════════════════════════════════════════════════
+_profile_cache: dict = {}
+
+
+def _extract_business_overview(text: str, length: int = 1200) -> str:
+    plain = re.sub(r"<[^>]+>", " ", text)
+    plain = re.sub(r"&[a-z]+;", " ", plain)
+    plain = re.sub(r"\s+", " ", plain)
+    idx = -1
+    for key in ("사업의 개요", "사업의개요"):
+        # 목차에 먼저 나오는 경우가 많아서 두 번째 등장(본문)을 우선 사용
+        first = plain.find(key)
+        second = plain.find(key, first + 1) if first >= 0 else -1
+        idx = second if second >= 0 else first
+        if idx >= 0:
+            idx += len(key)
+            break
+    if idx < 0:
+        return ""
+    body = plain[idx: idx + length * 2]
+    stop = re.search(r"2\.\s*주요\s*제품|2\.\s*주요 제품 및 서비스|주요 제품 및 서비스", body)
+    if stop and stop.start() > 200:
+        body = body[: stop.start()]
+    return body[:length].strip(" .:-")
+
+
+def fetch_company_profile(code: str) -> dict:
+    c = _profile_cache.get(code)
+    if c and time.time() - c[0] < 7 * 86400:
+        return c[1]
+    corp = _dart_corp_code(code)
+    if not corp:
+        raise ValueError("DART에서 회사를 찾지 못했어요")
+    info = requests.get("https://opendart.fss.or.kr/api/company.json",
+                        params={"crtfc_key": DART_API_KEY, "corp_code": corp}, timeout=10).json()
+    overview, report_nm = "", None
+    try:
+        lst = requests.get("https://opendart.fss.or.kr/api/list.json", params={
+            "crtfc_key": DART_API_KEY, "corp_code": corp, "pblntf_detail_ty": "A001",
+            "bgn_de": (now_kst() - timedelta(days=800)).strftime("%Y%m%d"), "page_count": 5,
+        }, timeout=10).json()
+        reports = lst.get("list") or []
+        if reports:
+            rcp = reports[0]["rcept_no"]
+            report_nm = reports[0].get("report_nm")
+            res = requests.get("https://opendart.fss.or.kr/api/document.xml",
+                               params={"crtfc_key": DART_API_KEY, "rcept_no": rcp}, timeout=30)
+            if res.content[:2] == b"PK":
+                with zipfile.ZipFile(io.BytesIO(res.content)) as zf:
+                    names = sorted(zf.namelist(), key=lambda n: zf.getinfo(n).file_size, reverse=True)
+                    raw = zf.read(names[0])
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    text = raw.decode("euc-kr", errors="replace")
+                overview = _extract_business_overview(text)
+    except Exception as e:
+        print(f"[profile] {code} 사업의 개요 실패: {e}")
+    out = {
+        "ok": True, "code": code, "name": info.get("corp_name"), "ceo": info.get("ceo_nm"),
+        "established": info.get("est_dt"), "homepage": info.get("hm_url"), "address": info.get("adres"),
+        "overview": overview, "source": report_nm,
+    }
+    _profile_cache[code] = (time.time(), out)
+    return out
+
+
+@app.get("/api/company-profile")
+def company_profile_endpoint(code: str):
+    """회사 소개 — 대표·설립일·홈페이지 + 최근 사업보고서 '사업의 개요' 앞부분 (DART)"""
+    try:
+        return fetch_company_profile((code or "").strip().upper())
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
