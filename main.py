@@ -5797,7 +5797,7 @@ def build_morning_brief():
             continue
         if sym == "^GSPC":
             us_date = q["date"]
-        arrow = "🔺" if q["pct"] > 0 else "🔻" if q["pct"] < 0 else "▫️"
+        arrow = "🔴▲" if q["pct"] > 0 else "🔵▼" if q["pct"] < 0 else "⚪"  # 한국식: 상승 빨강·하락 파랑
         price = q["price"]
         if unit == "%":
             val = f"{price:.3f}%"
@@ -5811,7 +5811,7 @@ def build_morning_brief():
     if not rows:
         return None, None
     idx = [r for r in rows[:5]]
-    up = sum(1 for r in idx[:3] if r.startswith("🔺"))
+    up = sum(1 for r in idx[:3] if r.startswith("🔴"))
     mood = "3대 지수 모두 상승" if up == 3 else "3대 지수 모두 하락" if up == 0 else "3대 지수 혼조"
     eu_rows = []
     for label, sym, unit in EUROPE_SYMBOLS:
@@ -5821,7 +5821,7 @@ def build_morning_brief():
             q = None
         if not q:
             continue
-        arrow = "🔺" if q["pct"] > 0 else "🔻" if q["pct"] < 0 else "▫️"
+        arrow = "🔴▲" if q["pct"] > 0 else "🔵▼" if q["pct"] < 0 else "⚪"  # 한국식: 상승 빨강·하락 파랑
         val = f"{q['price']:,.2f}" + ("p" if unit == "p" else "") if label != "유로/달러" else f"{q['price']:.4f}"
         eu_rows.append(f"{arrow} {label} {val} ({q['pct']:+.2f}%)")
     text = (
@@ -5896,10 +5896,10 @@ def build_targets_brief():
 
     parts = [f"🎯 증권가 목표가 ({_kr_date(latest)}~ 리포트 {len(day_items)}건)\n━━━━━━━━━━━━"]
     if ups:
-        parts.append("🔺 목표가 상향 TOP\n" + "\n".join(line(r, pct) for pct, r in ups[:10]))
+        parts.append("🔴▲ 목표가 상향 TOP\n" + "\n".join(line(r, pct) for pct, r in ups[:10]))
     if downs:
         downs.sort(key=lambda x: x[0])
-        parts.append("🔻 목표가 하향\n" + "\n".join(line(r, pct) for pct, r in downs[:5]))
+        parts.append("🔵▼ 목표가 하향\n" + "\n".join(line(r, pct) for pct, r in downs[:5]))
     if news:
         parts.append("🆕 신규·유지\n" + "\n".join(line(r) for r in news[:5]))
     if len(parts) == 1:
@@ -6328,12 +6328,16 @@ def build_plan_digest():
 # 구글 뉴스 RSS(무료, 키 없음)에서 지역별로 최근 기사를 모아 "주가에 영향 줄 만한" 단어가 들어간 것 위주로 추림.
 # AI 요약 없이 제목·출처·링크만 (비용 0). 한 번 보낸 기사는 다음 회차에 다시 안 보냄.
 NEWS_REGIONS = [
+    # 🌐 증시 말고 세계 정세 자체 (전쟁·외교·정상회담·선거·재난 등) — 2026-10-14 요청으로 맨 위에 추가
+    ("🌐 세계 주요뉴스", "국제 정세 OR 정상회담 OR 전쟁 OR 외교 OR 대선 OR 제재 OR 휴전"),
     ("🇺🇸 미국", "뉴욕증시 OR 미국증시 OR 연준 OR 나스닥 OR 미국 국채"),
     ("🇰🇷 국내", "코스피 OR 코스닥 OR 외국인 순매도 OR 외국인 순매수"),
-    ("🇨🇳 중국·아시아", "중국 증시 OR 중국 반도체 OR 홍콩증시 OR 일본증시 OR 대만 증시 OR 닛케이"),
+    ("🇨🇳 중국", "중국 증시 OR 상하이증시 OR 중국 반도체 OR 중국 경제 OR 홍콩증시"),
+    ("🇯🇵 일본", "일본증시 OR 닛케이 OR 일본은행 OR 엔화"),
+    ("🌏 그외 아시아", "대만 증시 OR TSMC OR 인도 증시 OR 베트남 증시 OR 동남아"),
     ("🇪🇺 유럽", "유럽증시 OR 유로존 OR ECB OR 프랑스 국채 OR 독일 경제"),
     ("🌍 중동·원자재", "중동 OR 국제유가 OR 이란 OR 이스라엘 OR OPEC"),
-    ("💱 환율·금리", "원달러 환율 OR 국채금리 OR 달러 강세 OR 엔화"),
+    ("💱 환율·금리", "원달러 환율 OR 국채금리 OR 달러 강세"),
 ]
 NEWS_IMPACT_WORDS = [
     "급락", "급등", "폭락", "폭등", "쇼크", "사상 최고", "최저", "관세", "금리", "연준", "인상", "인하", "제재", "전쟁",
@@ -6376,7 +6380,7 @@ def _news_score(n: dict) -> float:
     return score
 
 
-def build_world_news_brief(per_region: int = 3, hours: int = 8):
+def build_world_news_brief(per_region: int = 2, hours: int = 8):
     now = now_kst()
     parts = [f"🌍 세계 증시 이슈 ({now.month}/{now.day} {now.strftime('%H:%M')})\n━━━━━━━━━━━━"]
     seen_titles, sent_links = set(), []
@@ -6438,6 +6442,10 @@ def _run_telegram_briefs():
         if (now.hour, now.minute) < (h, m) or now.hour >= 23:
             continue
         if kind == "morning" and wd not in (1, 2, 3, 4, 5):  # 화~토 아침 = 미국 월~금장
+            continue
+        if kind == "morning" and (now.hour, now.minute) >= (9, 0):
+            # ⚠️ 야후 일봉 확정이 늦으면 하루 종일 재시도하다가 밤 10시 반(미국장 개장)에 엉뚱하게 보낸 일이 있어서
+            # (2026-10-14) 아침 9시까지 못 보내면 그날은 건너뜀
             continue
         if kind != "morning" and wd >= 5:
             continue
@@ -7116,7 +7124,7 @@ def _sentiment_from_kofia() -> list:
 
 def fetch_market_sentiment() -> dict:
     c = _sentiment_cache
-    if c["data"] and time.time() - c["at"] < 6 * 3600:
+    if c["data"] and time.time() - c["at"] < 1 * 3600:  # 1시간마다 새로 확인 (협회 발표 시각이 날마다 조금씩 달라서)
         return c["data"]
     rows, source, errors = [], None, []
     for label, fn in (("금융투자협회", _sentiment_from_kofia), ("네이버 증시자금동향", _sentiment_from_naver)):
