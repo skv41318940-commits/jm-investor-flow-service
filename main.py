@@ -2750,6 +2750,7 @@ async def _daily_jobs_worker():
         ("health_report", _ensure_health_report_sent_today, ()),
         ("telegram_briefs", _run_telegram_briefs, ()),
         ("sector_map", _ensure_sector_jobs, ()),
+        ("futures_snap", _snap_futures, ()),
         ("target_reach", _check_target_reach, ()),
         ("earnings_disclosure", _check_earnings_disclosures, ()),
     ]
@@ -6455,15 +6456,25 @@ def build_closing_report():
             P.append("② 코스피 수급\n" + " · ".join(fl))
     except Exception as e:
         print(f"[closing] 수급 실패: {e}")
+    # 2-1) 선물 투자자별
+    try:
+        fu = fetch_futures_investor()
+        P.append("②-1 코스피200 선물\n" + " · ".join(
+            f"{nm} {fu[k + '_qty']:+,.0f}계약({_fmt_eok(fu[k + '_eok'])})"
+            for nm, k in (("외국인", "foreign"), ("기관", "institution"), ("개인", "individual"))))
+    except Exception as e:
+        print(f"[closing] 선물 실패: {e}")
     # 3) 업종 강약
     try:
-        tm = supabase.table("sector_treemap").select("market,name,pct,trading_value").execute().data or []
-        tm = [t for t in tm if (t.get("trading_value") or 0) >= 300]
+        tm = supabase.table("sector_treemap").select("market,name,pct,trading_value,updated_at").execute().data or []
+        # 오늘 갱신된 업종 지도만 사용 (예전 값이면 엉뚱한 등락률이 나와서 건너뜀)
+        tm = [t for t in tm if (t.get("trading_value") or 0) >= 300 and str(t.get("updated_at") or "")[:10] == day]
         if tm:
             top = sorted(tm, key=lambda t: -t["pct"])[:3]
             bot = sorted(tm, key=lambda t: t["pct"])[:3]
-            P.append("③ 업종 강약 (거래대금 300억 이상)\n강세: " + ", ".join(f"{t['name']}({t['market'][:2]}) {t['pct']:+.1f}%" for t in top)
-                     + "\n약세: " + ", ".join(f"{t['name']}({t['market'][:2]}) {t['pct']:+.1f}%" for t in bot))
+            mk = lambda m: "코스피" if m == "KOSPI" else "코스닥"
+            P.append("③ 업종 강약 (거래대금 300억 이상)\n강세: " + ", ".join(f"{t['name']}({mk(t['market'])}) {t['pct']:+.1f}%" for t in top)
+                     + "\n약세: " + ", ".join(f"{t['name']}({mk(t['market'])}) {t['pct']:+.1f}%" for t in bot))
     except Exception as e:
         print(f"[closing] 업종 실패: {e}")
     # 4) 테마
@@ -7386,13 +7397,32 @@ def us_indicators_endpoint():
 #   · investor_flow / _summary      : 외국인·기관·연기금 순매수/순매도 TOP30 (당일·1주) + 연속 순매수 일수
 # 테이블 모양은 기존 화면이 읽던 그대로 맞춰서, 화면 코드는 안 바꿔도 됨.
 # ══════════════════════════════════════════════════════════════════════════
+_sector_last_raw = {"list": None}
+
+
 def _naver_industry_list() -> list:
     res = requests.get("https://m.stock.naver.com/api/stocks/industry", headers=_naver_stock_headers(),
                        params={"page": 1, "pageSize": 100}, timeout=10)
+    _sector_last_raw["list"] = f"HTTP {res.status_code}: {res.text[:500]}"
     res.raise_for_status()
     data = res.json()
-    groups = data.get("groups") if isinstance(data, dict) else data
-    return [g for g in (groups or []) if isinstance(g, dict) and g.get("no") and g.get("name")]
+    groups = None
+    if isinstance(data, dict):
+        for k in ("groups", "industries", "list", "result", "items"):
+            if isinstance(data.get(k), list):
+                groups = data[k]
+                break
+    elif isinstance(data, list):
+        groups = data
+    out = []
+    for g in groups or []:
+        if not isinstance(g, dict):
+            continue
+        no = g.get("no") or g.get("industryNo") or g.get("id")
+        name = g.get("name") or g.get("industryName")
+        if no and name:
+            out.append({"no": no, "name": name})
+    return out
 
 
 def _naver_industry_stocks(no) -> list:
@@ -7419,6 +7449,10 @@ def _kosdaq_codes() -> set:
 
 def sync_sector_map(dry: bool = False) -> dict:
     industries = _naver_industry_list()
+    if not industries:
+        raise ValueError(f"네이버 업종 목록이 비어 있어요 — 응답: {_sector_last_raw['list']}")
+    if dry:
+        industries = industries[:3]  # 미리보기는 3개 업종만 빨리
     kosdaq = _kosdaq_codes()
     now_iso = now_kst().isoformat()
     stock_rows, agg = [], {}
@@ -7456,7 +7490,7 @@ def sync_sector_map(dry: bool = False) -> dict:
         for (m, n), a in agg.items()
     ]
     if dry:
-        return {"industries": len(industries), "stocks": len(stock_rows), "treemap": len(tree_rows),
+        return {"ok": True, "dry_run": True, "industries_sampled": len(industries), "stocks": len(stock_rows), "treemap": len(tree_rows),
                 "sample_stocks": stock_rows[:3], "sample_treemap": sorted(tree_rows, key=lambda r: -r["trading_value"])[:5]}
     if len(stock_rows) < 1000:
         raise ValueError(f"업종 구성 종목이 {len(stock_rows)}개뿐이라 저장 안 함 (네이버 응답 확인 필요)")
@@ -7582,13 +7616,37 @@ def _ensure_sector_jobs():
             print(f"[sector_jobs] {kind} 실패 (5분 뒤 재시도): {e}")
 
 
+_sector_job_status = {"state": "idle", "result": None}
+
+
 @app.get("/api/sync-sector-map")
 def sync_sector_map_endpoint(dry: bool = True):
-    """업종 지도 동기화 — dry=true(기본)는 저장 없이 미리보기, dry=false면 실제 저장"""
-    try:
-        return sync_sector_map(dry=dry)
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    """
+    업종 지도 동기화 — dry=true(기본): 업종 3개만 빨리 미리보기(저장 안 함)
+    dry=false: 전체(약 80개 업종) 저장을 서버 뒤에서 시작 → /api/sync-sector-status 로 진행 확인
+    """
+    if dry:
+        try:
+            return sync_sector_map(dry=True)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def run():
+        _sector_job_status.update({"state": "running", "result": None})
+        try:
+            r1 = sync_sector_map()
+            r2 = sync_sector_flow()
+            _sector_job_status.update({"state": "done", "result": {"map": r1, "flow": r2}})
+        except Exception as e:
+            _sector_job_status.update({"state": "error", "result": str(e)})
+
+    threading.Thread(target=run, daemon=True).start()
+    return {"ok": True, "started": True, "check": "/api/sync-sector-status"}
+
+
+@app.get("/api/sync-sector-status")
+def sync_sector_status():
+    return _sector_job_status
 
 
 @app.get("/api/sync-investor-top30")
@@ -7652,6 +7710,51 @@ def live_investor_top_endpoint(market: str = "ALL", who: str = "foreign", side: 
     """장중 외국인·기관 잠정 순매수(buy)/순매도(sell) 상위 — 2분 캐시"""
     try:
         return fetch_live_investor_top(market, who, side)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+_fut_snaps: dict = {"date": None, "rows": []}
+
+
+def fetch_futures_investor() -> dict:
+    """코스피200 선물 투자자별 순매수 (2026-10-14 확인: FID_INPUT_ISCD=K2I, FID_INPUT_ISCD_2=F001, 금액 단위 백만원)"""
+    data = kis_get("/uapi/domestic-stock/v1/quotations/inquire-investor-time-by-market", "FHPTJ04030000",
+                   {"FID_INPUT_ISCD": "K2I", "FID_INPUT_ISCD_2": "F001"})
+    o = (data.get("output") or [{}])
+    o = o[0] if isinstance(o, list) else o
+    f = lambda k: float(o.get(k) or 0)
+    return {
+        "foreign_qty": f("frgn_ntby_qty"), "foreign_eok": round(f("frgn_ntby_tr_pbmn") / 100, 1),
+        "individual_qty": f("prsn_ntby_qty"), "individual_eok": round(f("prsn_ntby_tr_pbmn") / 100, 1),
+        "institution_qty": f("orgn_ntby_qty"), "institution_eok": round(f("orgn_ntby_tr_pbmn") / 100, 1),
+        "securities_qty": f("scrt_ntby_qty"), "invest_trust_qty": f("ivtr_ntby_qty"),
+    }
+
+
+def _snap_futures():
+    """장중 5분마다 선물 투자자별 누적 순매수를 기록 → 시간대별 흐름 차트"""
+    now = now_kst()
+    if now.weekday() >= 5 or not ((8, 45) <= (now.hour, now.minute) <= (15, 50)):
+        return
+    today = now.strftime("%Y-%m-%d")
+    if _fut_snaps["date"] != today:
+        _fut_snaps.update({"date": today, "rows": []})
+    try:
+        r = fetch_futures_investor()
+        r["time"] = now.strftime("%H:%M")
+        if not _fut_snaps["rows"] or _fut_snaps["rows"][-1]["time"] != r["time"]:
+            _fut_snaps["rows"].append(r)
+    except Exception as e:
+        print(f"[futures] 기록 실패: {e}")
+
+
+@app.get("/api/futures-investor")
+def futures_investor_endpoint():
+    """코스피200 선물 투자자별 순매수 — 지금 값 + 오늘 5분 간격 흐름"""
+    try:
+        cur = fetch_futures_investor()
+        return {"ok": True, "now": now_kst().strftime("%H:%M"), "current": cur, "intraday": _fut_snaps["rows"]}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -7724,10 +7827,42 @@ def _find_vkospi_ticker():
     return None
 
 
+def _vkospi_from_krx_openapi():
+    """KRX Open API 파생상품지수 일별시세(idx/drvprod_dd_trd)에서 '변동성' 지수 — KRX_AUTH_KEY 사용"""
+    if not KRX_AUTH_KEY:
+        return None
+    pts = []
+    d = now_kst()
+    tries = 0
+    while len(pts) < 45 and tries < 75:
+        bas = d.strftime("%Y%m%d")
+        d -= timedelta(days=1)
+        tries += 1
+        if datetime.strptime(bas, "%Y%m%d").weekday() >= 5:
+            continue
+        try:
+            res = requests.get("https://data-dbg.krx.co.kr/svc/apis/idx/drvprod_dd_trd",
+                               headers={"AUTH_KEY": KRX_AUTH_KEY}, params={"basDd": bas}, timeout=8)
+            rows = res.json().get("OutBlock_1", []) if res.ok else []
+        except Exception:
+            rows = []
+        hit = next((r for r in rows if "변동성" in (r.get("IDX_NM") or "")), None)
+        if hit and hit.get("CLSPRC_IDX") not in (None, "", "-"):
+            pts.append((f"{bas[:4]}-{bas[4:6]}-{bas[6:]}", float(str(hit["CLSPRC_IDX"]).replace(",", ""))))
+        elif tries == 1 and not rows and res is not None and not getattr(res, "ok", False):
+            break
+    return list(reversed(pts)) or None
+
+
 def fetch_vkospi():
+    closes = _vkospi_from_krx_openapi()
+    if closes and len(closes) >= 2:
+        last, prev = closes[-1][1], closes[-2][1]
+        return {"date": closes[-1][0], "value": round(last, 2), "change_pct": round((last / prev - 1) * 100, 2),
+                "avg60": round(sum(v for _, v in closes) / len(closes), 2), "history": closes}
     t = _find_vkospi_ticker()
     if not t:
-        raise ValueError("KRX 지수 목록에서 VKOSPI를 찾지 못했어요")
+        raise ValueError("VKOSPI를 찾지 못했어요 (KRX Open API '파생상품지수 일별시세' 서비스 신청 필요할 수 있음)")
     end = _latest_trading_day()
     start = (datetime.strptime(end, "%Y%m%d") - timedelta(days=90)).strftime("%Y%m%d")
     df = _krx_df(stock.get_index_ohlcv_by_date, start, end, t)
@@ -7742,7 +7877,13 @@ def fetch_vkospi():
 def fetch_cnn_fear_greed():
     res = requests.get(
         "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
-        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://edition.cnn.com/"},
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "Referer": "https://edition.cnn.com/markets/fear-and-greed",
+            "Origin": "https://edition.cnn.com",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
         timeout=10,
     )
     res.raise_for_status()
