@@ -7994,6 +7994,47 @@ def company_profile_endpoint(code: str):
         return {"ok": False, "error": str(e)}
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# ⚡ 종목별 장중 투자자 수급 (추정) — 한투 "종목별 외인기관 추정가집계" (FHPTJ04160001)
+# ──────────────────────────────────────────────────────────────────────────
+# 증권사들이 장중 5번(09:30·10:00·11:20·13:20·14:30) 집계하는 외국인·기관 추정 순매수(수량).
+# 개인은 제공되지 않음(외국인·기관의 반대편으로 추정 가능). 확정치는 장 마감 후 KRX.
+# ══════════════════════════════════════════════════════════════════════════
+EST_SLOTS = {"1": "09:30", "2": "10:00", "3": "11:20", "4": "13:20", "5": "14:30"}
+
+
+@app.get("/api/stock-live-flow")
+def stock_live_flow_endpoint(code: str):
+    code = (code or "").strip().upper()
+    try:
+        data = kis_get("/uapi/domestic-stock/v1/quotations/investor-trend-estimate", "HHPTJ04160200",
+                       {"MKSC_SHRN_ISCD": code})
+        rows = data.get("output2") or data.get("output") or []
+        if isinstance(rows, dict):
+            rows = [rows]
+        price = 0.0
+        try:
+            price = _kis_quote(code)["price"]
+        except Exception:
+            pass
+        slots = []
+        for r in rows:
+            gb = str(r.get("bsop_hour_gb") or "")
+            f = lambda k: float(r.get(k) or 0)
+            fq, oq = f("frgn_fake_ntby_qty"), f("orgn_fake_ntby_qty")
+            slots.append({
+                "slot": EST_SLOTS.get(gb, gb), "foreign_qty": fq, "institution_qty": oq,
+                "foreign_eok": round(fq * price / 1e8, 1) if price else None,
+                "institution_eok": round(oq * price / 1e8, 1) if price else None,
+            })
+        slots.sort(key=lambda x: x["slot"])
+        return {"ok": True, "code": code, "price": price, "slots": slots,
+                "rt_cd": data.get("rt_cd"), "msg": data.get("msg1"),
+                "raw_preview": None if slots else json.dumps(data, ensure_ascii=False)[:500]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/ping")
 def ping():
     return {"ok": True}
