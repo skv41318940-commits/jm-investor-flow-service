@@ -8035,6 +8035,81 @@ def stock_live_flow_endpoint(code: str):
         return {"ok": False, "error": str(e)}
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 📓 매매분석 — 매매한 날의 상황 (가격·투자자별 수급·공시·뉴스)
+# ══════════════════════════════════════════════════════════════════════════
+_trade_ctx_cache: dict = {}
+
+
+@app.get("/api/trade-context")
+def trade_context_endpoint(code: str, date: str):
+    """date=YYYY-MM-DD 그날 이 종목: 시가·고가·저가·종가·등락률·거래대금, 투자자별 순매수(억), 앞뒤 3일 공시, 그날 뉴스"""
+    code = (code or "").strip().upper()
+    key = (code, date)
+    if key in _trade_ctx_cache:
+        return _trade_ctx_cache[key]
+    ymd = date.replace("-", "")
+    out = {"ok": True, "code": code, "date": date}
+    # 가격
+    try:
+        start = (datetime.strptime(ymd, "%Y%m%d") - timedelta(days=10)).strftime("%Y%m%d")
+        df = _krx_df(stock.get_market_ohlcv_by_date, start, ymd, code)
+        if df is not None and len(df) >= 1:
+            r = df.iloc[-1]
+            prev = float(df["종가"].iloc[-2]) if len(df) >= 2 else None
+            out["price"] = {
+                "date": df.index[-1].strftime("%Y-%m-%d"), "open": float(r["시가"]), "high": float(r["고가"]),
+                "low": float(r["저가"]), "close": float(r["종가"]), "volume": float(r["거래량"]),
+                "pct": round((float(r["종가"]) / prev - 1) * 100, 2) if prev else None,
+            }
+    except Exception as e:
+        out["price_error"] = str(e)
+    # 투자자별 순매수 (억원)
+    try:
+        df = _krx_df(stock.get_market_trading_value_by_date, ymd, ymd, code)
+        if df is not None and not df.empty:
+            r = df.iloc[-1]
+            out["investors"] = {k: round(float(r[k]) / 1e8, 1) for k in df.columns if k in ("개인", "외국인합계", "기관합계", "기타법인")}
+    except Exception as e:
+        out["investors_error"] = str(e)
+    # 공시 (앞뒤 3일)
+    if DART_API_KEY:
+        try:
+            corp = _dart_corp_code(code)
+            if corp:
+                d0 = datetime.strptime(ymd, "%Y%m%d")
+                res = requests.get("https://opendart.fss.or.kr/api/list.json", params={
+                    "crtfc_key": DART_API_KEY, "corp_code": corp, "bgn_de": (d0 - timedelta(days=3)).strftime("%Y%m%d"),
+                    "end_de": (d0 + timedelta(days=3)).strftime("%Y%m%d"), "page_count": 30}, timeout=10).json()
+                out["disclosures"] = [{"date": f"{x['rcept_dt'][:4]}-{x['rcept_dt'][4:6]}-{x['rcept_dt'][6:]}",
+                                       "title": re.sub(r"\s+", " ", x.get("report_nm") or "").strip(),
+                                       "link": f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={x['rcept_no']}"}
+                                      for x in (res.get("list") or [])]
+        except Exception as e:
+            out["disclosures_error"] = str(e)
+    # 뉴스 (그날 앞뒤 하루, 구글 뉴스)
+    try:
+        name = _safe_ticker_name(code, allow_remote=False) or code
+        d0 = datetime.strptime(ymd, "%Y%m%d")
+        q = f'"{name}" after:{(d0 - timedelta(days=1)).strftime("%Y-%m-%d")} before:{(d0 + timedelta(days=2)).strftime("%Y-%m-%d")}'
+        res = requests.get("https://news.google.com/rss/search", params={"q": q, "hl": "ko", "gl": "KR", "ceid": "KR:ko"},
+                           headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        items = []
+        for it in ET.fromstring(res.content).iter("item"):
+            title = (it.findtext("title") or "").strip()
+            src = (it.findtext("source") or "").strip()
+            if src and title.endswith(f" - {src}"):
+                title = title[: -len(src) - 3]
+            items.append({"title": title, "source": src, "link": (it.findtext("link") or "").strip()})
+            if len(items) >= 6:
+                break
+        out["news"] = items
+    except Exception as e:
+        out["news_error"] = str(e)
+    _trade_ctx_cache[key] = out
+    return out
+
+
 @app.get("/api/ping")
 def ping():
     return {"ok": True}
