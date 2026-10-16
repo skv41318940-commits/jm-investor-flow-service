@@ -8110,6 +8110,48 @@ def trade_context_endpoint(code: str, date: str):
     return out
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# ⏱ 날짜 지정 1분봉 (단기 매매분석용) — 한투 "주식일별분봉조회" (FHKST03010230)
+# 당일·전날 등 과거 날짜의 09:00~15:30 1분봉. 한 번에 120개씩 받아서 앞으로 이어붙임.
+# ══════════════════════════════════════════════════════════════════════════
+@app.get("/api/stock-minute-by-date")
+def stock_minute_by_date_endpoint(code: str, date: str):
+    code = (code or "").strip().upper()
+    ymd = date.replace("-", "")
+    rows, cursor, seen = [], "153000", set()
+    try:
+        for _ in range(6):
+            data = kis_get(
+                "/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice",
+                "FHKST03010230",
+                {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code, "FID_INPUT_HOUR_1": cursor,
+                 "FID_INPUT_DATE_1": ymd, "FID_PW_DATA_INCU_YN": "Y", "FID_FAKE_TICK_INCU_YN": ""},
+            )
+            batch = [r for r in (data.get("output2") or []) if r.get("stck_bsop_date") == ymd]
+            new = [r for r in batch if r.get("stck_cntg_hour") not in seen]
+            if not new:
+                break
+            for r in new:
+                seen.add(r["stck_cntg_hour"])
+                rows.append(r)
+            earliest = min(r["stck_cntg_hour"] for r in new)
+            if earliest <= "090000":
+                break
+            t = datetime.strptime(earliest, "%H%M%S") - timedelta(minutes=1)
+            cursor = t.strftime("%H%M%S")
+            time.sleep(0.12)
+        candles = sorted(
+            [{"time": f"{r['stck_cntg_hour'][:2]}:{r['stck_cntg_hour'][2:4]}", "open": float(r["stck_oprc"]),
+              "high": float(r["stck_hgpr"]), "low": float(r["stck_lwpr"]), "close": float(r["stck_prpr"]),
+              "volume": float(r.get("cntg_vol") or 0)} for r in rows],
+            key=lambda c: c["time"],
+        )
+        return {"ok": bool(candles), "code": code, "date": date, "candles": candles,
+                "error": None if candles else "그날 분봉이 없어요 (휴장일이거나 너무 오래된 날짜)"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/ping")
 def ping():
     return {"ok": True}
