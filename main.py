@@ -8336,6 +8336,138 @@ def us_sector_flow_endpoint():
     return data
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 🔎 해외(미국) 종목 상세 — SEC 공식 공시·재무제표 + 나스닥 애널리스트 목표가·회사 소개 + 뉴스
+# ──────────────────────────────────────────────────────────────────────────
+# SEC(미국 증권거래위원회)는 User-Agent에 연락처를 넣어야 응답함. 공시·재무는 무료 공식 데이터.
+# ══════════════════════════════════════════════════════════════════════════
+SEC_HEADERS = {"User-Agent": os.environ.get("SEC_USER_AGENT", "JM Tracker jm-tracker@example.com"), "Accept-Encoding": "gzip, deflate"}
+_sec_cik = {"at": 0.0, "map": {}}
+_us_detail_cache: dict = {}
+
+
+def _sec_cik_of(symbol: str):
+    c = _sec_cik
+    if not c["map"] or time.time() - c["at"] > 7 * 86400:
+        res = requests.get("https://www.sec.gov/files/company_tickers.json", headers=SEC_HEADERS, timeout=20)
+        c["map"] = {v["ticker"].upper(): str(v["cik_str"]).zfill(10) for v in res.json().values()}
+        c["at"] = time.time()
+    return c["map"].get(symbol.upper().replace(".", "-"))
+
+
+def _sec_quarterly(facts: dict):
+    gaap = (facts.get("facts") or {}).get("us-gaap") or {}
+
+    def series(names):
+        for n in names:
+            units = (gaap.get(n) or {}).get("units") or {}
+            vals = units.get("USD") or []
+            q = {}
+            for v in vals:
+                fr = v.get("frame") or ""
+                if re.fullmatch(r"CY\d{4}Q\d", fr):
+                    q[fr] = v.get("val")
+            if q:
+                return q
+        return {}
+
+    rev = series(["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet"])
+    op = series(["OperatingIncomeLoss"])
+    net = series(["NetIncomeLoss"])
+    frames = sorted(set(rev) | set(op) | set(net))[-8:]
+    return [{"period": f"{f[2:6]}Q{f[-1]}", "revenue": rev.get(f), "op": op.get(f), "net": net.get(f)} for f in frames]
+
+
+@app.get("/api/us-stock-detail")
+def us_stock_detail_endpoint(symbol: str):
+    symbol = (symbol or "").strip().upper()
+    c = _us_detail_cache.get(symbol)
+    if c and time.time() - c[0] < 1800:
+        return c[1]
+    out = {"ok": True, "symbol": symbol}
+    # SEC 공시 + 재무
+    try:
+        cik = _sec_cik_of(symbol)
+        out["cik"] = cik
+        if cik:
+            sub = requests.get(f"https://data.sec.gov/submissions/CIK{cik}.json", headers=SEC_HEADERS, timeout=15).json()
+            rec = (sub.get("filings") or {}).get("recent") or {}
+            filings = []
+            for i, form in enumerate(rec.get("form") or []):
+                if form not in ("10-K", "10-Q", "8-K", "20-F", "6-K", "S-1", "DEF 14A", "4", "13D", "SC 13G"):
+                    continue
+                acc = rec["accessionNumber"][i].replace("-", "")
+                filings.append({"date": rec["filingDate"][i], "form": form, "desc": (rec.get("primaryDocDescription") or [""] * 999)[i] or "",
+                                "link": f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc}/{rec['primaryDocument'][i]}"})
+                if len(filings) >= 30:
+                    break
+            out["filings"] = filings
+            out["company"] = {"name": sub.get("name"), "industry": sub.get("sicDescription"), "exchange": ", ".join(sub.get("exchanges") or [])}
+            facts = requests.get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json", headers=SEC_HEADERS, timeout=20).json()
+            out["quarters"] = _sec_quarterly(facts)
+    except Exception as e:
+        out["sec_error"] = str(e)
+    # 나스닥: 애널리스트 목표가·회사 소개
+    nh = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+    try:
+        t = requests.get(f"https://api.nasdaq.com/api/analyst/{symbol}/targetprice", headers=nh, timeout=10).json()
+        co = ((t.get("data") or {}).get("consensusOverview")) or {}
+        out["target"] = {k: co.get(k) for k in ("lowPriceTarget", "highPriceTarget", "priceTarget", "buy", "sell", "hold")}
+    except Exception as e:
+        out["target_error"] = str(e)
+    try:
+        prof = requests.get(f"https://api.nasdaq.com/api/company/{symbol}/company-profile", headers=nh, timeout=10).json()
+        d = (prof.get("data") or {})
+        out["profile"] = {"description": ((d.get("CompanyDescription") or {}).get("value")), "sector": ((d.get("Sector") or {}).get("value")),
+                          "industry": ((d.get("Industry") or {}).get("value")), "website": ((d.get("CompanyUrl") or {}).get("value"))}
+    except Exception as e:
+        out["profile_error"] = str(e)
+    # 뉴스 (한국어 기사 위주)
+    try:
+        kr = US_KR_NAMES.get(symbol) or next((k for k, v in GLOBAL_KR_EXTRA.items() if v == symbol), None)
+        q = f"{kr or symbol} 주가" + (f" OR {symbol}" if kr else "")
+        res = requests.get("https://news.google.com/rss/search", params={"q": f"{q} when:7d", "hl": "ko", "gl": "KR", "ceid": "KR:ko"},
+                           headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        items = []
+        for it in ET.fromstring(res.content).iter("item"):
+            title = (it.findtext("title") or "").strip()
+            src = (it.findtext("source") or "").strip()
+            if src and title.endswith(f" - {src}"):
+                title = title[: -len(src) - 3]
+            items.append({"title": title, "source": src, "link": (it.findtext("link") or "").strip(), "date": (it.findtext("pubDate") or "")[:16]})
+            if len(items) >= 20:
+                break
+        out["news"] = items
+    except Exception as e:
+        out["news_error"] = str(e)
+    _us_detail_cache[symbol] = (time.time(), out)
+    return out
+
+
+@app.get("/api/global-minute")
+def global_minute_endpoint(symbol: str, interval: str = "1m"):
+    """해외 종목 분봉 (야후, 최근 7일 1분봉 / 60일 5분봉) — 현지 시각으로 날짜별 묶음"""
+    try:
+        rng = "7d" if interval == "1m" else "60d"
+        res = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{requests.utils.quote(symbol)}",
+                           params={"range": rng, "interval": interval}, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        r = res.json()["chart"]["result"][0]
+        off = (r.get("meta") or {}).get("gmtoffset") or 0
+        q = r["indicators"]["quote"][0]
+        days = {}
+        for i, t in enumerate(r.get("timestamp") or []):
+            o, h, l, c, v = (q.get(k, [None])[i] for k in ("open", "high", "low", "close", "volume"))
+            if None in (o, h, l, c):
+                continue
+            local = datetime.fromtimestamp(t + off, tz=timezone.utc)
+            days.setdefault(local.strftime("%Y-%m-%d"), []).append(
+                {"time": local.strftime("%H:%M"), "ts": int(t), "open": o, "high": h, "low": l, "close": c, "volume": v or 0})
+        return {"ok": bool(days), "symbol": symbol, "currency": (r.get("meta") or {}).get("currency"),
+                "days": [{"date": d, "candles": days[d]} for d in sorted(days)], "error": None if days else "분봉 데이터가 없어요"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/ping")
 def ping():
     return {"ok": True}
