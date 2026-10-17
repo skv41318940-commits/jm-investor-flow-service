@@ -8224,6 +8224,118 @@ def global_ohlcv_endpoint(symbol: str, start: str, end: str = ""):
         return {"ok": False, "error": str(ex)}
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 🇺🇸 해외 시장분석·랭킹 — 나스닥 공식 스크리너(미국 전 종목: 현재가·등락률·시총·섹터·거래량)
+# ──────────────────────────────────────────────────────────────────────────
+# 미국은 투자자별 수급이 공개되지 않아서, "돈이 몰리는 곳"을 거래대금·섹터 ETF 자금 흐름으로 대신 봄.
+# 한 번 받으면 5분 보관 (전 종목 약 7천 개).
+# ══════════════════════════════════════════════════════════════════════════
+_us_screen_cache = {"at": 0.0, "rows": []}
+SECTOR_KR = {
+    "Technology": "기술", "Health Care": "헬스케어", "Finance": "금융", "Consumer Discretionary": "경기소비재",
+    "Consumer Staples": "필수소비재", "Industrials": "산업재", "Energy": "에너지", "Utilities": "유틸리티",
+    "Real Estate": "부동산", "Telecommunications": "통신", "Basic Materials": "소재", "Miscellaneous": "기타",
+}
+
+
+def _num_us(v):
+    try:
+        return float(str(v).replace("$", "").replace(",", "").replace("%", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_us_screener() -> list:
+    c = _us_screen_cache
+    if c["rows"] and time.time() - c["at"] < 300:
+        return c["rows"]
+    rows = []
+    for ex in ("nasdaq", "nyse", "amex"):
+        try:
+            res = requests.get("https://api.nasdaq.com/api/screener/stocks",
+                               params={"tableonly": "true", "limit": 10000, "exchange": ex, "download": "true"},
+                               headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}, timeout=25)
+            data = (res.json() or {}).get("data") or {}
+            for r in data.get("rows") or []:
+                price, pct, cap, vol = _num_us(r.get("lastsale")), _num_us(r.get("pctchange")), _num_us(r.get("marketCap")), _num_us(r.get("volume"))
+                sym = (r.get("symbol") or "").strip()
+                if not sym or price is None or "^" in sym or "/" in sym:
+                    continue
+                rows.append({
+                    "symbol": sym, "name": US_KR_NAMES.get(sym) or (r.get("name") or sym).replace(" Common Stock", "").replace(" Class A", "")[:40],
+                    "exchange": ex.upper(), "price": price, "pct": pct or 0.0, "cap": cap or 0.0, "volume": vol or 0.0,
+                    "value": round(price * (vol or 0)), "sector": SECTOR_KR.get(r.get("sector") or "", r.get("sector") or "기타"),
+                    "industry": r.get("industry") or "",
+                })
+        except Exception as e:
+            print(f"[us-screener] {ex} 실패: {e}")
+    if rows:
+        c.update({"at": time.time(), "rows": rows})
+    return rows
+
+
+@app.get("/api/us-market-map")
+def us_market_map_endpoint(top: int = 300):
+    """미국 시장 지도 — 시가총액 상위 N개를 섹터별로 (등락률·시총·거래대금)"""
+    rows = sorted([r for r in fetch_us_screener() if r["cap"] > 0], key=lambda r: -r["cap"])[: max(50, min(top, 600))]
+    sectors = {}
+    for r in rows:
+        sectors.setdefault(r["sector"], []).append(r)
+    out = []
+    for sec, items in sectors.items():
+        cap = sum(i["cap"] for i in items)
+        out.append({"sector": sec, "cap": cap, "pct": round(sum(i["pct"] * i["cap"] for i in items) / cap, 2) if cap else 0,
+                    "value": sum(i["value"] for i in items), "stocks": items})
+    return {"ok": bool(out), "sectors": sorted(out, key=lambda x: -x["cap"]), "count": len(rows)}
+
+
+@app.get("/api/us-ranking")
+def us_ranking_endpoint(sort: str = "value", min_cap_b: float = 1.0, min_price: float = 1.0, limit: int = 30, sector: str = ""):
+    """미국 랭킹 — sort: value(거래대금)/gainers/losers/cap/volume · 시총 하한(억달러 아닌 10억달러 B 단위)·가격 하한"""
+    rows = [r for r in fetch_us_screener() if r["cap"] >= min_cap_b * 1e9 and r["price"] >= min_price and (not sector or r["sector"] == sector)]
+    key = {"value": lambda r: -r["value"], "gainers": lambda r: -r["pct"], "losers": lambda r: r["pct"],
+           "cap": lambda r: -r["cap"], "volume": lambda r: -r["volume"]}.get(sort, lambda r: -r["value"])
+    return {"ok": True, "sort": sort, "rows": sorted(rows, key=key)[: max(10, min(limit, 100))], "total": len(rows)}
+
+
+# 섹터 ETF 자금 흐름 — 오늘 거래대금이 최근 20일 평균보다 얼마나 많은지 + 등락 (돈이 어느 섹터로 가나)
+SECTOR_ETFS = [
+    ("XLK", "기술"), ("SMH", "반도체"), ("XLC", "통신서비스"), ("XLY", "경기소비재"), ("XLF", "금융"),
+    ("XLV", "헬스케어"), ("XLI", "산업재"), ("XLE", "에너지"), ("XLB", "소재"), ("XLP", "필수소비재"),
+    ("XLU", "유틸리티"), ("XLRE", "부동산"), ("ARKK", "혁신성장"), ("IWM", "중소형주"),
+]
+_etf_flow_cache = {"at": 0.0, "data": None}
+
+
+@app.get("/api/us-sector-flow")
+def us_sector_flow_endpoint():
+    c = _etf_flow_cache
+    if c["data"] and time.time() - c["at"] < 600:
+        return c["data"]
+    out = []
+    for sym, kr in SECTOR_ETFS:
+        try:
+            res = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}", params={"range": "1mo", "interval": "1d"},
+                               headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+            r = res.json()["chart"]["result"][0]
+            q = r["indicators"]["quote"][0]
+            pts = [(cl, v) for cl, v in zip(q.get("close") or [], q.get("volume") or []) if cl is not None and v is not None]
+            if len(pts) < 3:
+                continue
+            vals = [cl * v for cl, v in pts]
+            today_v, avg20 = vals[-1], sum(vals[:-1]) / max(1, len(vals) - 1)
+            out.append({"symbol": sym, "name": kr, "price": round(pts[-1][0], 2), "pct": round((pts[-1][0] / pts[-2][0] - 1) * 100, 2),
+                        "value": round(today_v), "ratio": round(today_v / avg20, 2) if avg20 else None,
+                        "pct5": round((pts[-1][0] / pts[-6][0] - 1) * 100, 2) if len(pts) >= 6 else None})
+        except Exception as e:
+            print(f"[sector-flow] {sym} 실패: {e}")
+        time.sleep(0.1)
+    data = {"ok": bool(out), "rows": sorted(out, key=lambda x: -(x["pct"] or 0))}
+    if out:
+        c.update({"at": time.time(), "data": data})
+    return data
+
+
 @app.get("/api/ping")
 def ping():
     return {"ok": True}
