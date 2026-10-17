@@ -8198,6 +8198,32 @@ def global_search_endpoint(q: str):
     return {"ok": True, "results": out[:15]}
 
 
+@app.get("/api/global-ohlcv")
+def global_ohlcv_endpoint(symbol: str, start: str, end: str = ""):
+    """해외 종목 일봉 — 시작~종료일을 정확히 (야후 period1/period2). start/end: YYYY-MM-DD"""
+    try:
+        p1 = int(datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
+        e = datetime.strptime(end, "%Y-%m-%d") if end else datetime.utcnow()
+        p2 = int((e + timedelta(days=1)).replace(tzinfo=timezone.utc).timestamp())
+        res = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{requests.utils.quote(symbol)}",
+                           params={"period1": p1, "period2": p2, "interval": "1d", "events": "split"},
+                           headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        r = res.json()["chart"]["result"][0]
+        q = r["indicators"]["quote"][0]
+        meta = r.get("meta", {})
+        out = []
+        for i, t in enumerate(r.get("timestamp") or []):
+            o, h, l, c, v = (q.get(k, [None])[i] for k in ("open", "high", "low", "close", "volume"))
+            if None in (o, h, l, c):
+                continue
+            out.append({"time": int(t), "date": datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%d"),
+                        "open": o, "high": h, "low": l, "close": c, "volume": v or 0})
+        return {"ok": bool(out), "symbol": symbol, "currency": meta.get("currency"), "candles": out,
+                "error": None if out else "데이터가 없어요"}
+    except Exception as ex:
+        return {"ok": False, "error": str(ex)}
+
+
 @app.get("/api/ping")
 def ping():
     return {"ok": True}
