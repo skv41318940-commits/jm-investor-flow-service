@@ -8152,6 +8152,52 @@ def stock_minute_by_date_endpoint(code: str, date: str):
         return {"ok": False, "error": str(e)}
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 🌐 해외 종목 검색 (전 세계, 야후) — 한글 이름(대형주 약 190개)·영문 이름·티커
+# ══════════════════════════════════════════════════════════════════════════
+GLOBAL_KR_EXTRA = {
+    "도쿄일렉트론": "8035.T", "어드반테스트": "6857.T", "소프트뱅크그룹": "9984.T", "패스트리테일링": "9983.T",
+    "키옥시아": "285A.T", "무라타": "6981.T", "도요타": "7203.T", "소니": "6758.T", "닌텐도": "7974.T",
+    "구이저우마오타이": "600519.SS", "마오타이": "600519.SS", "CATL": "300750.SZ", "텐센트": "0700.HK",
+    "알리바바": "9988.HK", "샤오미": "1810.HK", "BYD": "1211.HK", "TSMC": "2330.TW", "폭스콘": "2317.TW",
+    "SAP": "SAP.DE", "지멘스": "SIE.DE", "LVMH": "MC.PA", "에르메스": "RMS.PA", "토탈에너지스": "TTE.PA",
+    "노보노디스크": "NOVO-B.CO", "셸": "SHEL.L", "아스트라제네카": "AZN.L",
+}
+
+
+@app.get("/api/global-search")
+def global_search_endpoint(q: str):
+    q = (q or "").strip()
+    if not q:
+        return {"ok": True, "results": []}
+    out, seen = [], set()
+
+    def add(sym, name, exch=""):
+        if sym and sym not in seen:
+            seen.add(sym)
+            out.append({"symbol": sym, "name": name, "exchange": exch})
+
+    # 1) 한글 이름
+    for kr, sym in GLOBAL_KR_EXTRA.items():
+        if q in kr:
+            add(sym, kr)
+    for sym, kr in US_KR_NAMES.items():
+        if q in kr:
+            add(sym, kr, "미국")
+    # 2) 야후 검색 (영문 이름·티커)
+    try:
+        res = requests.get("https://query1.finance.yahoo.com/v1/finance/search",
+                           params={"q": q, "quotesCount": 10, "newsCount": 0},
+                           headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        for it in (res.json().get("quotes") or []):
+            if it.get("quoteType") in ("EQUITY", "ETF"):
+                add(it.get("symbol"), US_KR_NAMES.get(it.get("symbol")) or it.get("shortname") or it.get("longname") or it.get("symbol"),
+                    it.get("exchDisp") or "")
+    except Exception as e:
+        print(f"[global-search] 야후 검색 실패: {e}")
+    return {"ok": True, "results": out[:15]}
+
+
 @app.get("/api/ping")
 def ping():
     return {"ok": True}
