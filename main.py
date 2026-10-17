@@ -8218,7 +8218,9 @@ def global_ohlcv_endpoint(symbol: str, start: str, end: str = ""):
                 continue
             out.append({"time": int(t), "date": datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%d"),
                         "open": o, "high": h, "low": l, "close": c, "volume": v or 0})
+        kr = US_KR_NAMES.get(symbol.upper()) or next((k for k, v in GLOBAL_KR_EXTRA.items() if v == symbol.upper()), None)
         return {"ok": bool(out), "symbol": symbol, "currency": meta.get("currency"), "candles": out,
+                "name": kr or meta.get("shortName") or meta.get("longName") or symbol,
                 "error": None if out else "데이터가 없어요"}
     except Exception as ex:
         return {"ok": False, "error": str(ex)}
@@ -8462,7 +8464,7 @@ def global_minute_endpoint(symbol: str, interval: str = "1m"):
             local = datetime.fromtimestamp(t + off, tz=timezone.utc)
             days.setdefault(local.strftime("%Y-%m-%d"), []).append(
                 {"time": local.strftime("%H:%M"), "ts": int(t), "open": o, "high": h, "low": l, "close": c, "volume": v or 0})
-        return {"ok": bool(days), "symbol": symbol, "currency": (r.get("meta") or {}).get("currency"),
+        return {"ok": bool(days), "symbol": symbol, "currency": (r.get("meta") or {}).get("currency"), "gmtoffset": off, "gmtoffset": off,
                 "days": [{"date": d, "candles": days[d]} for d in sorted(days)], "error": None if days else "분봉 데이터가 없어요"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
