@@ -2751,6 +2751,7 @@ async def _daily_jobs_worker():
         ("telegram_briefs", _run_telegram_briefs, ()),
         ("sector_map", _ensure_sector_jobs, ()),
         ("futures_snap", _snap_futures, ()),
+        ("us_briefs", _run_us_briefs, ()),
         ("target_reach", _check_target_reach, ()),
         ("earnings_disclosure", _check_earnings_disclosures, ()),
     ]
@@ -5833,6 +5834,10 @@ def build_morning_brief():
         + ("\n\n🇪🇺 유럽 마감\n" + "\n".join(eu_rows) if eu_rows else "")
         + "\n\n" + "\n".join(rows[5:])
     )
+    try:
+        text += "\n\n" + _us_close_extras()
+    except Exception as e:
+        print(f"[brief:morning] 확장 실패: {e}")
     return text, us_date
 
 
@@ -5994,6 +5999,16 @@ def build_flow_brief():
                 lines.append(f"{i} {nm} {_fmt_eok(float(rr[col]) / 1e8, signed=False)}")
     except Exception as e:
         print(f"[brief:flow] 사모 TOP5 실패: {e}")
+    try:  # 🌏 아시아 마감 한 줄 (일본·중국·홍콩)
+        al = []
+        for sym, nm in (("^N225", "니케이"), ("000001.SS", "상해"), ("^HSI", "항셍"), ("^TWII", "대만")):
+            q = _yahoo_quote(sym)
+            if q:
+                al.append(f"{nm} {'🔴▲' if q['pct'] > 0 else '🔵▼'}{q['pct']:+.2f}%")
+        if al:
+            lines.append("\n🌏 아시아: " + " · ".join(al))
+    except Exception as e:
+        print(f"[brief:flow] 아시아 실패: {e}")
     return "\n".join(lines), day
 
 
@@ -6545,6 +6560,8 @@ def build_closing_report():
 
 
 BRIEF_BUILDERS = {
+    "us_pre": lambda: build_us_pre_brief(),
+    "us_open30": lambda: build_us_open30_brief(),
     "closing": build_closing_report,
     "news_11": build_world_news_brief,
     "news_15": build_world_news_brief,
@@ -8468,6 +8485,187 @@ def global_minute_endpoint(symbol: str, interval: str = "1m"):
                 "days": [{"date": d, "candles": days[d]} for d in sorted(days)], "error": None if days else "분봉 데이터가 없어요"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 🇺🇸 미국장 텔레그램 알림 — 국내 하루 흐름(장전 → 개장 초반 → 마감)과 같은 리듬
+#   · 개장 1시간 전 (여름 21:30 / 겨울 22:30 KST): 📋 미국 장전 리포트
+#   · 개장 30분 후 (여름 23:00 / 겨울 24:00 KST): 🚀 미국 개장 초반 상승 랭킹
+#   · 06:15 KST: ☀️ 미국 마감 (기존 + 급등락·섹터·한국 관련주·해외 관심종목)
+# 서머타임은 _us_to_kst가 자동 반영. 미국 휴장일은 나스닥 market-info로 확인.
+# ══════════════════════════════════════════════════════════════════════════
+_us_bday_cache = {"date": None, "val": True}
+
+# 미국 대장주 → 한국 관련주 (움직임이 크면 같이 알려줌)
+KR_LINKS = {
+    "NVDA": "SK하이닉스·한미반도체·삼성전자", "AMD": "삼성전자·SK하이닉스", "MU": "SK하이닉스·삼성전자", "AVGO": "SK하이닉스",
+    "TSM": "삼성전자·DB하이텍", "^SOX": "반도체 전반", "TSLA": "LG에너지솔루션·에코프로비엠·삼성SDI", "AAPL": "LG이노텍·비에이치",
+    "META": "SK하이닉스(HBM)", "MSFT": "SK하이닉스·삼성전자(데이터센터)", "GOOGL": "SK하이닉스", "AMZN": "SK하이닉스",
+    "LLY": "HLB·알테오젠(바이오)", "NVO": "펩트론·한미약품(비만약)", "BA": "한화에어로스페이스·KAI", "XOM": "S-Oil·SK이노베이션",
+}
+
+
+def _us_business_day() -> bool:
+    today = now_kst().strftime("%Y-%m-%d")
+    c = _us_bday_cache
+    if c["date"] == today:
+        return c["val"]
+    val = now_kst().weekday() < 5
+    try:
+        j = requests.get("https://api.nasdaq.com/api/market-info", headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}, timeout=8).json()
+        d = j.get("data") or {}
+        if "isBusinessDay" in d:
+            val = bool(d["isBusinessDay"])
+    except Exception:
+        pass
+    c.update({"date": today, "val": val})
+    return val
+
+
+def _us_session_date():
+    """지금 걸쳐 있는 미국 세션 날짜 — 한국 새벽(0~6시)은 전날 밤에 시작한 세션 (겨울 개장 30분 후 = 00:00 대비)"""
+    return (now_kst() - timedelta(hours=6)).strftime("%Y-%m-%d")
+
+
+def _us_open_kst():
+    """이번 미국 정규장 개장 시각(KST) — 서머타임 자동 반영 (여름 22:30 / 겨울 23:30)"""
+    return _us_to_kst(_us_session_date(), "09:30")
+
+
+def _q_line(sym, label):
+    q = _yahoo_quote(sym)
+    if not q:
+        return None
+    return f"{'🔴▲' if q['pct'] > 0 else '🔵▼' if q['pct'] < 0 else '⚪'} {label} {q['price']:,.2f} ({q['pct']:+.2f}%)"
+
+
+def _global_watch_rows():
+    try:
+        return supabase.table("global_watchlist").select("symbol,name,target_price,stop_price").execute().data or []
+    except Exception:
+        return []
+
+
+def build_us_pre_brief():
+    now = now_kst()
+    lines = [f"📋 미국 장전 리포트 ({now.month}/{now.day} 밤 · 개장 {_us_open_kst().strftime('%H:%M')} KST)\n━━━━━━━━━━━━"]
+    fut = [l for l in (_q_line("NQ=F", "나스닥100 선물"), _q_line("ES=F", "S&P500 선물"), _q_line("YM=F", "다우 선물")) if l]
+    if fut:
+        lines.append("📈 미국 선물\n" + "\n".join(fut))
+    mac = [l for l in (_q_line("^VIX", "VIX"), _q_line("^TNX", "미 10년물"), _q_line("DX-Y.NYB", "달러인덱스"), _q_line("CL=F", "WTI"), _q_line("BTC-USD", "비트코인")) if l]
+    if mac:
+        lines.append("🌐 금리·달러·원자재\n" + "\n".join(mac))
+    eu = [l for l in (_q_line("^GDAXI", "독일 DAX"), _q_line("^FCHI", "프랑스 CAC"), _q_line("^STOXX50E", "유로스톡스50")) if l]
+    if eu:
+        lines.append("🇪🇺 유럽 장중\n" + "\n".join(eu))
+    try:
+        cal = fetch_calendar(2)
+        tonight = []
+        for e in cal["events"]:
+            if not e["kind"].startswith("us_"):
+                continue
+            if e["date"] == now.strftime("%Y-%m-%d") or (e["date"] == (now + timedelta(days=1)).strftime("%Y-%m-%d") and (e.get("time") or "99") < "07:00"):
+                tonight.append(_event_line(e).split("\n")[0])
+        if tonight:
+            lines.append("🗓 오늘 밤 미국 일정\n" + "\n".join(tonight[:10]))
+    except Exception as e:
+        print(f"[us_pre] 일정 실패: {e}")
+    wl = _global_watch_rows()
+    if wl:
+        wq = []
+        for w in wl[:15]:
+            q = _yahoo_quote(w["symbol"])
+            if q:
+                wq.append(f"· {w.get('name') or w['symbol']} {q['price']:,.2f} (전일 {q['pct']:+.2f}%)")
+        if wq:
+            lines.append("⭐ 해외 관심종목\n" + "\n".join(wq))
+    return "\n\n".join(lines), now.strftime("%Y-%m-%d")
+
+
+def build_us_open30_brief(top_n: int = 20):
+    now = now_kst()
+    rows = [r for r in fetch_us_screener() if r["cap"] >= 2e9 and r["price"] >= 5]
+    if not rows:
+        return None, None
+    gain = sorted(rows, key=lambda r: -r["pct"])[:top_n]
+    lines = [f"🚀 미국 개장 초반 상승 랭킹 ({now.strftime('%H:%M')} KST · 개장 30분)\n━━━━━━━━━━━━", "시가총액 20억달러↑ · 주가 $5↑"]
+    for i, r in enumerate(gain, 1):
+        kr = KR_LINKS.get(r["symbol"])
+        lines.append(f"{i}. {r['name']} ({r['symbol']}) {r['pct']:+.2f}% · ${r['price']:,.2f} · 거래대금 ${r['value'] / 1e6:,.0f}M"
+                     + (f"\n   🇰🇷 관련: {kr}" if kr else "") + f"\n   🔗 {FRONTEND_URL}/global-analysis?symbol={r['symbol']}")
+    val = sorted(rows, key=lambda r: -r["value"])[:5]
+    lines.append("\n💵 거래대금 TOP5: " + ", ".join(f"{r['name']} {r['pct']:+.1f}%" for r in val))
+    return "\n".join(lines), now.strftime("%Y-%m-%d")
+
+
+def _us_close_extras() -> str:
+    parts = []
+    rows = [r for r in fetch_us_screener() if r["cap"] >= 10e9]
+    if rows:
+        g = sorted(rows, key=lambda r: -r["pct"])[:5]
+        l = sorted(rows, key=lambda r: r["pct"])[:5]
+        parts.append("🔺 대형주 상승 TOP5: " + ", ".join(f"{r['name']} {r['pct']:+.1f}%" for r in g))
+        parts.append("🔻 대형주 하락 TOP5: " + ", ".join(f"{r['name']} {r['pct']:+.1f}%" for r in l))
+        links = []
+        by = {r["symbol"]: r for r in rows}
+        for sym, kr in KR_LINKS.items():
+            r = by.get(sym)
+            if r and abs(r["pct"]) >= 2:
+                links.append(f"· {r['name']} {r['pct']:+.1f}% → {kr}")
+        if links:
+            parts.append("🇰🇷 한국 관련주 체크\n" + "\n".join(links))
+    try:
+        fl = us_sector_flow_endpoint().get("rows") or []
+        if fl:
+            parts.append("💵 섹터: 강세 " + ", ".join(f"{f['name']} {f['pct']:+.1f}%" for f in fl[:3]) + " / 약세 " + ", ".join(f"{f['name']} {f['pct']:+.1f}%" for f in fl[-3:]))
+    except Exception:
+        pass
+    wl = _global_watch_rows()
+    hits = []
+    for w in wl[:20]:
+        q = _yahoo_quote(w["symbol"])
+        if not q:
+            continue
+        nm = w.get("name") or w["symbol"]
+        if w.get("target_price") and q["price"] >= float(w["target_price"]):
+            hits.append(f"🎯 {nm} 목표가 도달 ({q['price']:,.2f} ≥ {float(w['target_price']):,.2f})")
+        elif w.get("stop_price") and q["price"] <= float(w["stop_price"]):
+            hits.append(f"🛑 {nm} 손절가 이탈 ({q['price']:,.2f} ≤ {float(w['stop_price']):,.2f})")
+        elif abs(q["pct"]) >= 3:
+            hits.append(f"⚡ {nm} {q['pct']:+.1f}%")
+    if hits:
+        parts.append("⭐ 해외 관심종목\n" + "\n".join(hits))
+    return "\n\n".join(parts)
+
+
+def _run_us_briefs():
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    now = now_kst()
+    sess = _us_session_date()
+    if datetime.strptime(sess, "%Y-%m-%d").weekday() >= 5:
+        return
+    try:
+        open_kst = _us_open_kst().replace(tzinfo=None)
+    except Exception:
+        return
+    nowl = now.replace(tzinfo=None)
+    today = sess
+    for kind, at, builder in (
+        ("us_pre", open_kst - timedelta(minutes=60), build_us_pre_brief),
+        ("us_open30", open_kst + timedelta(minutes=30), build_us_open30_brief),
+    ):
+        if not (at <= nowl <= at + timedelta(minutes=40)) or _brief_already_sent(kind, today):
+            continue
+        if not _us_business_day():
+            continue
+        try:
+            text, ref = builder()
+            if text and send_telegram(text):
+                _mark_brief_sent(kind, today)
+                print(f"[us_briefs] {kind} 발송")
+        except Exception as e:
+            print(f"[us_briefs] {kind} 실패: {e}")
 
 
 @app.get("/api/ping")
