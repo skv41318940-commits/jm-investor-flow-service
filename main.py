@@ -8750,17 +8750,107 @@ def _news_issues(query: str, days: int = 30, limit: int = 5):
     return out
 
 
+# 원어 뉴스 — 시장별 언어 (미국 영어 / 일본 일본어 / 중국·홍콩 중국어)
+NEWS_LANG = {
+    "en": {"hl": "en-US", "gl": "US", "ceid": "US:en"},
+    "ja": {"hl": "ja", "gl": "JP", "ceid": "JP:ja"},
+    "zh": {"hl": "zh-TW", "gl": "HK", "ceid": "HK:zh-Hant"},
+}
+
+
+def _lang_of(sym: str) -> str:
+    if sym.endswith(".T"):
+        return "ja"
+    if sym.endswith((".HK", ".SS", ".SZ", ".TW")):
+        return "zh"
+    return "en"
+
+
+def _news_original(sym: str, name: str, days: int = 30, limit: int = 5):
+    from email.utils import parsedate_to_datetime
+    lang = _lang_of(sym)
+    code = sym.split(".")[0]
+    q = {"en": f'"{name}" stock OR "{code}" shares', "ja": f'"{code}" 株', "zh": f'"{code.lstrip("0") or code}" 股價 OR "{name}"'}[lang]
+    res = requests.get("https://news.google.com/rss/search", params={"q": f"{q} when:{days}d", **NEWS_LANG[lang]},
+                       headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+    out, seen = [], set()
+    for it in ET.fromstring(res.content).iter("item"):
+        title = (it.findtext("title") or "").strip()
+        src = (it.findtext("source") or "").strip()
+        if src and title.endswith(f" - {src}"):
+            title = title[: -len(src) - 3]
+        key = title[:30].lower()
+        if not title or key in seen:
+            continue
+        seen.add(key)
+        try:
+            d = parsedate_to_datetime(it.findtext("pubDate")).astimezone(KST).strftime("%Y-%m-%d")
+        except Exception:
+            continue
+        out.append({"date": d, "text": title, "source": src, "link": (it.findtext("link") or "").strip()})
+        if len(out) >= limit:
+            break
+    return out, lang
+
+
+def _asia_universe(per_group: int = 200):
+    """한투 해외 업종(일본·홍콩/중국)에서 업종별 종목을 모아 야후 티커로 — (티커, 이름, 업종)"""
+    out = []
+    for group in ("JP", "HK_CN"):
+        try:
+            sectors = fetch_overseas_sector_list(group, limit=40)
+        except Exception as e:
+            print(f"[global_dict] {group} 업종 목록 실패: {e}")
+            continue
+        rows = []
+        for sec in sectors:
+            try:
+                for r in fetch_overseas_sector_detail(group, sec["icod"], limit=30):
+                    rows.append((r, sec["sector_name"]))
+            except Exception:
+                pass
+            time.sleep(0.15)
+        rows.sort(key=lambda x: -(x[0].get("volume") or 0))
+        seen = set()
+        for r, secname in rows:
+            m = (r.get("market") or "").upper()
+            code = str(r.get("symbol") or "").strip()
+            if m.startswith("TSE"):
+                tk = f"{code}.T"
+            elif m.startswith("HKS"):
+                tk = f"{str(int(code)) if code.isdigit() else code}".zfill(4) + ".HK"
+            elif m.startswith("SHS"):
+                tk = f"{code}.SS"
+            elif m.startswith("SZS"):
+                tk = f"{code}.SZ"
+            else:
+                continue
+            if tk in seen:
+                continue
+            seen.add(tk)
+            out.append((tk, r.get("stock_name") or tk, secname))
+            if len([1 for o in out if o[0].endswith(".T")]) >= per_group and group == "JP":
+                break
+            if len([1 for o in out if not o[0].endswith(".T")]) >= per_group and group == "HK_CN":
+                break
+    return out
+
+
 EXTRA_GLOBAL = [(v, k) for k, v in GLOBAL_KR_EXTRA.items()]
 _gdict_status = {"state": "idle", "done": 0, "total": 0, "error": None}
 
 
-def build_global_dictionary(top: int = 300):
+def build_global_dictionary(top: int = 600, asia: int = 200):
     st = _gdict_status
     st.update({"state": "running", "done": 0, "error": None})
     try:
         rows = sorted([r for r in fetch_us_screener() if r["cap"] > 0], key=lambda r: -r["cap"])[:top]
         items = [(r["symbol"], r["name"], r.get("sector") or "", r.get("industry") or "") for r in rows]
         have = {r[0] for r in items}
+        for tk, nm, secname in _asia_universe(asia):  # 🇯🇵 일본·🇭🇰 홍콩·🇨🇳 중국 (업종 이름 포함)
+            if tk not in have:
+                have.add(tk)
+                items.append((tk, nm, secname, ""))
         for sym, kr in EXTRA_GLOBAL:
             if sym not in have:  # "마오타이·구이저우마오타이"처럼 같은 티커가 두 번 있으면 한 번만 (2026-10-18 오류)
                 have.add(sym)
@@ -8788,13 +8878,19 @@ def build_global_dictionary(top: int = 300):
                 news = _news_issues(f"\"{krname}\"" if krname else f"\"{name}\" 주가")
             except Exception:
                 news = []
+            try:
+                orig, lang = _news_original(sym, name)
+            except Exception:
+                orig, lang = [], _lang_of(sym)
             prev = existing.get(sym, [])
             have_keys = {(i.get("date"), (i.get("text") or "")[:30]) for i in prev}
             merged = prev + [n for n in news if (n["date"], n["text"][:30]) not in have_keys]
             merged.sort(key=lambda i: i.get("date") or "", reverse=True)
             batch.append({
                 "code": sym, "name": krname or name, "market": "GLOBAL", "keywords_short": kw, "keywords_full": kw,
-                "tags": tags, "subtags": subtags, "issues": merged[:30], "last_issue_date": merged[0]["date"] if merged else None,
+                "tags": tags, "subtags": subtags, "issues": merged[:30],
+                "issues_original": orig, "lang": lang,
+                "last_issue_date": max([x["date"] for x in merged[:1] + orig[:1]] or [None]) if (merged or orig) else None,
                 "updated_at": now_kst().isoformat(),
             })
             st["done"] += 1
@@ -8812,11 +8908,11 @@ def build_global_dictionary(top: int = 300):
 
 
 @app.get("/api/build-global-dictionary")
-def build_global_dictionary_endpoint(top: int = 300):
-    """해외 종목 사전 만들기(서버 뒤에서, 300종목 약 3~5분) — 진행: /api/build-global-dictionary-status"""
+def build_global_dictionary_endpoint(top: int = 600):
+    """해외 종목 사전 만들기(서버 뒤에서, 미국 600 + 일본·홍콩·중국 약 400 → 15~20분) — 진행: /api/build-global-dictionary-status"""
     if _gdict_status["state"] == "running":
         return {"ok": True, "running": True, **_gdict_status}
-    threading.Thread(target=build_global_dictionary, args=(max(50, min(top, 600)),), daemon=True).start()
+    threading.Thread(target=build_global_dictionary, args=(max(50, min(top, 1000)),), daemon=True).start()
     return {"ok": True, "started": True, "check": "/api/build-global-dictionary-status"}
 
 
