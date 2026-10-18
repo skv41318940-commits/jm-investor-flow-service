@@ -8280,8 +8280,13 @@ def fetch_us_screener() -> list:
                 sym = (r.get("symbol") or "").strip()
                 if not sym or price is None or "^" in sym or "/" in sym:
                     continue
+                raw_name = r.get("name") or sym
+                # 워런트·유닛·권리·우선주는 랭킹에서 제외 (2026-10-18 CORZW 같은 워런트가 섞였음)
+                if re.search(r"\b(Warrants?|Units?|Rights?|Preferred|Depositary Shares? representing)\b", raw_name, re.I):
+                    continue
                 rows.append({
-                    "symbol": sym, "name": US_KR_NAMES.get(sym) or (r.get("name") or sym).replace(" Common Stock", "").replace(" Class A", "")[:40],
+                    "symbol": sym,
+                    "name": _us_name(sym, re.sub(r"\s*(Common (Stock|Shares?)|Ordinary Shares?|American Depositary Shares?|Class [A-C].*|Capital Stock)\s*", " ", raw_name).strip())[:30],
                     "exchange": ex.upper(), "price": price, "pct": pct or 0.0, "cap": cap or 0.0, "volume": vol or 0.0,
                     "value": round(price * (vol or 0)), "sector": SECTOR_KR.get(r.get("sector") or "", r.get("sector") or "기타"),
                     "industry": r.get("industry") or "",
@@ -8587,7 +8592,16 @@ def build_us_open30_brief(top_n: int = 20):
     rows = [r for r in fetch_us_screener() if r["cap"] >= 2e9 and r["price"] >= 5]
     if not rows:
         return None, None
-    gain = sorted(rows, key=lambda r: -r["pct"])[:top_n]
+    # 같은 회사의 다른 주식 종류(예: Zillow Z·ZG)는 하나만
+    seen, gain = set(), []
+    for r in sorted(rows, key=lambda r: -r["pct"]):
+        base = re.sub(r"[^a-z]", "", r["name"].lower())[:12]
+        if base in seen:
+            continue
+        seen.add(base)
+        gain.append(r)
+        if len(gain) >= top_n:
+            break
     lines = [f"🚀 미국 개장 초반 상승 랭킹 ({now.strftime('%H:%M')} KST · 개장 30분)\n━━━━━━━━━━━━", "시가총액 20억달러↑ · 주가 $5↑"]
     for i, r in enumerate(gain, 1):
         kr = KR_LINKS.get(r["symbol"])
