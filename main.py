@@ -8993,6 +8993,7 @@ def stock_ohlcv_endpoint(code: str, start: str, end: str):
                     "low": float(row.get("저가", 0)),
                     "close": float(row.get("종가", 0)),
                     "volume": float(row.get("거래량", 0)),
+                    "amount": float(row.get("거래대금", 0) or 0),  # 원 단위 (거래대금 기준봉 판정용)
                 }
             )
         return {"ok": True, "code": code, "candles": candles}
