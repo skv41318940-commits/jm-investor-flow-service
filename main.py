@@ -2752,6 +2752,7 @@ async def _daily_jobs_worker():
         ("sector_map", _ensure_sector_jobs, ()),
         ("futures_snap", _snap_futures, ()),
         ("us_briefs", _run_us_briefs, ()),
+        ("global_dict", _weekly_global_dictionary, ()),
         ("target_reach", _check_target_reach, ()),
         ("earnings_disclosure", _check_earnings_disclosures, ()),
     ]
@@ -8680,6 +8681,157 @@ def _run_us_briefs():
                 print(f"[us_briefs] {kind} 발송")
         except Exception as e:
             print(f"[us_briefs] {kind} 실패: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 📒 해외 종목 사전 자동 생성 — 국내 사전(키워드 + 날짜별 이슈)과 같은 모양
+# ──────────────────────────────────────────────────────────────────────────
+#   · 대상: 미국 시가총액 상위 N개 + 아시아·유럽 대표 종목
+#   · 키워드: 나스닥 섹터·산업 → 한국어 테마 + 대표 테마(AI·원전·우주·양자·비만약…) + 🇰🇷 관련주
+#   · 이슈: 최근 30일 한국어 뉴스 제목(날짜별, 종목당 최대 5개) — 매주 토요일 새 이슈만 추가
+#   · 내가 직접 추가한 이슈는 지우지 않고 합쳐서 보관
+# ══════════════════════════════════════════════════════════════════════════
+INDUSTRY_KR = [
+    ("Semiconductor", "반도체"), ("Prepackaged Software", "소프트웨어"), ("Programming", "소프트웨어"), ("EDP Services", "IT서비스"),
+    ("Internet", "인터넷·플랫폼"), ("Computer Communications", "네트워크장비"), ("Computer Manufacturing", "컴퓨터·하드웨어"),
+    ("Biotechnology", "바이오"), ("Pharmaceutical", "제약"), ("Medical", "의료기기"), ("Hospital", "헬스케어서비스"),
+    ("Major Banks", "은행"), ("Banks", "은행"), ("Investment Bankers", "증권"), ("Finance", "금융"), ("Insurance", "보험"),
+    ("Auto Manufacturing", "자동차"), ("Auto Parts", "자동차부품"), ("Electric Utilities", "전력"), ("Power Generation", "전력"),
+    ("Oil", "석유·가스"), ("Natural Gas", "석유·가스"), ("Aerospace", "항공우주"), ("Military", "방산"), ("Real Estate Investment", "리츠"),
+    ("Industrial Machinery", "기계"), ("Electrical Products", "전기장비"), ("Restaurants", "외식"), ("Retail", "유통"),
+    ("Department", "유통"), ("Telecommunications Equipment", "통신장비"), ("Telecom", "통신"), ("Broadcasting", "미디어"),
+    ("Movies", "엔터·미디어"), ("Railroads", "운송"), ("Air Freight", "운송"), ("Trucking", "운송"), ("Airlines", "항공"),
+    ("Hotels", "여행·레저"), ("Beverages", "음료"), ("Packaged Foods", "식품"), ("Apparel", "의류"), ("Steel", "철강"),
+    ("Metal", "금속·광물"), ("Mining", "금속·광물"), ("Chemicals", "화학"), ("Construction", "건설"), ("Homebuilding", "건설"),
+    ("Consumer Electronics", "전자제품"), ("Industrial Specialties", "산업재"), ("Specialty Insurers", "보험"),
+]
+THEME_RULES = {
+    "AI": ["NVDA", "AMD", "AVGO", "MSFT", "GOOGL", "GOOG", "META", "PLTR", "ARM", "SMCI", "ORCL", "CRM", "NOW", "SNOW", "AI", "SOUN", "TSM", "ASML"],
+    "데이터센터": ["VRT", "ETN", "ANET", "DELL", "SMCI", "EQIX", "DLR", "CEG", "VST", "NVDA", "CRWV", "NBIS", "APLD", "IREN"],
+    "HBM·메모리": ["MU", "SNDK", "WDC", "STX"],
+    "원전·SMR": ["CEG", "VST", "OKLO", "SMR", "CCJ", "BWXT", "LEU", "NNE", "TLN"],
+    "우주": ["RKLB", "ASTS", "LUNR", "PL", "SPCE", "RDW", "BA", "LMT"],
+    "양자컴퓨터": ["IONQ", "RGTI", "QBTS", "QUBT", "QNT", "IBM", "GOOGL"],
+    "가상자산": ["COIN", "MSTR", "MARA", "RIOT", "CRCL", "HOOD", "CLSK", "WULF", "CORZ", "GLXY"],
+    "비만약": ["LLY", "NVO", "VKTX", "AMGN"],
+    "로봇": ["TSLA", "ISRG", "SYM", "TER", "ROK", "SERV"],
+    "전기차·배터리": ["TSLA", "RIVN", "LCID", "ALB", "QS", "ENVX"],
+    "방산": ["LMT", "NOC", "RTX", "GD", "LHX", "KTOS", "AVAV", "PLTR", "HII"],
+    "사이버보안": ["CRWD", "PANW", "ZS", "FTNT", "NET", "OKTA", "S"],
+    "스테이블코인·핀테크": ["CRCL", "PYPL", "SQ", "XYZ", "SOFI", "AFRM", "V", "MA"],
+}
+
+
+def _themes_for(sym: str):
+    return [t for t, syms in THEME_RULES.items() if sym in syms]
+
+
+def _news_issues(query: str, days: int = 30, limit: int = 5):
+    from email.utils import parsedate_to_datetime
+    res = requests.get("https://news.google.com/rss/search", params={"q": f"{query} when:{days}d", "hl": "ko", "gl": "KR", "ceid": "KR:ko"},
+                       headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+    out, seen = [], set()
+    for it in ET.fromstring(res.content).iter("item"):
+        title = (it.findtext("title") or "").strip()
+        src = (it.findtext("source") or "").strip()
+        if src and title.endswith(f" - {src}"):
+            title = title[: -len(src) - 3]
+        key = re.sub(r"[^가-힣A-Za-z0-9]", "", title)[:20]
+        if not title or key in seen:
+            continue
+        seen.add(key)
+        try:
+            d = parsedate_to_datetime(it.findtext("pubDate")).astimezone(KST).strftime("%Y-%m-%d")
+        except Exception:
+            continue
+        out.append({"date": d, "text": f"{title} ({src})" if src else title})
+        if len(out) >= limit:
+            break
+    return out
+
+
+EXTRA_GLOBAL = [(v, k) for k, v in GLOBAL_KR_EXTRA.items()]
+_gdict_status = {"state": "idle", "done": 0, "total": 0, "error": None}
+
+
+def build_global_dictionary(top: int = 300):
+    st = _gdict_status
+    st.update({"state": "running", "done": 0, "error": None})
+    try:
+        rows = sorted([r for r in fetch_us_screener() if r["cap"] > 0], key=lambda r: -r["cap"])[:top]
+        items = [(r["symbol"], r["name"], r.get("sector") or "", r.get("industry") or "") for r in rows]
+        have = {r[0] for r in items}
+        for sym, kr in EXTRA_GLOBAL:
+            if sym not in have:
+                items.append((sym, kr, "", ""))
+        st["total"] = len(items)
+        existing = {}
+        try:
+            for i in range(0, 4000, 1000):
+                d = supabase.table("stock_dictionary").select("code,issues").eq("market", "GLOBAL").range(i, i + 999).execute().data or []
+                existing.update({x["code"]: x.get("issues") or [] for x in d})
+                if len(d) < 1000:
+                    break
+        except Exception:
+            pass
+        batch = []
+        for sym, name, sector, industry in items:
+            ind_kr = next((kr for key, kr in INDUSTRY_KR if key.lower() in industry.lower()), None)
+            themes = _themes_for(sym)
+            tags = [t for t in [sector or None, ind_kr] if t] + [t for t in themes if t not in (sector, ind_kr)]
+            kr_rel = KR_LINKS.get(sym)
+            subtags = [x.strip() for x in kr_rel.split("·")] if kr_rel else []
+            kw = ",".join(tags) + (f" / 🇰🇷 {kr_rel}" if kr_rel else "")
+            krname = US_KR_NAMES.get(sym) or next((k for k, v in GLOBAL_KR_EXTRA.items() if v == sym), None)
+            try:
+                news = _news_issues(f"\"{krname}\"" if krname else f"\"{name}\" 주가")
+            except Exception:
+                news = []
+            prev = existing.get(sym, [])
+            have_keys = {(i.get("date"), (i.get("text") or "")[:30]) for i in prev}
+            merged = prev + [n for n in news if (n["date"], n["text"][:30]) not in have_keys]
+            merged.sort(key=lambda i: i.get("date") or "", reverse=True)
+            batch.append({
+                "code": sym, "name": krname or name, "market": "GLOBAL", "keywords_short": kw, "keywords_full": kw,
+                "tags": tags, "subtags": subtags, "issues": merged[:30], "last_issue_date": merged[0]["date"] if merged else None,
+                "updated_at": now_kst().isoformat(),
+            })
+            st["done"] += 1
+            if len(batch) >= 50:
+                supabase.table("stock_dictionary").upsert(batch, on_conflict="code").execute()
+                batch = []
+            time.sleep(0.4)
+        if batch:
+            supabase.table("stock_dictionary").upsert(batch, on_conflict="code").execute()
+        st["state"] = "done"
+    except Exception as e:
+        st.update({"state": "error", "error": str(e)})
+
+
+@app.get("/api/build-global-dictionary")
+def build_global_dictionary_endpoint(top: int = 300):
+    """해외 종목 사전 만들기(서버 뒤에서, 300종목 약 3~5분) — 진행: /api/build-global-dictionary-status"""
+    if _gdict_status["state"] == "running":
+        return {"ok": True, "running": True, **_gdict_status}
+    threading.Thread(target=build_global_dictionary, args=(max(50, min(top, 600)),), daemon=True).start()
+    return {"ok": True, "started": True, "check": "/api/build-global-dictionary-status"}
+
+
+@app.get("/api/build-global-dictionary-status")
+def build_global_dictionary_status():
+    return _gdict_status
+
+
+def _weekly_global_dictionary():
+    """매주 토요일 10시 이후 1번 — 해외 사전 새 이슈 추가"""
+    now = now_kst()
+    if now.weekday() != 5 or now.hour < 10:
+        return
+    key = now.strftime("%Y-%m-%d")
+    if _brief_already_sent("job_global_dict", key) or _gdict_status["state"] == "running":
+        return
+    _mark_brief_sent("job_global_dict", key)
+    threading.Thread(target=build_global_dictionary, daemon=True).start()
 
 
 @app.get("/api/ping")
