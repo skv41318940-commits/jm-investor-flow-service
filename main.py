@@ -2753,6 +2753,7 @@ async def _daily_jobs_worker():
         ("futures_snap", _snap_futures, ()),
         ("us_briefs", _run_us_briefs, ()),
         ("global_dict", _weekly_global_dictionary, ()),
+        ("maintenance", _maintenance_reminders, ()),
         ("target_reach", _check_target_reach, ()),
         ("earnings_disclosure", _check_earnings_disclosures, ()),
     ]
@@ -8931,6 +8932,36 @@ def _weekly_global_dictionary():
         return
     _mark_brief_sent("job_global_dict", key)
     threading.Thread(target=build_global_dictionary, daemon=True).start()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 🔔 정비 알림 — 키 연장·일정 갱신을 잊지 않게 텔레그램으로 (해마다 반복)
+#   · 6/25, 7/1  : KRX Open API·한국투자증권 앱키 갱신 (7월 말 발급 → 7월 초 연장)
+#   · 1/2        : FOMC·금통위 새해 일정 갱신
+# ══════════════════════════════════════════════════════════════════════════
+MAINTENANCE_REMINDERS = [
+    ((6, 25), "🔑 [정비] API 키 갱신 준비 (다음 주부터 7월 초 연장 신청)\n"
+              "· KRX Open API 인증키 — openapi.krx.co.kr → 마이페이지 → 인증키 신청내역 → 연장\n"
+              "· 한국투자증권 앱키 — KIS Developers → API 신청 내역 → 기간 연장\n"
+              "· 새 키를 다시 발급받으면 Render 환경변수(KRX_AUTH_KEY / KIS_APP_KEY / KIS_APP_SECRET)도 교체"),
+    ((7, 1), "🔑 [정비] 오늘부터 API 키 연장 신청하세요 (7월 말 만료 예정)\n"
+             "· KRX Open API 인증키 (선물 시세·VKOSPI)\n"
+             "· 한국투자증권 앱키 (실시간 체결·수급·랭킹 — 핵심)\n"
+             "· KRX 데이터 비밀번호를 바꿨다면 Render의 KRX_PW도 변경"),
+    ((1, 2), "📅 [정비] 새해 일정 갱신 — 올해 FOMC·금통위 날짜를 Claude에게 알려주고 서버에 반영하세요 "
+             "(main.py의 FOMC_DECISION_DATES / BOK_MPC_DATES)"),
+]
+
+
+def _maintenance_reminders():
+    now = now_kst()
+    if now.hour < 9:
+        return
+    for (m, d), text in MAINTENANCE_REMINDERS:
+        if (now.month, now.day) == (m, d):
+            key = f"maint-{m:02d}{d:02d}-{now.year}"
+            if not _brief_already_sent("maintenance", key) and send_telegram(text):
+                _mark_brief_sent("maintenance", key)
 
 
 @app.get("/api/ping")
