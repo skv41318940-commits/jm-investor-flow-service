@@ -8762,7 +8762,8 @@ def build_global_dictionary(top: int = 300):
         items = [(r["symbol"], r["name"], r.get("sector") or "", r.get("industry") or "") for r in rows]
         have = {r[0] for r in items}
         for sym, kr in EXTRA_GLOBAL:
-            if sym not in have:
+            if sym not in have:  # "마오타이·구이저우마오타이"처럼 같은 티커가 두 번 있으면 한 번만 (2026-10-18 오류)
+                have.add(sym)
                 items.append((sym, kr, "", ""))
         st["total"] = len(items)
         existing = {}
@@ -8798,10 +8799,12 @@ def build_global_dictionary(top: int = 300):
             })
             st["done"] += 1
             if len(batch) >= 50:
+                batch = list({b["code"]: b for b in batch}.values())
                 supabase.table("stock_dictionary").upsert(batch, on_conflict="code").execute()
                 batch = []
             time.sleep(0.4)
         if batch:
+            batch = list({b["code"]: b for b in batch}.values())
             supabase.table("stock_dictionary").upsert(batch, on_conflict="code").execute()
         st["state"] = "done"
     except Exception as e:
