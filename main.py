@@ -6588,7 +6588,9 @@ def build_closing_report():
                 checks.append("신용/예탁 비율 40% 이상 — 과열, 급락 시 반대매매 주의")
         vk = fear.get("vkospi") if isinstance(fear, dict) else None
         if vk:
-            parts.append(f"VKOSPI {vk['value']} (60일 평균 {vk['avg60']})")
+            v = vk["value"]
+            lvl = "🔴 고공포" if v >= 40 else "🟠 경계" if v >= 30 else "🟡 보통" if v >= 20 else "🟢 안정"
+            parts.append(f"VKOSPI {v} {lvl} (60일 평균 {vk['avg60']})")
             if vk["value"] >= vk["avg60"] * 1.3:
                 checks.append("VKOSPI가 평균보다 30% 이상 높음 — 공포 구간, 변동성 확대")
         cnn = fear.get("cnn") if isinstance(fear, dict) else None
