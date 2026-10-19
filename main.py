@@ -9047,6 +9047,7 @@ NEWS_COUNTRIES = {
     "jp": {"name": "🇯🇵 일본", "hl": "ja", "gl": "JP", "ceid": "JP:ja"},
     "cn": {"name": "🇨🇳 중국", "hl": "zh-CN", "gl": "CN", "ceid": "CN:zh-Hans"},
     "me": {"name": "🇸🇦 중동(아랍)", "hl": "ar", "gl": "SA", "ceid": "SA:ar"},
+    "es": {"name": "🇪🇸 스페인어권", "hl": "es", "gl": "ES", "ceid": "ES:es"},
 }
 NEWS_TOPICS = {"top": None, "world": "WORLD", "nation": "NATION", "business": "BUSINESS", "technology": "TECHNOLOGY",
                "science": "SCIENCE", "health": "HEALTH", "sports": "SPORTS", "entertainment": "ENTERTAINMENT"}
