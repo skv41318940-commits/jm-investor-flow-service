@@ -2754,6 +2754,7 @@ async def _daily_jobs_worker():
         ("us_briefs", _run_us_briefs, ()),
         ("global_dict", _weekly_global_dictionary, ()),
         ("maintenance", _maintenance_reminders, ()),
+        ("world_news", _run_world_news_alerts, ()),
         ("target_reach", _check_target_reach, ()),
         ("earnings_disclosure", _check_earnings_disclosures, ()),
     ]
@@ -6269,6 +6270,64 @@ def _kis_rank_candidates() -> dict:
     return cands
 
 
+def _rally_reasons(rows: list) -> dict:
+    """🚀 아침 상승 랭킹 종목마다 '왜 올랐나' — 공시(어제 저녁~오늘) · 뉴스(최근 18시간) · 내 종목 사전 테마(+동반 상승)
+    ※ 관련 공시·뉴스를 찾아 붙이는 것이지, 반드시 그게 원인이라는 뜻은 아님"""
+    from email.utils import parsedate_to_datetime
+    codes = [r["code"] for r in rows if r.get("code")]
+    tags = {}
+    try:
+        d = supabase.table("stock_dictionary").select("code,tags,subtags").in_("code", codes).execute().data or []
+        tags = {x["code"]: (x.get("tags") or [])[:3] for x in d}
+    except Exception:
+        pass
+    now = now_kst()
+    y = (now - timedelta(days=1)).strftime("%Y%m%d")
+    out = {}
+    for r in rows:
+        code, name = r.get("code"), r.get("name")
+        parts = []
+        # 📢 공시 (DART: 어제~오늘)
+        if DART_API_KEY:
+            try:
+                corp = _dart_corp_code(code)
+                if corp:
+                    res = requests.get("https://opendart.fss.or.kr/api/list.json",
+                                       params={"crtfc_key": DART_API_KEY, "corp_code": corp, "bgn_de": y, "end_de": now.strftime("%Y%m%d"), "page_count": 5},
+                                       timeout=8).json()
+                    lst = [x for x in (res.get("list") or []) if not re.search(r"임원|주요주주|소유상황|대량보유|기재정정", x.get("report_nm", ""))]
+                    if lst:
+                        parts.append("📢 공시: " + re.sub(r"\s+", " ", lst[0]["report_nm"]).strip())
+            except Exception:
+                pass
+        # 📰 뉴스 (최근 18시간, 제목 1개)
+        try:
+            res = requests.get("https://news.google.com/rss/search", params={"q": f'"{name}" when:1d', "hl": "ko", "gl": "KR", "ceid": "KR:ko"},
+                               headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+            for it in ET.fromstring(res.content).iter("item"):
+                try:
+                    if (now - parsedate_to_datetime(it.findtext("pubDate")).astimezone(KST)).total_seconds() > 18 * 3600:
+                        continue
+                except Exception:
+                    continue
+                title = (it.findtext("title") or "").strip()
+                src = (it.findtext("source") or "").strip()
+                if src and title.endswith(f" - {src}"):
+                    title = title[: -len(src) - 3]
+                parts.append(f"📰 뉴스: {title[:60]}")
+                break
+        except Exception:
+            pass
+        # 🏷 테마 (내 종목 사전) + 같은 테마로 같이 오른 종목
+        t = tags.get(code) or []
+        if t:
+            mates = [x["name"] for x in rows if x.get("code") != code and set(tags.get(x.get("code"), [])) & set(t)][:3]
+            parts.append("🏷 테마: " + "·".join(t) + (f" (동반: {', '.join(mates)})" if mates else ""))
+        out[code] = parts or ["❔ 관련 공시·뉴스 없음 → 수급·테마 순환 가능성"]
+        time.sleep(0.15)
+    return out
+
+
 def build_rally_brief(top_n: int = 20, min_value_eok: float = 50):
     now = now_kst()
     today = now.strftime("%Y-%m-%d")
@@ -6293,6 +6352,11 @@ def build_rally_brief(top_n: int = 20, min_value_eok: float = 50):
 
     lines = [f"🚀 아침 상승 랭킹 ({now.month}/{now.day} 09:00~{now.strftime('%H:%M')} 기준)\n━━━━━━━━━━━━",
              "시가 대비 상승률 순 · 거래대금 50억 이상 · ETF·스팩·우선주 제외"]
+    try:
+        reasons = _rally_reasons(rows)
+    except Exception as e:
+        print(f"[brief:rally] 이유 찾기 실패: {e}")
+        reasons = {}
     for i, r in enumerate(rows, start=1):
         extra = ""
         try:
@@ -6309,10 +6373,13 @@ def build_rally_brief(top_n: int = 20, min_value_eok: float = 50):
             print(f"[brief:rally] {r['code']} 분봉 실패: {e}")
         lines.append(
             f"\n{i}. {r['name']} 시가대비 {r['from_open']:+.1f}% (전일비 {r['pct']:+.1f}%) · {_fmt_eok(r['value_eok'], signed=False)}"
-            f"{extra}\n   🔗 {FRONTEND_URL}/stock-analysis?code={r['code']}"
+            f"{extra}"
+            + "".join(f"\n   {x}" for x in reasons.get(r["code"], []))
+            + f"\n   🔗 {FRONTEND_URL}/stock-analysis?code={r['code']}"
         )
         time.sleep(0.1)
-    lines.append("\n※ 평단 대비 +가 작고 고점 대비 -가 적당하면 눌림목 후보 — 링크로 분봉·세력평단 확인")
+    lines.append("\n※ 평단 대비 +가 작고 고점 대비 -가 적당하면 눌림목 후보 — 링크로 분봉·세력평단 확인"
+                 "\n※ 📢·📰는 관련 공시·뉴스를 찾아 붙인 것 (원인이 아닐 수도 있어요) · 🏷는 내 종목 사전 키워드")
     return "\n".join(lines), today
 
 
@@ -6562,6 +6629,7 @@ def build_closing_report():
 
 
 BRIEF_BUILDERS = {
+    "worldnews": lambda: build_world_news_digest(),
     "us_pre": lambda: build_us_pre_brief(),
     "us_open30": lambda: build_us_open30_brief(),
     "closing": build_closing_report,
@@ -8962,6 +9030,135 @@ def _maintenance_reminders():
             key = f"maint-{m:02d}{d:02d}-{now.year}"
             if not _brief_already_sent("maintenance", key) and send_telegram(text):
                 _mark_brief_sent("maintenance", key)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 📰 주요뉴스 (원어) — 한국·미국·러시아·일본·중국·중동(사우디 아랍어) · 분야별
+# ──────────────────────────────────────────────────────────────────────────
+# 구글 뉴스 국가판 RSS (무료, 키 불필요) — 각 나라 언어 그대로. 10분 보관.
+# 텔레그램: 07:10 출근길 · 18:10 퇴근길 "🌍 세계 주요뉴스(원어)" — 나라별 상위 3개
+# ══════════════════════════════════════════════════════════════════════════
+NEWS_COUNTRIES = {
+    "kr": {"name": "🇰🇷 한국", "hl": "ko", "gl": "KR", "ceid": "KR:ko"},
+    "us": {"name": "🇺🇸 미국", "hl": "en-US", "gl": "US", "ceid": "US:en"},
+    "ru": {"name": "🇷🇺 러시아", "hl": "ru", "gl": "RU", "ceid": "RU:ru"},
+    "jp": {"name": "🇯🇵 일본", "hl": "ja", "gl": "JP", "ceid": "JP:ja"},
+    "cn": {"name": "🇨🇳 중국", "hl": "zh-CN", "gl": "CN", "ceid": "CN:zh-Hans"},
+    "me": {"name": "🇸🇦 중동(아랍)", "hl": "ar", "gl": "SA", "ceid": "SA:ar"},
+}
+NEWS_TOPICS = {"top": None, "world": "WORLD", "nation": "NATION", "business": "BUSINESS", "technology": "TECHNOLOGY",
+               "science": "SCIENCE", "health": "HEALTH", "sports": "SPORTS", "entertainment": "ENTERTAINMENT"}
+_world_news_cache: dict = {}
+_ko_cache: dict = {}
+
+
+def translate_to_ko(texts: list) -> list:
+    """원어 제목 → 한국어 (구글 번역 무료 엔드포인트, 결과는 보관해서 같은 제목은 다시 안 물어봄)"""
+    out = [None] * len(texts)
+    todo = [(i, t) for i, t in enumerate(texts) if t and t not in _ko_cache]
+    for i, t in enumerate(texts):
+        if t in _ko_cache:
+            out[i] = _ko_cache[t]
+    # 20개씩 줄바꿈으로 묶어서 한 번에
+    for k in range(0, len(todo), 20):
+        chunk = todo[k:k + 20]
+        try:
+            res = requests.get("https://translate.googleapis.com/translate_a/single",
+                               params={"client": "gtx", "sl": "auto", "tl": "ko", "dt": "t", "q": "\n".join(t for _, t in chunk)},
+                               headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
+            joined = "".join(seg[0] for seg in (res.json()[0] or []) if seg and seg[0])
+            parts = [x.strip() for x in joined.split("\n")]
+            if len(parts) == len(chunk):
+                for (i, t), ko in zip(chunk, parts):
+                    _ko_cache[t] = ko
+                    out[i] = ko
+        except Exception as e:
+            print(f"[translate] 실패: {e}")
+        time.sleep(0.2)
+    if len(_ko_cache) > 5000:
+        _ko_cache.clear()
+    return out
+
+
+def fetch_world_news(country: str = "us", topic: str = "top", limit: int = 30):
+    from email.utils import parsedate_to_datetime
+    c = NEWS_COUNTRIES.get(country)
+    if not c:
+        return []
+    key = (country, topic)
+    hit = _world_news_cache.get(key)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1][:limit]
+    sec = NEWS_TOPICS.get(topic)
+    url = f"https://news.google.com/rss/headlines/section/topic/{sec}" if sec else "https://news.google.com/rss"
+    res = requests.get(url, params={"hl": c["hl"], "gl": c["gl"], "ceid": c["ceid"]}, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
+    items, seen = [], set()
+    for it in ET.fromstring(res.content).iter("item"):
+        title = (it.findtext("title") or "").strip()
+        src = (it.findtext("source") or "").strip()
+        if src and title.endswith(f" - {src}"):
+            title = title[: -len(src) - 3]
+        k = title[:40]
+        if not title or k in seen:
+            continue
+        seen.add(k)
+        try:
+            dt = parsedate_to_datetime(it.findtext("pubDate")).astimezone(KST)
+            at = dt.strftime("%m-%d %H:%M")
+        except Exception:
+            at = ""
+        items.append({"title": title, "source": src, "link": (it.findtext("link") or "").strip(), "at": at})
+    if country != "kr" and items:
+        kos = translate_to_ko([n["title"] for n in items[:60]])
+        for n, ko in zip(items, kos):
+            n["ko"] = ko
+    _world_news_cache[key] = (time.time(), items)
+    return items[:limit]
+
+
+@app.get("/api/world-news")
+def world_news_endpoint(country: str = "us", topic: str = "top", limit: int = 30):
+    try:
+        return {"ok": True, "country": country, "topic": topic, "name": NEWS_COUNTRIES.get(country, {}).get("name"),
+                "items": fetch_world_news(country, topic, max(5, min(limit, 60)))}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def build_world_news_digest():
+    now = now_kst()
+    lines = [f"🌍 세계 주요뉴스 원어 ({now.strftime('%m/%d %H:%M')})\n━━━━━━━━━━━━"]
+    for code, c in NEWS_COUNTRIES.items():
+        try:
+            items = fetch_world_news(code, "top", 3)
+        except Exception:
+            items = []
+        if not items:
+            continue
+        lines.append(f"\n{c['name']}")
+        for n in items:
+            lines.append(f"· {n['title']} ({n['source']})" + (f"\n   ↳ {n['ko']}" if n.get("ko") else ""))
+    lines.append(f"\n🔗 전체 보기: {FRONTEND_URL}/world-news")
+    return "\n".join(lines), now.strftime("%Y-%m-%d %H")
+
+
+def _run_world_news_alerts():
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    now = now_kst()
+    for kind, (h, m) in (("worldnews_am", (7, 10)), ("worldnews_pm", (18, 10))):
+        at = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if not (at <= now <= at + timedelta(minutes=40)):
+            continue
+        key = now.strftime("%Y-%m-%d")
+        if _brief_already_sent(kind, key):
+            continue
+        try:
+            text, _ = build_world_news_digest()
+            if send_telegram(text):
+                _mark_brief_sent(kind, key)
+        except Exception as e:
+            print(f"[worldnews] {kind} 실패: {e}")
 
 
 @app.get("/api/ping")
