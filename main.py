@@ -9194,6 +9194,12 @@ FLASH_GLOBAL_COMPANIES = {
 FLASH_GLOBAL_EVENTS_EN = ['strike', 'fire', 'outage', 'earthquake', '"production halt"', '"export controls"', 'tariff', 'recall', 'explosion']
 FLASH_GLOBAL_EVENTS_KO = ["파업", "화재", "정전", "지진", "가동중단", "수출규제", "관세", "리콜", "폭발"]
 _flash_state = {"at": 0.0, "names": None, "names_at": 0.0, "pending": []}
+# 회사 이름에 사건 단어가 들어 있거나 다른 뜻인 경우 (예: 삼성화재 = Samsung Fire, 뉴욕 별명 Big Apple)
+FLASH_GLOBAL_FALSE = re.compile(r"samsung fire|fire\s*&\s*marine|big apple|apple(bee|ton)|pineapple|apple tv|ordered to pay|lawsuit|verdict", re.I)
+FLASH_EVENT_WORDS = {"strike": "파업", "fire": "화재", "outage": "정전", "earthquake": "지진", "production halt": "가동중단",
+                     "export controls": "수출규제", "tariff": "관세", "recall": "리콜", "explosion": "폭발",
+                     "파업": "파업", "화재": "화재", "정전": "정전", "지진": "지진", "가동중단": "가동중단", "수출규제": "수출규제",
+                     "관세": "관세", "리콜": "리콜", "폭발": "폭발"}
 
 
 def _flash_seen(key: str) -> bool:
@@ -9335,17 +9341,30 @@ def _collect_flash_global() -> list:
             print(f"[flash] 해외 뉴스 실패: {e}")
     kos = translate_to_ko([t for l, t, _ in items if l == "en"]) if any(l == "en" for l, _, _ in items) else []
     ko_iter = iter(kos)
+    groups = {}  # (회사, 사건) → 같은 사건 기사 묶음 (예: 마이크론 파업 기사 5개 → 알림 1개)
+    today = now_kst().strftime("%Y-%m-%d")
+    ko_alias = {"마이크론": "Micron", "엔비디아": "Nvidia", "애플": "Apple", "테슬라": "Tesla", "인텔": "Intel", "폭스콘": "Foxconn"}
     for lang, title, src in items:
         ko = next(ko_iter, None) if lang == "en" else None
-        key = "glnews:" + re.sub(r"[^가-힣A-Za-z0-9]", "", title.lower())[:40]
+        if FLASH_GLOBAL_FALSE.search(title):
+            continue
+        low = title.lower()
+        comp = next((c for c in comps if re.search(rf"\b{re.escape(c.lower())}\b", low)), None) \
+            or ko_alias.get(next((k for k in ko_alias if k in title), ""), None) or next((c for c in comps if c in title), None)
+        event = next((v for k, v in FLASH_EVENT_WORDS.items() if re.search(rf"\b{re.escape(k)}", low) if k.isascii()) , None) \
+            or next((v for k, v in FLASH_EVENT_WORDS.items() if not k.isascii() and k in title), None)
+        if not comp or not event:
+            continue
+        g = groups.setdefault((comp, event), [])
+        g.append((title, src, ko))
+    for (comp, event), arts in groups.items():
+        key = f"glevent:{comp}:{event}:{today}"  # 같은 회사·같은 사건은 하루 한 번
         if _flash_seen(key) or any(o["key"] == key for o in out):
             continue
-        comp = next((c for c in comps if c.lower() in title.lower()), None)
-        if not comp:
-            comp = {"마이크론": "Micron", "엔비디아": "Nvidia", "애플": "Apple", "테슬라": "Tesla", "인텔": "Intel", "폭스콘": "Foxconn"}.get(
-                next((k for k in ("마이크론", "엔비디아", "애플", "테슬라", "인텔", "폭스콘") if k in title), ""), None) or next((c for c in comps if c in title), None)
-        kr = FLASH_GLOBAL_COMPANIES.get(comp or "", "")
-        out.append({"key": key, "text": f"🌐 {title} ({src})" + (f"\n   ↳ {ko}" if ko else "") + (f"\n   🇰🇷 관련: {kr}" if kr else ""), "cat": "gl"})
+        title, src, ko = arts[0]
+        kr = FLASH_GLOBAL_COMPANIES.get(comp, "")
+        more = f"\n   (같은 사건 기사 {len(arts) - 1}건 더)" if len(arts) > 1 else ""
+        out.append({"key": key, "text": f"🌐 [{comp} · {event}] {title} ({src})" + (f"\n   ↳ {ko}" if ko else "") + more + (f"\n   🇰🇷 관련: {kr}" if kr else ""), "cat": "gl"})
     return out[:8]
 
 
