@@ -2755,6 +2755,7 @@ async def _daily_jobs_worker():
         ("global_dict", _weekly_global_dictionary, ()),
         ("maintenance", _maintenance_reminders, ()),
         ("world_news", _run_world_news_alerts, ()),
+        ("flash", _run_flash_alerts, ()),
         ("target_reach", _check_target_reach, ()),
         ("earnings_disclosure", _check_earnings_disclosures, ()),
     ]
@@ -9162,6 +9163,242 @@ def _run_world_news_alerts():
                 _mark_brief_sent(kind, key)
         except Exception as e:
             print(f"[worldnews] {kind} 실패: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 🚨 속보 알림 — 국내 증시 이슈 / 해외 증시 이슈 (단타·특징주용)
+# ──────────────────────────────────────────────────────────────────────────
+#  [국내] ① DART 실시간 주요 공시 (정정공시 제외 = 신규만): 공급계약(금액·매출 대비 %)·유무상증자·자사주·
+#          최대주주 변경·합병분할·CB/BW·감자·횡령배임·영업정지·주요경영사항(임상·특허)·기술이전·신규시설투자
+#         ② 뉴스 키워드 (최근 1시간): 수주·공급계약·FDA·품목허가·임상·기술이전·인수 — 종목명이 제목에 있을 때만
+#  [해외] 공급망·빅테크 사건 (최근 1시간): TSMC·마이크론·엔비디아·삼성·하이닉스·ASML·애플·테슬라… ×
+#         파업·화재·정전·지진·가동중단·수출규제·관세·리콜 → 한국어 번역 + 🇰🇷 관련주
+#  · 5분마다 · 같은 공시/기사는 한 번만 · 00:00~06:30에 잡힌 건 모아서 06:30 이후 한 번에
+# ══════════════════════════════════════════════════════════════════════════
+FLASH_DART_RULES = [
+    (r"단일판매.*공급계약|공급계약체결", "📝 신규 공급계약", "contract"),
+    (r"무상증자결정", "🎁 무상증자", ""), (r"유상증자결정", "⚠️ 유상증자(희석)", ""),
+    (r"자기주식.*(취득|소각)|자기주식취득", "💰 자사주 취득·소각", ""),
+    (r"최대주주\s*변경", "👤 최대주주 변경", ""), (r"합병결정|분할결정|주식교환|영업양수|영업양도", "🔀 합병·분할·양수도", ""),
+    (r"전환사채|신주인수권부사채|교환사채", "⚠️ CB·BW 발행(희석)", ""), (r"감자결정", "⚠️ 감자", ""),
+    (r"횡령|배임", "🚫 횡령·배임", ""), (r"영업정지|생산중단", "🚫 영업·생산 중단", ""),
+    (r"기술이전|라이선스", "🧬 기술이전·라이선스", ""), (r"투자판단\s*관련\s*주요경영사항", "🧪 주요경영사항(임상·특허 등)", ""),
+    (r"신규시설투자", "🏭 신규 시설투자", ""), (r"상장적격성|매매거래정지|관리종목", "🚫 거래정지·적격성", ""),
+]
+FLASH_KR_NEWS_QUERIES = ["수주 공급계약", "단독 수주", "FDA 승인", "품목허가 획득", "임상 성공", "기술이전 계약", "인수합병 단독"]
+FLASH_GLOBAL_COMPANIES = {
+    "TSMC": "삼성전자·DB하이텍", "Micron": "SK하이닉스·삼성전자", "Nvidia": "SK하이닉스·한미반도체", "Samsung": "삼성전자",
+    "SK hynix": "SK하이닉스", "ASML": "반도체 장비주", "Apple": "LG이노텍·비에이치", "Tesla": "LG에너지솔루션·에코프로비엠",
+    "Intel": "반도체", "AMD": "삼성전자·SK하이닉스", "Broadcom": "SK하이닉스", "Foxconn": "전자부품주", "Qualcomm": "삼성전자",
+}
+FLASH_GLOBAL_EVENTS_EN = ['strike', 'fire', 'outage', 'earthquake', '"production halt"', '"export controls"', 'tariff', 'recall', 'explosion']
+FLASH_GLOBAL_EVENTS_KO = ["파업", "화재", "정전", "지진", "가동중단", "수출규제", "관세", "리콜", "폭발"]
+_flash_state = {"at": 0.0, "names": None, "names_at": 0.0, "pending": []}
+
+
+def _flash_seen(key: str) -> bool:
+    return _brief_already_sent("flash", key)
+
+
+def _flash_mark(key: str):
+    _mark_brief_sent("flash", key)
+
+
+def _flash_stock_names():
+    st = _flash_state
+    if st["names"] and time.time() - st["names_at"] < 6 * 3600:
+        return st["names"]
+    names = {}
+    try:
+        for i in range(0, 4000, 1000):
+            d = supabase.table("sector_stocks").select("code,name").range(i, i + 999).execute().data or []
+            for r in d:
+                if r.get("name") and len(r["name"]) >= 3:  # 2글자 이름은 오탐이 많아 제외
+                    names[r["name"]] = r["code"]
+            if len(d) < 1000:
+                break
+    except Exception:
+        pass
+    st.update({"names": names, "names_at": time.time()})
+    return names
+
+
+def _contract_details(rcept_no: str) -> str:
+    """공급계약 공시 원문에서 계약금액·매출액 대비(%)·상대방 꺼내기"""
+    try:
+        res = requests.get("https://opendart.fss.or.kr/api/document.xml", params={"crtfc_key": DART_API_KEY, "rcept_no": rcept_no}, timeout=15)
+        if res.content[:2] != b"PK":
+            return ""
+        with zipfile.ZipFile(io.BytesIO(res.content)) as zf:
+            raw = b"".join(zf.read(n) for n in zf.namelist())
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("euc-kr", errors="replace")
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            plain = re.sub(r"\s+", " ", BeautifulSoup(text, "html.parser").get_text(" "))
+        amt = re.search(r"계약금액[^0-9]{0,30}([\d,]{5,})", plain)
+        ratio = re.search(r"매출액\s*대비\s*\(?%?\)?\s*([\d.]+)", plain)
+        party = re.search(r"계약상대(?:방)?\s*([^\s]{2,30})", plain)
+        parts = []
+        if amt:
+            won = float(amt.group(1).replace(",", ""))
+            parts.append(f"계약금액 {won / 1e8:,.0f}억" if won >= 1e8 else f"계약금액 {amt.group(1)}")
+        if ratio:
+            parts.append(f"매출 대비 {ratio.group(1)}%")
+        if party:
+            parts.append(f"상대방 {party.group(1)}")
+        return " · ".join(parts)
+    except Exception as e:
+        print(f"[flash] 계약 원문 실패 {rcept_no}: {e}")
+        return ""
+
+
+def _flash_quote_txt(code: str) -> str:
+    try:
+        q = _kis_quote(code)
+        return f" ({'🔴' if q['pct'] > 0 else '🔵'}{q['pct']:+.2f}% · {q['price']:,.0f}원 · 거래대금 {q['value_eok']:,.0f}억)"
+    except Exception:
+        return ""
+
+
+def _collect_flash_domestic() -> list:
+    out = []
+    now = now_kst()
+    # ① DART 실시간 주요 공시 (오늘, 정정 제외)
+    if DART_API_KEY:
+        try:
+            rows = _dart_list(now.strftime("%Y%m%d"), now.strftime("%Y%m%d"), max_pages=2)
+        except Exception as e:
+            rows = []
+            print(f"[flash] DART 목록 실패: {e}")
+        for r in rows:
+            nm = r.get("report_nm") or ""
+            if "정정" in nm or not r.get("stock_code"):
+                continue
+            rule = next((x for x in FLASH_DART_RULES if re.search(x[0], nm)), None)
+            if not rule:
+                continue
+            key = f"dart:{r['rcept_no']}"
+            if _flash_seen(key):
+                continue
+            extra = _contract_details(r["rcept_no"]) if rule[2] == "contract" else ""
+            nm_clean = re.sub(r"\s+", " ", nm).strip()  # (f-string 안 백슬래시는 Python 3.11 이하에서 오류라 밖으로 뺌)
+            out.append({"key": key, "text": f"{rule[1]} · {r.get('corp_name')}{_flash_quote_txt(r['stock_code'])}\n   {nm_clean}"
+                        + (f"\n   {extra}" if extra else "")
+                        + f"\n   🔗 {FRONTEND_URL}/stock-analysis?code={r['stock_code']}", "cat": "kr"})
+    # ② 뉴스 키워드 (최근 1시간, 종목명이 제목에 있을 때만)
+    names = _flash_stock_names()
+    for q in FLASH_KR_NEWS_QUERIES:
+        try:
+            res = requests.get("https://news.google.com/rss/search", params={"q": f"{q} when:1h", "hl": "ko", "gl": "KR", "ceid": "KR:ko"},
+                               headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            for it in ET.fromstring(res.content).iter("item"):
+                title = (it.findtext("title") or "").strip()
+                src = (it.findtext("source") or "").strip()
+                if src and title.endswith(f" - {src}"):
+                    title = title[: -len(src) - 3]
+                hit = max((n for n in names if n in title), key=len, default=None)
+                if not hit:
+                    continue
+                key = "krnews:" + re.sub(r"[^가-힣A-Za-z0-9]", "", title)[:40]
+                if _flash_seen(key) or any(o["key"] == key for o in out):
+                    continue
+                code = names[hit]
+                out.append({"key": key, "text": f"📰 {hit}{_flash_quote_txt(code)}\n   {title} ({src})\n   🔗 {FRONTEND_URL}/stock-analysis?code={code}", "cat": "kr"})
+        except Exception as e:
+            print(f"[flash] 국내 뉴스 실패 {q}: {e}")
+        time.sleep(0.2)
+    return out
+
+
+def _collect_flash_global() -> list:
+    out = []
+    comps = list(FLASH_GLOBAL_COMPANIES)
+    queries = [
+        ("en", "(" + " OR ".join(f'"{c}"' for c in comps) + ") (" + " OR ".join(FLASH_GLOBAL_EVENTS_EN) + ")", {"hl": "en-US", "gl": "US", "ceid": "US:en"}),
+        ("ko", "(TSMC OR 마이크론 OR 엔비디아 OR ASML OR 애플 OR 테슬라 OR 인텔 OR 폭스콘) (" + " OR ".join(FLASH_GLOBAL_EVENTS_KO) + ")", {"hl": "ko", "gl": "KR", "ceid": "KR:ko"}),
+    ]
+    items = []
+    for lang, q, loc in queries:
+        try:
+            res = requests.get("https://news.google.com/rss/search", params={"q": f"{q} when:1h", **loc}, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            for it in ET.fromstring(res.content).iter("item"):
+                title = (it.findtext("title") or "").strip()
+                src = (it.findtext("source") or "").strip()
+                if src and title.endswith(f" - {src}"):
+                    title = title[: -len(src) - 3]
+                items.append((lang, title, src))
+        except Exception as e:
+            print(f"[flash] 해외 뉴스 실패: {e}")
+    kos = translate_to_ko([t for l, t, _ in items if l == "en"]) if any(l == "en" for l, _, _ in items) else []
+    ko_iter = iter(kos)
+    for lang, title, src in items:
+        ko = next(ko_iter, None) if lang == "en" else None
+        key = "glnews:" + re.sub(r"[^가-힣A-Za-z0-9]", "", title.lower())[:40]
+        if _flash_seen(key) or any(o["key"] == key for o in out):
+            continue
+        comp = next((c for c in comps if c.lower() in title.lower()), None)
+        if not comp:
+            comp = {"마이크론": "Micron", "엔비디아": "Nvidia", "애플": "Apple", "테슬라": "Tesla", "인텔": "Intel", "폭스콘": "Foxconn"}.get(
+                next((k for k in ("마이크론", "엔비디아", "애플", "테슬라", "인텔", "폭스콘") if k in title), ""), None) or next((c for c in comps if c in title), None)
+        kr = FLASH_GLOBAL_COMPANIES.get(comp or "", "")
+        out.append({"key": key, "text": f"🌐 {title} ({src})" + (f"\n   ↳ {ko}" if ko else "") + (f"\n   🇰🇷 관련: {kr}" if kr else ""), "cat": "gl"})
+    return out[:8]
+
+
+def _send_flash(items: list, title: str):
+    kr = [i for i in items if i["cat"] == "kr"]
+    gl = [i for i in items if i["cat"] == "gl"]
+    for group, head in ((kr, "🚨 국내 증시 속보"), (gl, "🚨 해외 증시 속보")):
+        if not group:
+            continue
+        for k in range(0, len(group), 8):  # 메시지가 너무 길지 않게 8개씩
+            chunk = group[k:k + 8]
+            text = f"{head}{title}\n━━━━━━━━━━━━\n" + "\n\n".join(i["text"] for i in chunk) + "\n\n※ 속보는 확인 전 1차 정보 — 원문·공시로 꼭 확인"
+            if send_telegram(text):
+                for i in chunk:
+                    _flash_mark(i["key"])
+
+
+def _run_flash_alerts():
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    st = _flash_state
+    if time.time() - st["at"] < 5 * 60:
+        return
+    st["at"] = time.time()
+    now = now_kst()
+    quiet = now.hour < 6 or (now.hour == 6 and now.minute < 30)
+    items = []
+    try:
+        if now.weekday() < 5 and (7, 0) <= (now.hour, now.minute) <= (20, 30):
+            items += _collect_flash_domestic()
+        items += _collect_flash_global()
+    except Exception as e:
+        print(f"[flash] 수집 실패: {e}")
+    if quiet:
+        known = {p["key"] for p in st["pending"]}
+        st["pending"] += [i for i in items if i["key"] not in known]
+        return
+    if st["pending"]:
+        items = st["pending"] + [i for i in items if i["key"] not in {p["key"] for p in st["pending"]}]
+        st["pending"] = []
+        _send_flash(items, " (밤사이 모음)")
+        return
+    if items:
+        _send_flash(items, "")
+
+
+@app.get("/api/flash-check")
+def flash_check_endpoint(send: bool = False):
+    """속보 미리보기 — send=true면 지금 바로 보냄 (보낸 건 다시 안 보냄)"""
+    items = _collect_flash_domestic() + _collect_flash_global()
+    if send and items:
+        _send_flash(items, " (수동 확인)")
+    return {"ok": True, "count": len(items), "items": [i["text"] for i in items]}
 
 
 @app.get("/api/ping")
