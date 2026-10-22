@@ -9179,11 +9179,11 @@ FLASH_DART_RULES = [
     (r"단일판매.*공급계약|공급계약체결", "📝 신규 공급계약", "contract"),
     (r"무상증자결정", "🎁 무상증자", ""), (r"유상증자결정", "⚠️ 유상증자(희석)", ""),
     (r"자기주식.*(취득|소각)|자기주식취득", "💰 자사주 취득·소각", ""),
-    (r"최대주주\s*변경", "👤 최대주주 변경", ""), (r"합병결정|분할결정|주식교환|영업양수|영업양도", "🔀 합병·분할·양수도", ""),
-    (r"전환사채|신주인수권부사채|교환사채", "⚠️ CB·BW 발행(희석)", ""), (r"감자결정", "⚠️ 감자", ""),
+    (r"^최대주주\s*변경", "👤 최대주주 변경", ""), (r"합병결정|분할결정|주식교환|영업양수|영업양도", "🔀 합병·분할·양수도", ""),
+    (r"(전환사채|신주인수권부사채|교환사채)권?\s*발행결정", "⚠️ CB·BW 발행(희석)", ""), (r"감자결정", "⚠️ 감자", ""),
     (r"횡령|배임", "🚫 횡령·배임", ""), (r"영업정지|생산중단", "🚫 영업·생산 중단", ""),
     (r"기술이전|라이선스", "🧬 기술이전·라이선스", ""), (r"투자판단\s*관련\s*주요경영사항", "🧪 주요경영사항(임상·특허 등)", ""),
-    (r"신규시설투자", "🏭 신규 시설투자", ""), (r"상장적격성|매매거래정지|관리종목", "🚫 거래정지·적격성", ""),
+    (r"신규시설투자", "🏭 신규 시설투자", ""), (r"^주권매매거래정지|상장적격성\s*실질심사\s*대상\s*결정|관리종목\s*지정", "🚫 거래정지·적격성", ""),
 ]
 FLASH_KR_NEWS_QUERIES = ["수주 공급계약", "단독 수주", "FDA 승인", "품목허가 획득", "임상 성공", "기술이전 계약", "인수합병 단독"]
 FLASH_GLOBAL_COMPANIES = {
@@ -9191,22 +9191,39 @@ FLASH_GLOBAL_COMPANIES = {
     "SK hynix": "SK하이닉스", "ASML": "반도체 장비주", "Apple": "LG이노텍·비에이치", "Tesla": "LG에너지솔루션·에코프로비엠",
     "Intel": "반도체", "AMD": "삼성전자·SK하이닉스", "Broadcom": "SK하이닉스", "Foxconn": "전자부품주", "Qualcomm": "삼성전자",
 }
-FLASH_GLOBAL_EVENTS_EN = ['strike', 'fire', 'outage', 'earthquake', '"production halt"', '"export controls"', 'tariff', 'recall', 'explosion']
+FLASH_GLOBAL_EVENTS_EN = ['"workers strike"', '"on strike"', '"to strike"', '"strike vote"', '"labor strike"', '"plant fire"', '"factory fire"', '"fab fire"',
+                          'outage', 'earthquake', '"production halt"', '"export controls"', 'recall', 'explosion']
 FLASH_GLOBAL_EVENTS_KO = ["파업", "화재", "정전", "지진", "가동중단", "수출규제", "관세", "리콜", "폭발"]
 _flash_state = {"at": 0.0, "names": None, "names_at": 0.0, "pending": []}
 # 회사 이름에 사건 단어가 들어 있거나 다른 뜻인 경우 (예: 삼성화재 = Samsung Fire, 뉴욕 별명 Big Apple)
-FLASH_GLOBAL_FALSE = re.compile(r"samsung fire|fire\s*&\s*marine|big apple|apple(bee|ton)|pineapple|apple tv|ordered to pay|lawsuit|verdict", re.I)
-FLASH_EVENT_WORDS = {"strike": "파업", "fire": "화재", "outage": "정전", "earthquake": "지진", "production halt": "가동중단",
+FLASH_GLOBAL_FALSE = re.compile(r"samsung fire|fire\s*&\s*marine|big apple|apple(bee|ton)|pineapple|apple tv|ordered to pay|lawsuit|verdict|"
+                                r"strikes? (a )?deal|strike(s)? .{0,20}(deal|partnership|agreement)|tv deals?|black friday|lit a|ends .{0,10}strike", re.I)
+FLASH_EVENT_WORDS = {"workers strike": "파업", "on strike": "파업", "strike vote": "파업", "labor strike": "파업", "to strike": "파업",
+                     "plant fire": "화재", "factory fire": "화재", "fab fire": "화재", "outage": "정전", "earthquake": "지진", "production halt": "가동중단",
                      "export controls": "수출규제", "tariff": "관세", "recall": "리콜", "explosion": "폭발",
                      "파업": "파업", "화재": "화재", "정전": "정전", "지진": "지진", "가동중단": "가동중단", "수출규제": "수출규제",
                      "관세": "관세", "리콜": "리콜", "폭발": "폭발"}
 
 
+_flash_mem: set = set()  # 서버 메모리에도 기억 — DB 조회가 실패해도 같은 속보를 다시 안 보냄 (2026-10-22 중복 수정)
+
+
 def _flash_seen(key: str) -> bool:
-    return _brief_already_sent("flash", key)
+    if key in _flash_mem:
+        return True
+    try:
+        res = supabase.table("telegram_sent_log").select("kind").eq("kind", "flash").eq("ref_date", key).limit(1).execute()
+        if res.data:
+            _flash_mem.add(key)
+            return True
+        return False
+    except Exception as e:
+        print(f"[flash] 보낸 기록 조회 실패 → 안전하게 '보냄'으로 처리: {e}")
+        return True  # 확인이 안 되면 보내지 않는 쪽으로 (중복보다 누락이 낫다)
 
 
 def _flash_mark(key: str):
+    _flash_mem.add(key)
     _mark_brief_sent("flash", key)
 
 
@@ -9282,7 +9299,7 @@ def _collect_flash_domestic() -> list:
             print(f"[flash] DART 목록 실패: {e}")
         for r in rows:
             nm = r.get("report_nm") or ""
-            if "정정" in nm or not r.get("stock_code"):
+            if "정정" in nm or "기타시장안내" in nm or "기한 안내" in nm or not r.get("stock_code"):
                 continue
             rule = next((x for x in FLASH_DART_RULES if re.search(x[0], nm)), None)
             if not rule:
@@ -9313,7 +9330,11 @@ def _collect_flash_domestic() -> list:
                 if _flash_seen(key) or any(o["key"] == key for o in out):
                     continue
                 code = names[hit]
-                out.append({"key": key, "text": f"📰 {hit}{_flash_quote_txt(code)}\n   {title} ({src})\n   🔗 {FRONTEND_URL}/stock-analysis?code={code}", "cat": "kr"})
+                skey = f"krstock:{code}:{now.strftime('%Y-%m-%d')}"  # 같은 종목 뉴스는 하루 한 번만
+                if _flash_seen(skey) or any(o.get("skey") == skey for o in out):
+                    _flash_mark(key)
+                    continue
+                out.append({"key": key, "skey": skey, "text": f"📰 {hit}{_flash_quote_txt(code)}\n   {title} ({src})\n   🔗 {FRONTEND_URL}/stock-analysis?code={code}", "cat": "kr"})
         except Exception as e:
             print(f"[flash] 국내 뉴스 실패 {q}: {e}")
         time.sleep(0.2)
@@ -9380,13 +9401,15 @@ def _send_flash(items: list, title: str):
             if send_telegram(text):
                 for i in chunk:
                     _flash_mark(i["key"])
+                    if i.get("skey"):
+                        _flash_mark(i["skey"])
 
 
 def _run_flash_alerts():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     st = _flash_state
-    if time.time() - st["at"] < 5 * 60:
+    if time.time() - st["at"] < 10 * 60:  # 10분마다 (5분은 너무 잦았음)
         return
     st["at"] = time.time()
     now = now_kst()
