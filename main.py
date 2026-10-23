@@ -5700,8 +5700,50 @@ def _second_thursday(y: int, m: int) -> datetime:
     return first_thu + timedelta(days=7)
 
 
+# 🌏 해외 중앙은행 (⚠️ 매년 1월 갱신 — 정비 알림에 포함). 결과 발표는 한국 시각 기준
+BOJ_DECISION_DATES = ["2026-01-23", "2026-03-19", "2026-04-28", "2026-06-16", "2026-07-31", "2026-09-18", "2026-10-30", "2026-12-18"]
+ECB_DECISION_DATES = ["2026-02-05", "2026-03-19", "2026-04-30", "2026-06-11", "2026-07-23", "2026-09-10", "2026-10-29", "2026-12-17"]
+# 🇰🇷 날짜가 매번 다른 국내 지표 (한국은행 공표일정 기준, ⚠️ 매년 갱신)
+KR_GDP_DATES = {"2026-10-27": "3분기 실질 GDP 속보", "2027-01-26": "4분기 실질 GDP 속보"}
+
+
+def _last_weekday(y: int, m: int) -> datetime:
+    d = (datetime(y + (m == 12), m % 12 + 1, 1) - timedelta(days=1))
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def _nth_weekday(y: int, m: int, n: int) -> datetime:
+    d, k = datetime(y, m, 1), 0
+    while True:
+        if d.weekday() < 5:
+            k += 1
+            if k == n:
+                return d
+        d += timedelta(days=1)
+
+
+def _fetch_global_cb(start: str, end: str) -> list:
+    out = []
+    for d in BOJ_DECISION_DATES:
+        if start <= d <= end:
+            out.append({"date": d, "time": "점심 무렵", "title": "日) 일본은행(BOJ) 금리 결정", "major": True,
+                        "note": "엔화·일본 증시에 영향 (엔캐리 청산 이슈 주의)", "kind": "us_macro"})
+    for d in ECB_DECISION_DATES:
+        if start <= d <= end:
+            summer = 3 < int(d[5:7]) < 10 or (d[5:7] == "10" and int(d[8:]) < 25) or (d[5:7] == "03" and int(d[8:]) > 28)
+            out.append({"date": d, "time": "21:15" if summer else "22:15", "title": "유로존) 유럽중앙은행(ECB) 금리 결정", "major": True,
+                        "note": "유로화·달러·유럽 증시에 영향", "kind": "us_macro"})
+    return out
+
+
 def _fetch_kr_schedule(start: str, end: str) -> list:
     out = []
+    for d, t in KR_GDP_DATES.items():
+        if start <= d <= end:
+            out.append({"date": d, "time": "08:00", "title": f"韓) {t} (한국은행)", "major": True,
+                        "note": "한국 경제 성장률 — 내수·경기민감주에 영향", "kind": "kr_macro"})
     for d in BOK_MPC_DATES:
         if start <= d <= end:
             out.append({"date": d, "time": "10:00", "title": "韓) 한국은행 금통위 기준금리 결정", "major": True,
@@ -5716,6 +5758,13 @@ def _fetch_kr_schedule(start: str, end: str) -> list:
             out.append({"date": thu, "time": None,
                         "title": "韓) 선물·옵션 동시만기일" if quad else "韓) 옵션만기일",
                         "major": quad, "note": "장 마감 무렵 프로그램 매물·변동성 주의", "kind": "kr_macro"})
+        # 통계청 정기 지표 (발표 규칙 기준 예정일 — 실제 날짜는 하루 이틀 다를 수 있음)
+        for d_obj, title, note in ((_nth_weekday(y, m, 2), "韓) 소비자물가동향 (통계청·예정)", "국내 물가 — 금리·내수주에 영향"),
+                                   (_nth_weekday(y, m, 8), "韓) 고용동향 (통계청·예정)", "고용 흐름 — 내수 경기 확인"),
+                                   (_last_weekday(y, m), "韓) 산업활동동향 (통계청·예정)", "생산·소비·투자 — 경기 흐름 확인")):
+            ds = d_obj.strftime("%Y-%m-%d")
+            if start <= ds <= end:
+                out.append({"date": ds, "time": "08:00", "title": title, "major": False, "note": note, "kind": "kr_macro"})
         for day, title, t in ((1, "韓) 월간 수출입 동향 (산업부)", "09:00"),
                               (11, "韓) 1~10일 수출 잠정치 (관세청)", "09:00"),
                               (21, "韓) 1~20일 수출 잠정치 (관세청)", "09:00")):
@@ -5726,6 +5775,72 @@ def _fetch_kr_schedule(start: str, end: str) -> list:
         m += 1
         if m > 12:
             y, m = y + 1, 1
+    return out
+
+
+_kr_ir_cache = {"at": 0.0, "data": []}
+
+
+def _dart_plain_text(rcept_no: str) -> str:
+    res = requests.get("https://opendart.fss.or.kr/api/document.xml", params={"crtfc_key": DART_API_KEY, "rcept_no": rcept_no}, timeout=15)
+    if res.content[:2] != b"PK":
+        return ""
+    with zipfile.ZipFile(io.BytesIO(res.content)) as zf:
+        raw = b"".join(zf.read(n) for n in zf.namelist())
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("euc-kr", errors="replace")
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return re.sub(r"\s+", " ", BeautifulSoup(text, "html.parser").get_text(" "))
+
+
+def _fetch_kr_ir(start: str, end: str) -> list:
+    """최근 14일 DART 'IR 개최·결산실적 공시예고' 원문에서 날짜를 꺼내 → 날짜별 '실적발표·IR : A·B·C' (3시간 보관)"""
+    if not DART_API_KEY:
+        return []
+    c = _kr_ir_cache
+    if not c["data"] or time.time() - c["at"] > 3 * 3600:
+        now = now_kst()
+        rows = _dart_list((now - timedelta(days=14)).strftime("%Y%m%d"), now.strftime("%Y%m%d"), max_pages=6)
+        items, seen = [], set()
+        for r in rows:
+            nm = r.get("report_nm") or ""
+            if not r.get("stock_code") or "정정" in nm or not re.search(r"기업설명회|IR\)?\s*개최|결산실적공시\s*예고", nm):
+                continue
+            if r["corp_name"] in seen:
+                continue
+            try:
+                txt = _dart_plain_text(r["rcept_no"])
+            except Exception:
+                continue
+            m = re.search(r"(?:일시|일자|예정일)[^0-9]{0,15}(20\d{2})\s*[.\-년]\s*(\d{1,2})\s*[.\-월]\s*(\d{1,2})", txt)
+            if not m:
+                continue
+            seen.add(r["corp_name"])
+            items.append({"date": f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}", "name": r["corp_name"], "code": r["stock_code"],
+                          "kind": "실적" if "결산" in nm else "IR"})
+            time.sleep(0.15)
+        c.update({"at": time.time(), "data": items})
+    by_day = {}
+    for x in c["data"]:
+        if start <= x["date"] <= end:
+            by_day.setdefault(x["date"], []).append(x)
+    out = []
+    for d, xs in sorted(by_day.items()):
+        names = [x["name"] for x in xs]
+        tags = []
+        try:
+            dd = supabase.table("stock_dictionary").select("tags").in_("code", [x["code"] for x in xs[:6]]).execute().data or []
+            for r in dd:
+                tags += (r.get("tags") or [])[:1]
+        except Exception:
+            pass
+        note = ("업종: " + "·".join(dict.fromkeys(tags))) if tags else "해당 종목·업종에 영향"
+        out.append({"date": d, "time": None, "title": "韓) 실적발표·IR : " + "·".join(names[:5]) + (f" 외 {len(names) - 5}" if len(names) > 5 else ""),
+                    "major": len(names) >= 3, "note": note, "kind": "kr_macro"})
     return out
 
 
@@ -5743,6 +5858,8 @@ def fetch_calendar(days: int = 7) -> dict:
         ("미국 실적", _fetch_us_earnings),
         ("공모주", _fetch_kr_ipo),
         ("신규상장", _fetch_kr_listing),
+        ("해외 중앙은행", _fetch_global_cb),
+        ("국내 실적발표·IR", _fetch_kr_ir),
     ):
         try:
             events += fn(start, end)
@@ -5750,6 +5867,13 @@ def fetch_calendar(days: int = 7) -> dict:
             errors.append(f"{label}: {e}")
             print(f"[calendar] {label} 실패: {e}")
     events.sort(key=lambda e: (e["date"], e["time"] or "99:99", not e["major"]))
+    uniq, seen = [], set()  # 같은 날·같은 제목은 하나만 (예: 알파벳 실적발표가 두 줄 나오던 문제)
+    for e in events:
+        k = (e["date"], re.sub(r"\s+", "", e["title"]))
+        if k not in seen:
+            seen.add(k)
+            uniq.append(e)
+    events = uniq
     data = {"ok": True, "start": start, "end": end, "events": events, "errors": errors}
     # 실패한 출처가 있으면 5분만 기억 → 다음 요청 때 금방 다시 시도
     _calendar_cache.update({"at": time.time() - (25 * 60 if errors else 0), "key": key, "data": data})
@@ -6166,6 +6290,10 @@ def _event_line(e: dict) -> str:
     line = f"· {e['title']}{star}{t}"
     if e.get("note") and e.get("kind") in ("us_macro", "kr_macro"):
         line += f"\n  ↳ {e['note']}"
+    elif e.get("kind") == "us_earnings":
+        sym = (e.get("note") or "").split(" · ")[0]
+        if sym in KR_LINKS:
+            line += f"\n  ↳ 🇰🇷 관련: {KR_LINKS[sym]}"
     return line
 
 
@@ -9258,7 +9386,7 @@ MAINTENANCE_REMINDERS = [
              "· 한국투자증권 앱키 (실시간 체결·수급·랭킹 — 핵심)\n"
              "· KRX 데이터 비밀번호를 바꿨다면 Render의 KRX_PW도 변경"),
     ((1, 2), "📅 [정비] 새해 일정 갱신 — 올해 FOMC·금통위 날짜를 Claude에게 알려주고 서버에 반영하세요 "
-             "(main.py의 FOMC_DECISION_DATES / BOK_MPC_DATES)"),
+             "(main.py의 FOMC_DECISION_DATES / BOK_MPC_DATES / BOJ_DECISION_DATES / ECB_DECISION_DATES / KR_GDP_DATES)"),
 ]
 
 
@@ -9467,8 +9595,10 @@ FLASH_KR_MUST = re.compile(r"수주|공급계약|계약\s*체결|FDA\s*(승인|�
 FLASH_KR_SKIP = re.compile(r"인터뷰|칼럼|기고|사설|기획|커버스토리|COVER STORY|비즈리더|돋보기|창립|\d+년\s*-|100년|주간|리뷰|전망|분석|\?|…까|할까|될까|볼까|"
                            r"박차|추진|노린다|목표|참가|참석|전시회|박람회|기대감|"
                            r"증권사\s*리포트|리포트|목표가|투자의견|브리핑|요약|모닝|마감시황|시황|특징주\s*모음")  # 리포트 요약·시황 정리는 속보가 아님
-# 속보가 아닌 출처 (유료 뉴스레터·리포트 요약·블로그형 콘텐츠)
-FLASH_KR_SKIP_SRC = re.compile(r"프리미엄콘텐츠|프리미엄 콘텐츠|블로그|카페|포스트|유튜브|YouTube|브런치")
+# 속보가 아닌 출처 (유료 뉴스레터·리포트 요약·블로그형 콘텐츠·공시 재가공 분석 기사)
+FLASH_KR_SKIP_SRC = re.compile(r"프리미엄콘텐츠|프리미엄 콘텐츠|블로그|카페|포스트|유튜브|YouTube|브런치|데일리연합")
+# 분쟁·공방·해설 기사 ("재인수"처럼 키워드만 겹치는 경영권 분쟁 뉴스 등)
+FLASH_KR_SKIP2 = re.compile(r"분쟁|공방|주장|의혹|소송|고발|반박|드러난|계보|짚어|따져|보도…|논란|우려|감소·|MBK")
 FLASH_KR_TAG = re.compile(r"^\[(?!단독|속보)[^\]]{1,30}\]")
 # 바이오 뉴스는 너무 잦아서 "최초"가 제목에 있을 때만 (국내 최초·세계 최초·글로벌 최초 등) — 2026-10-23 요청
 FLASH_KR_BIO = re.compile(r"임상|FDA|품목허가|신약|바이오|항암|치료제|백신|톱라인|기술이전|기술수출|라이선스|제약|의약|파이프라인|희귀질환|세포|유전자|항체")
@@ -9484,7 +9614,7 @@ FLASH_GLOBAL_COMPANIES = {
 FLASH_GLOBAL_EVENTS_EN = ['"workers strike"', '"on strike"', '"to strike"', '"strike vote"', '"labor strike"', '"plant fire"', '"factory fire"', '"fab fire"',
                           'outage', 'earthquake', '"production halt"', '"export controls"', 'recall', 'explosion']
 FLASH_GLOBAL_EVENTS_KO = ["파업", "화재", "정전", "지진", "가동중단", "수출규제", "관세", "리콜", "폭발"]
-_flash_state = {"at": 0.0, "names": None, "names_at": 0.0, "pending": []}
+_flash_state = {"at": 0.0, "names": None, "names_at": 0.0, "pending": [], "waiting": {}}
 # 회사 이름에 사건 단어가 들어 있거나 다른 뜻인 경우 (예: 삼성화재 = Samsung Fire, 뉴욕 별명 Big Apple)
 FLASH_GLOBAL_FALSE = re.compile(r"samsung fire|fire\s*&\s*marine|big apple|apple(bee|ton)|pineapple|apple tv|ordered to pay|lawsuit|verdict|"
                                 r"strikes? (a )?deal|strike(s)? .{0,20}(deal|partnership|agreement)|tv deals?|black friday|lit a|ends .{0,10}strike", re.I)
@@ -9569,6 +9699,90 @@ def _contract_details(rcept_no: str) -> str:
         return ""
 
 
+_flash_q_cache: dict = {}
+# 속보 거래대금 기준 (억원) — 장 초반 50억 터진 종목이 이후에도 강했던 경험 기준 (2026-10-23 JM). 아침 상승 랭킹도 50억 기준
+FLASH_MIN_VALUE_EOK = 50
+
+
+def _flash_liquid(code: str, min_eok: float) -> bool:
+    """장중엔 거래대금이 너무 작은 종목은 속보에서 뺌 (단타 대상이 아님). 장 전·주말엔 거르지 않음"""
+    now = now_kst()
+    if now.weekday() >= 5 or (now.hour, now.minute) < (9, 10):
+        return True
+    try:
+        q = _flash_q_cache.get(code)
+        if not q or time.time() - q[0] > 300:
+            q = (time.time(), _kis_quote(code))
+            _flash_q_cache[code] = q
+        return (q[1].get("value_eok") or 0) >= min_eok
+    except Exception:
+        return True
+
+
+def _after_close() -> bool:
+    """정규장 마감(15:30) 이후 ~ 다음 날 장 시작 전 — 이때는 진짜 큰 호재·악재만 보냄"""
+    now = now_kst()
+    return (now.hour, now.minute) >= (15, 30) or (now.hour, now.minute) < (8, 30)
+
+
+def _big_amount_eok(text: str) -> float:
+    """제목·계약 내용에서 금액(억) 꺼내기: '2조원'·'1,200억' 등"""
+    best = 0.0
+    for m in re.finditer(r"(\d+(?:\.\d+)?)\s*조", text):
+        best = max(best, float(m.group(1)) * 10000)
+    for m in re.finditer(r"([\d,]{3,})\s*억", text):
+        best = max(best, float(m.group(1).replace(",", "")))
+    return best
+
+
+def _is_big_dart(label: str, nm: str, extra: str) -> bool:
+    """장 마감 뒤에도 보낼 만한 공시인가 — 대형 호재·악재만"""
+    if label.startswith(("🚫", "⚠️", "👤", "🔀", "🎁")):  # 거래정지·횡령·희석·최대주주 변경·합병분할·무상증자
+        return True
+    if label.startswith("💰"):
+        return "소각" in nm  # 자사주는 소각만
+    if label.startswith("📝"):
+        ratio = re.search(r"매출 대비 ([\d.]+)%", extra or "")
+        return (ratio and float(ratio.group(1)) >= 20) or _big_amount_eok(extra or "") >= 1000
+    return False  # 시설투자·주요경영사항·기술이전 등은 장중에만
+
+
+def _is_big_news(title: str) -> bool:
+    """장 마감 뒤 뉴스: '단독' + 1,000억 이상, 또는 바이오 '최초'"""
+    return ("단독" in title and _big_amount_eok(title) >= 1000) or (bool(FLASH_KR_BIO.search(title)) and "최초" in title)
+
+
+def _flash_wait(key: str, code: str, head: str, body: str, skey: str = None):
+    """재료는 나왔는데 아직 거래대금이 50억 전인 종목 — 오늘 장 끝날 때까지 지켜보다가 터지면 보냄"""
+    _flash_state["waiting"][key] = {"code": code, "head": head, "body": body, "skey": skey,
+                                    "day": now_kst().strftime("%Y-%m-%d"), "at": now_kst().strftime("%H:%M")}
+
+
+def _check_flash_waiting() -> list:
+    """대기 목록 다시 확인 → 거래대금 50억 넘고 상승 중이면 '⚡ 거래대금 터짐'으로 보냄"""
+    now = now_kst()
+    today = now.strftime("%Y-%m-%d")
+    out = []
+    for key, w in list(_flash_state["waiting"].items()):
+        if w["day"] != today:
+            _flash_state["waiting"].pop(key, None)
+            continue
+        if _flash_seen(key):
+            _flash_state["waiting"].pop(key, None)
+            continue
+        try:
+            q = _kis_quote(w["code"])
+            _flash_q_cache[w["code"]] = (time.time(), q)
+        except Exception:
+            continue
+        if (q.get("value_eok") or 0) >= FLASH_MIN_VALUE_EOK and (q.get("pct") or 0) > 0:
+            out.append({"key": key, "skey": w.get("skey"), "cat": "kr",
+                        "text": f"⚡ 재료 뒤 거래대금 터짐 (재료 {w['at']} → 지금 {q['value_eok']:,.0f}억)\n{w['head']}{_flash_quote_txt(w['code'])}\n{w['body']}"})
+            _flash_state["waiting"].pop(key, None)
+        time.sleep(0.1)
+    return out
+
+
 def _flash_quote_txt(code: str) -> str:
     now = now_kst()
     if now.weekday() >= 5 or (now.hour, now.minute) < (9, 0):
@@ -9596,18 +9810,29 @@ def _collect_flash_domestic() -> list:
             nm = r.get("report_nm") or ""
             if "정정" in nm or "기타시장안내" in nm or "기한 안내" in nm or not r.get("stock_code"):
                 continue
+            if re.search(r"종속회사|자회사", nm):  # 자회사 공시는 본업 영향이 작아서 제외 (한솔홀딩스 사례)
+                continue
             rule = next((x for x in FLASH_DART_RULES if re.search(x[0], nm)), None)
             if not rule:
                 continue
             key = f"dart:{r['rcept_no']}"
             if _flash_seen(key):
                 continue
+            if key in _flash_state["waiting"]:
+                continue
             extra = _contract_details(r["rcept_no"]) if rule[2] == "contract" else ""
             nm_clean = re.sub(r"\s+", " ", nm).strip()  # (f-string 안 백슬래시는 Python 3.11 이하에서 오류라 밖으로 뺌)
-            out.append({"key": key, "text": f"{rule[1]} · {r.get('corp_name')}{_flash_quote_txt(r['stock_code'])}\n   {nm_clean}"
-                        + (f"\n   {extra}" if extra else "")
-                        + f"\n   📎 공시 원문: https://dart.fss.or.kr/dsaf001/main.do?rcpNo={r['rcept_no']}"
-                        + f"\n   🔗 {FRONTEND_URL}/stock-analysis?code={r['stock_code']}", "cat": "kr"})
+            if _after_close() and not _is_big_dart(rule[1], nm, extra):
+                _flash_mark(key)  # 장 마감 뒤 작은 공시는 보내지 않음
+                continue
+            head = f"{rule[1]} · {r.get('corp_name')}"
+            body = (f"   {nm_clean}" + (f"\n   {extra}" if extra else "")
+                    + f"\n   📎 공시 원문: https://dart.fss.or.kr/dsaf001/main.do?rcpNo={r['rcept_no']}"
+                    + f"\n   🔗 {FRONTEND_URL}/stock-analysis?code={r['stock_code']}")
+            if not rule[1].startswith(("🚫", "⚠️")) and not _flash_liquid(r["stock_code"], FLASH_MIN_VALUE_EOK):
+                _flash_wait(key, r["stock_code"], head, body)  # 거래대금 50억 전 → 대기 목록에 두고, 나중에 터지면 보냄
+                continue
+            out.append({"key": key, "text": f"{head}{_flash_quote_txt(r['stock_code'])}\n{body}", "cat": "kr"})
     # ② 뉴스 키워드 (최근 1시간, 종목명이 제목에 있을 때만)
     names = _flash_stock_names()
     for q in FLASH_KR_NEWS_QUERIES:
@@ -9621,7 +9846,7 @@ def _collect_flash_domestic() -> list:
                 if src and title.endswith(f" - {src}"):
                     title = title[: -len(src) - 3]
                 if not FLASH_KR_MUST.search(title) or FLASH_KR_SKIP.search(title) or FLASH_KR_TAG.search(title) or _bio_without_first(title) \
-                        or FLASH_KR_SKIP_SRC.search(src):
+                        or FLASH_KR_SKIP_SRC.search(src) or FLASH_KR_SKIP2.search(title):
                     continue
                 hit = max((n for n in names if n in title), key=len, default=None)
                 if not hit:
@@ -9630,9 +9855,15 @@ def _collect_flash_domestic() -> list:
                 if _flash_seen(key) or any(o["key"] == key for o in out):
                     continue
                 code = names[hit]
+                if _after_close() and not _is_big_news(title):
+                    _flash_mark(key)  # 장 마감 뒤엔 대형 뉴스만
+                    continue
                 skey = f"krstock:{code}:{now.strftime('%Y-%m-%d')}"  # 같은 종목 뉴스는 하루 한 번만
-                if _flash_seen(skey) or any(o.get("skey") == skey for o in out):
+                if _flash_seen(skey) or any(o.get("skey") == skey for o in out) or key in _flash_state["waiting"]:
                     _flash_mark(key)
+                    continue
+                if not _flash_liquid(code, FLASH_MIN_VALUE_EOK):  # 거래대금 50억 전 → 대기, 나중에 터지면 보냄
+                    _flash_wait(key, code, f"📰 {hit}", f"   {title} ({src})\n   📎 원문: {link}\n   🔗 {FRONTEND_URL}/stock-analysis?code={code}", skey)
                     continue
                 out.append({"key": key, "skey": skey, "text": f"📰 {hit}{_flash_quote_txt(code)}\n   {title} ({src})\n   📎 원문: {link}\n   🔗 {FRONTEND_URL}/stock-analysis?code={code}", "cat": "kr"})
         except Exception as e:
@@ -9723,6 +9954,8 @@ def _run_flash_alerts():
     try:
         if now.weekday() < 5 and (7, 0) <= (now.hour, now.minute) <= (20, 30):
             items += _collect_flash_domestic()
+        if now.weekday() < 5 and (9, 10) <= (now.hour, now.minute) <= (15, 20):
+            items += _check_flash_waiting()  # 재료 뒤 늦게 거래대금이 터진 종목
         items += _collect_flash_global()
     except Exception as e:
         print(f"[flash] 수집 실패: {e}")
