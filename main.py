@@ -5594,6 +5594,98 @@ def _fetch_kr_ipo(start: str, end: str) -> list:
     return out
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 🆕 신규상장 (IPO) — 38커뮤니케이션 "신규상장"(상장일·공모가) + "수요예측 결과"(기관 경쟁률·의무보유확약)
+# 표 모양이 바뀌어도 머리글(신규상장일·공모가·기관경쟁률·의무보유확약)을 찾아 읽도록 만듦
+# ══════════════════════════════════════════════════════════════════════════
+_ipo_cache = {"at": 0.0, "data": None}
+
+
+def _38_table(params: dict, must: list):
+    res = requests.get("http://www.38.co.kr/html/fund/index.htm", params=params,
+                       headers={"User-Agent": "Mozilla/5.0", "Referer": "http://www.38.co.kr/"}, timeout=12)
+    soup = BeautifulSoup(res.content.decode("euc-kr", errors="replace"), "html.parser")
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        for hi, tr in enumerate(rows):
+            head = [c.get_text(" ", strip=True).replace(" ", "") for c in tr.find_all(["td", "th"])]
+            if all(any(m in h for h in head) for m in must):
+                out = []
+                for tr2 in rows[hi + 1:]:
+                    cells = [c.get_text(" ", strip=True) for c in tr2.find_all("td")]
+                    if len(cells) >= len(head) - 1 and cells and cells[0]:
+                        out.append(dict(zip(head, cells)))
+                if out:
+                    return head, out
+    return None, []
+
+
+def _num(v):
+    try:
+        return float(re.sub(r"[^\d.]", "", str(v)) or "nan")
+    except ValueError:
+        return None
+
+
+def _ipo_name(v: str) -> str:
+    return re.sub(r"\((유가|코스닥|코넥스)\)|\s+", "", v or "").strip()
+
+
+def fetch_kr_ipo_listings() -> list:
+    """신규상장 목록 [{name, date, offer, comp, lockup}] — 30분 보관"""
+    c = _ipo_cache
+    if c["data"] is not None and time.time() - c["at"] < 1800:
+        return c["data"]
+    out = {}
+    try:
+        head, rows = _38_table({"o": "nw"}, ["신규상장일", "공모가"])
+        for r in rows:
+            name = _ipo_name(next((v for k, v in r.items() if "기업명" in k or "종목명" in k), list(r.values())[0]))
+            d = next((v for k, v in r.items() if "신규상장일" in k), "")
+            m = re.search(r"(\d{4})[./-](\d{1,2})[./-](\d{1,2})", d)
+            if not name or not m:
+                continue
+            offer = next((_num(v) for k, v in r.items() if k.startswith("공모가") and "대비" not in k), None)
+            out[name] = {"name": name, "date": f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}", "offer": offer, "comp": None, "lockup": None}
+    except Exception as e:
+        print(f"[ipo] 신규상장 실패: {e}")
+    try:
+        head, rows = _38_table({"o": "r1"}, ["기관경쟁률"])
+        for r in rows:
+            name = _ipo_name(next((v for k, v in r.items() if "기업명" in k or "종목명" in k), list(r.values())[0]))
+            if name in out:
+                out[name]["comp"] = next((v for k, v in r.items() if "기관경쟁률" in k), None)
+                out[name]["lockup"] = next((v for k, v in r.items() if "의무보유" in k), None)
+                if not out[name]["offer"]:
+                    out[name]["offer"] = next((_num(v) for k, v in r.items() if k.startswith("공모가") and "희망" not in k), None)
+    except Exception as e:
+        print(f"[ipo] 수요예측 실패: {e}")
+    data = sorted(out.values(), key=lambda x: x["date"])
+    c.update({"at": time.time(), "data": data})
+    return data
+
+
+def _ipo_line(x: dict) -> str:
+    bits = [f"공모가 {x['offer']:,.0f}원" if x.get("offer") else None,
+            f"기관경쟁률 {x['comp']}" if x.get("comp") else None,
+            f"의무보유확약 {x['lockup']}" if x.get("lockup") else None]
+    return f"· {x['name']} — " + " · ".join(b for b in bits if b) if any(bits) else f"· {x['name']}"
+
+
+def _fetch_kr_listing(start: str, end: str) -> list:
+    return [{"date": x["date"], "time": None, "title": f"신규상장 : {x['name']}", "major": True, "note": None, "kind": "kr_listing"}
+            for x in fetch_kr_ipo_listings() if start <= x["date"] <= end]
+
+
+@app.get("/api/ipo")
+def ipo_endpoint():
+    """신규상장 미리보기 — 표를 제대로 읽는지 확인용"""
+    try:
+        return {"ok": True, "items": fetch_kr_ipo_listings()}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 # 🇰🇷 국내 일정 — 한국은행 금통위(연 8회, ⚠️ 매년 갱신), 옵션만기일·동시만기일(매월 둘째 목요일),
 # 수출입 동향(매월 1일 산업부, 11일·21일 관세청 잠정)
 BOK_MPC_DATES = [
@@ -5650,6 +5742,7 @@ def fetch_calendar(days: int = 7) -> dict:
         ("미국 경제지표", _fetch_us_economic),
         ("미국 실적", _fetch_us_earnings),
         ("공모주", _fetch_kr_ipo),
+        ("신규상장", _fetch_kr_listing),
     ):
         try:
             events += fn(start, end)
@@ -6311,6 +6404,21 @@ def build_premarket_brief():
         parts.append("🗓 오늘 주요 일정\n" + ("\n".join(_event_line(e).split("\n")[0] for e in todays[:8]) if todays else "· 큰 일정 없음"))
     except Exception as e:
         print(f"[brief:premarket] 일정 실패: {e}")
+    # 🆕 신규상장 — 오늘 상장 (+ 월요일엔 이번 주 상장 예정)
+    try:
+        ipos = fetch_kr_ipo_listings()
+        today = now.strftime("%Y-%m-%d")
+        todays = [x for x in ipos if x["date"] == today]
+        if todays:
+            parts.append("🆕 오늘 신규상장\n" + "\n".join(_ipo_line(x) for x in todays)
+                         + "\n※ 기관경쟁률↑·의무보유확약↑일수록 첫날 매도 물량이 적은 편")
+        if now.weekday() == 0:
+            wk_end = (now + timedelta(days=4)).strftime("%Y-%m-%d")
+            week = [x for x in ipos if today < x["date"] <= wk_end]
+            if week:
+                parts.append("🗓 이번 주 상장 예정\n" + "\n".join(f"{_kr_date(x['date'])[5:]} {_ipo_line(x)[2:]}" for x in week))
+    except Exception as e:
+        print(f"[brief:premarket] 신규상장 실패: {e}")
     # 📌 오늘 볼 만한 후보 (데이터로 고른 것 — 추천 아님, 링크로 바로 종목분석)
     try:
         parts.append(_build_watch_candidates())
@@ -6484,6 +6592,12 @@ def build_rally_brief(top_n: int = 20, min_value_eok: float = 50):
                          f" · 장중 고점 대비 {(r['price'] / hi - 1) * 100:+.1f}%")
         except Exception as e:
             print(f"[brief:rally] {r['code']} 분봉 실패: {e}")
+        try:  # 🆕 상장 첫날이면 공모가 대비 표시
+            ipo = next((x for x in fetch_kr_ipo_listings() if x["date"] == now.strftime("%Y-%m-%d") and x["name"] == _ipo_name(r["name"]) and x.get("offer")), None)
+            if ipo:
+                extra += f"\n   🆕 상장 첫날 · 공모가 {ipo['offer']:,.0f}원 대비 {(r['price'] / ipo['offer'] - 1) * 100:+.0f}%"
+        except Exception:
+            pass
         lines.append(
             f"\n{i}. {r['name']} 시가대비 {r['from_open']:+.1f}% (전일비 {r['pct']:+.1f}%) · {_fmt_eok(r['value_eok'], signed=False)}"
             f"{extra}"
