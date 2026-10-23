@@ -6176,7 +6176,7 @@ def _morning_news_picks(n: int = 3) -> list:
                 src = (it.findtext("source") or "").strip()
                 if src and title.endswith(f" - {src}"):
                     title = title[: -len(src) - 3]
-                if FLASH_KR_SKIP.search(title) or FLASH_KR_TAG.search(title):
+                if FLASH_KR_SKIP.search(title) or FLASH_KR_TAG.search(title) or _bio_without_first(title):
                     continue
                 hit = max((nm for nm in names if nm in title), key=len, default=None)
                 if not hit or names[hit] in seen_codes:
@@ -9353,6 +9353,12 @@ FLASH_KR_MUST = re.compile(r"수주|공급계약|계약\s*체결|FDA\s*(승인|�
 FLASH_KR_SKIP = re.compile(r"인터뷰|칼럼|기고|사설|기획|커버스토리|COVER STORY|비즈리더|돋보기|창립|\d+년\s*-|100년|주간|리뷰|전망|분석|\?|…까|할까|될까|볼까|"
                            r"박차|추진|노린다|목표|참가|참석|전시회|박람회|기대감")  # "수주 확대 박차" 같은 다짐·행사 기사 제외
 FLASH_KR_TAG = re.compile(r"^\[(?!단독|속보)[^\]]{1,30}\]")
+# 바이오 뉴스는 너무 잦아서 "최초"가 제목에 있을 때만 (국내 최초·세계 최초·글로벌 최초 등) — 2026-10-23 요청
+FLASH_KR_BIO = re.compile(r"임상|FDA|품목허가|신약|바이오|항암|치료제|백신|톱라인|기술이전|기술수출|라이선스|제약|의약|파이프라인|희귀질환|세포|유전자|항체")
+
+
+def _bio_without_first(title: str) -> bool:
+    return bool(FLASH_KR_BIO.search(title)) and "최초" not in title
 FLASH_GLOBAL_COMPANIES = {
     "TSMC": "삼성전자·DB하이텍", "Micron": "SK하이닉스·삼성전자", "Nvidia": "SK하이닉스·한미반도체", "Samsung": "삼성전자",
     "SK hynix": "SK하이닉스", "ASML": "반도체 장비주", "Apple": "LG이노텍·비에이치", "Tesla": "LG에너지솔루션·에코프로비엠",
@@ -9497,7 +9503,7 @@ def _collect_flash_domestic() -> list:
                 link = (it.findtext("link") or "").strip()
                 if src and title.endswith(f" - {src}"):
                     title = title[: -len(src) - 3]
-                if not FLASH_KR_MUST.search(title) or FLASH_KR_SKIP.search(title) or FLASH_KR_TAG.search(title):
+                if not FLASH_KR_MUST.search(title) or FLASH_KR_SKIP.search(title) or FLASH_KR_TAG.search(title) or _bio_without_first(title):
                     continue
                 hit = max((n for n in names if n in title), key=len, default=None)
                 if not hit:
