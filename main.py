@@ -6269,7 +6269,7 @@ def _morning_news_picks(n: int = 3) -> list:
                 src = (it.findtext("source") or "").strip()
                 if src and title.endswith(f" - {src}"):
                     title = title[: -len(src) - 3]
-                if FLASH_KR_SKIP.search(title) or FLASH_KR_TAG.search(title) or _bio_without_first(title):
+                if FLASH_KR_SKIP.search(title) or FLASH_KR_TAG.search(title) or _bio_without_first(title) or FLASH_KR_SKIP_SRC.search(src):
                     continue
                 hit = max((nm for nm in names if nm in title), key=len, default=None)
                 if not hit or names[hit] in seen_codes:
@@ -9465,7 +9465,10 @@ FLASH_KR_NEWS_QUERIES = ['"수주"', '"공급계약"', '"FDA 승인"', '"품목�
 FLASH_KR_MUST = re.compile(r"수주|공급계약|계약\s*체결|FDA\s*(승인|허가)|품목허가|임상.{0,6}(성공|승인|유효|달성)|톱라인|기술이전|기술수출|인수|합병|M&A|최대\s*실적|단독")
 # 기획·인터뷰·칼럼은 매매와 상관없어서 제외
 FLASH_KR_SKIP = re.compile(r"인터뷰|칼럼|기고|사설|기획|커버스토리|COVER STORY|비즈리더|돋보기|창립|\d+년\s*-|100년|주간|리뷰|전망|분석|\?|…까|할까|될까|볼까|"
-                           r"박차|추진|노린다|목표|참가|참석|전시회|박람회|기대감")  # "수주 확대 박차" 같은 다짐·행사 기사 제외
+                           r"박차|추진|노린다|목표|참가|참석|전시회|박람회|기대감|"
+                           r"증권사\s*리포트|리포트|목표가|투자의견|브리핑|요약|모닝|마감시황|시황|특징주\s*모음")  # 리포트 요약·시황 정리는 속보가 아님
+# 속보가 아닌 출처 (유료 뉴스레터·리포트 요약·블로그형 콘텐츠)
+FLASH_KR_SKIP_SRC = re.compile(r"프리미엄콘텐츠|프리미엄 콘텐츠|블로그|카페|포스트|유튜브|YouTube|브런치")
 FLASH_KR_TAG = re.compile(r"^\[(?!단독|속보)[^\]]{1,30}\]")
 # 바이오 뉴스는 너무 잦아서 "최초"가 제목에 있을 때만 (국내 최초·세계 최초·글로벌 최초 등) — 2026-10-23 요청
 FLASH_KR_BIO = re.compile(r"임상|FDA|품목허가|신약|바이오|항암|치료제|백신|톱라인|기술이전|기술수출|라이선스|제약|의약|파이프라인|희귀질환|세포|유전자|항체")
@@ -9617,7 +9620,8 @@ def _collect_flash_domestic() -> list:
                 link = (it.findtext("link") or "").strip()
                 if src and title.endswith(f" - {src}"):
                     title = title[: -len(src) - 3]
-                if not FLASH_KR_MUST.search(title) or FLASH_KR_SKIP.search(title) or FLASH_KR_TAG.search(title) or _bio_without_first(title):
+                if not FLASH_KR_MUST.search(title) or FLASH_KR_SKIP.search(title) or FLASH_KR_TAG.search(title) or _bio_without_first(title) \
+                        or FLASH_KR_SKIP_SRC.search(src):
                     continue
                 hit = max((n for n in names if n in title), key=len, default=None)
                 if not hit:
