@@ -2756,6 +2756,7 @@ async def _daily_jobs_worker():
         ("maintenance", _maintenance_reminders, ()),
         ("world_news", _run_world_news_alerts, ()),
         ("flash", _run_flash_alerts, ()),
+        ("theme_snap", _save_theme_snapshot, ()),
         ("target_reach", _check_target_reach, ()),
         ("earnings_disclosure", _check_earnings_disclosures, ()),
     ]
@@ -5838,10 +5839,23 @@ def build_morning_brief():
         + ("\n\n🇪🇺 유럽 마감\n" + "\n".join(eu_rows) if eu_rows else "")
         + "\n\n" + "\n".join(rows[5:])
     )
+    # 확장 부분은 시간 제한(45초)을 두고, 실패해도 기본 마감 알림은 무조건 발송 (2026-10-23: 06:15 알림 누락 수정)
+    import concurrent.futures as _cf
+    with _cf.ThreadPoolExecutor(max_workers=1) as ex:
+        try:
+            extra = ex.submit(_us_close_extras).result(timeout=45)
+            if extra:
+                text += "\n\n" + extra
+        except Exception as e:
+            print(f"[brief:morning] 확장 실패(기본 알림은 발송): {e}")
+    # 🌙 내가 잠든 사이 해외 속보 (밤에 모아둔 것)
     try:
-        text += "\n\n" + _us_close_extras()
+        night = [i for i in _flash_state.get("pending", []) if i.get("cat") == "gl"][:6]
+        if night:
+            text += "\n\n🌙 밤사이 해외 속보\n" + "\n\n".join(i["text"] for i in night)
+            _flash_state["morning_keys"] = [i["key"] for i in night]
     except Exception as e:
-        print(f"[brief:morning] 확장 실패: {e}")
+        print(f"[brief:morning] 밤사이 속보 실패: {e}")
     return text, us_date
 
 
@@ -6102,6 +6116,96 @@ def _stock_link(code: str) -> str:
     return f"{FRONTEND_URL}/stock-analysis?code={code}"
 
 
+def _theme_top_now(n: int = 3):
+    themes = sorted(fetch_naver_theme_list(limit=25), key=lambda t: t["change_pct"], reverse=True)[:n]
+    out = []
+    for t in themes:
+        try:
+            stocks, _ = fetch_naver_theme_detail(t["theme_no"], limit=20)
+        except Exception:
+            stocks = []
+        top = sorted(stocks, key=lambda x: x["change_pct"], reverse=True)[:2]
+        out.append({"name": t["theme_name"], "pct": t["change_pct"],
+                    "stocks": [{"name": x["stock_name"], "pct": x["change_pct"], "code": x["stock_code"]} for x in top]})
+    return out
+
+
+def _save_theme_snapshot():
+    """평일 15:50 이후 하루 한 번 — 오늘 강세 테마를 저장해 다음 날 장전 리포트에 씀"""
+    now = now_kst()
+    if now.weekday() >= 5 or (now.hour, now.minute) < (15, 50):
+        return
+    key = now.strftime("%Y-%m-%d")
+    if _brief_already_sent("job_theme_snap", key):
+        return
+    try:
+        if _latest_trading_day() != now.strftime("%Y%m%d"):
+            return
+        data = {"date": key, "themes": _theme_top_now()}
+        if data["themes"] and any(t["pct"] for t in data["themes"]):
+            supabase.table("brief_cache").upsert({"key": "theme_top_prevday", "data": data, "updated_at": now.isoformat()}).execute()
+            _mark_brief_sent("job_theme_snap", key)
+    except Exception as e:
+        print(f"[theme_snap] 실패: {e}")
+
+
+MORNING_NEWS_QUERIES = ['"수주"', '"공급계약"', '"단독"', '"정부" 지원', '"정책" 수혜', '"FDA"', '"임상"', '"최대 실적"', '"신고가"', '"특징주"']
+
+
+def _morning_news_picks(n: int = 3) -> list:
+    """밤사이~아침(최근 14시간) 국내 기사 중 상장사 이름이 들어간 굵직한 것 2~3개
+    → 헤드라인 + 원문 링크 + 🏷 테마(내 종목 사전) + 관련주(같은 테마의 다른 종목)"""
+    from email.utils import parsedate_to_datetime
+    names = _flash_stock_names()
+    now = now_kst()
+    weight = [(r"단독", 3), (r"수주|공급계약|계약\s*체결", 3), (r"FDA|품목허가|임상.{0,6}(성공|승인)", 3), (r"최대\s*실적|흑자\s*전환", 2),
+              (r"정부|정책|지원|규제\s*완화", 2), (r"특징주|신고가|급등", 1)]
+    cands, seen_codes = [], set()
+    for q in MORNING_NEWS_QUERIES:
+        try:
+            res = requests.get("https://news.google.com/rss/search", params={"q": f"{q} when:1d", "hl": "ko", "gl": "KR", "ceid": "KR:ko"},
+                               headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            for it in ET.fromstring(res.content).iter("item"):
+                try:
+                    age_h = (now - parsedate_to_datetime(it.findtext("pubDate")).astimezone(KST)).total_seconds() / 3600
+                except Exception:
+                    continue
+                if age_h > 14:
+                    continue
+                title = (it.findtext("title") or "").strip()
+                src = (it.findtext("source") or "").strip()
+                if src and title.endswith(f" - {src}"):
+                    title = title[: -len(src) - 3]
+                if FLASH_KR_SKIP.search(title) or FLASH_KR_TAG.search(title):
+                    continue
+                hit = max((nm for nm in names if nm in title), key=len, default=None)
+                if not hit or names[hit] in seen_codes:
+                    continue
+                score = sum(w for pat, w in weight if re.search(pat, title)) + (1 if age_h <= 3 else 0)
+                if score < 2:
+                    continue
+                seen_codes.add(names[hit])
+                cands.append((score, title, src, (it.findtext("link") or "").strip(), hit, names[hit]))
+        except Exception as e:
+            print(f"[morning_news] {q} 실패: {e}")
+        time.sleep(0.15)
+    cands.sort(key=lambda x: -x[0])
+    out = []
+    for score, title, src, link, nm, code in cands[:n]:
+        tags, mates = [], []
+        try:
+            d = supabase.table("stock_dictionary").select("tags").eq("code", code).limit(1).execute().data
+            tags = (d[0]["tags"] if d else [])[:2]
+            if tags:
+                m = supabase.table("stock_dictionary").select("name").eq("market", "KR").contains("tags", [tags[0]]).neq("code", code).limit(4).execute().data or []
+                mates = [x["name"] for x in m][:3]
+        except Exception:
+            pass
+        out.append(f"· {title} ({src})\n   📎 {link}\n   🏷 {nm}" + (f" · 테마: {'·'.join(tags)}" if tags else "")
+                   + (f" · 관련주: {', '.join(mates)}" if mates else "") + f"\n   🔗 {_stock_link(code)}")
+    return out
+
+
 def _build_watch_candidates() -> str:
     """
     장전 리포트용 "오늘 볼 만한 후보" — 예측이 아니라, 밤사이·전일 데이터에서 눈에 띄는 것만 모음:
@@ -6110,7 +6214,15 @@ def _build_watch_candidates() -> str:
       ③ 전일 장 마감 후~오늘 아침 실적 공시 종목 (숫자 포함)
       ④ 전일 외국인 순매수 TOP5
     """
-    lines = ["📌 오늘 볼 만한 후보 (데이터로 고른 것 · 추천 아님)"]
+    lines = []
+    # 📰 오늘 볼 만한 기사 2~3개 (밤사이~아침 뉴스에서 골라 헤드라인 + 원문 + 테마 + 관련주)
+    try:
+        arts = _morning_news_picks()
+        if arts:
+            lines.append("📰 오늘 국내 볼 만한 기사 (밤사이~아침 · 추천 아님)\n" + "\n\n".join(arts))
+    except Exception as e:
+        print(f"[brief:candidates] 아침 기사 실패: {e}")
+    lines.append("📌 참고 데이터")
     # ① 미국 섹터 힌트
     hints = []
     for sym, label, kr in (("^SOX", "필라델피아 반도체", "반도체"), ("^IXIC", "나스닥", "성장·기술주"), ("CL=F", "WTI 유가", "정유·에너지")):
@@ -6122,21 +6234,19 @@ def _build_watch_candidates() -> str:
             hints.append(f"{label} {q['pct']:+.1f}% → {kr} {'강세' if q['pct'] > 0 else '약세'} 가능성")
     if hints:
         lines.append("🌙 밤사이 미국: " + " / ".join(hints))
-    # ② 전일 강세 테마
+    # ② 전일 강세 테마 — 아침엔 오늘 등락률이 0이라, 전날 장 마감 뒤 저장해 둔 스냅샷을 씀 (2026-10-23)
     try:
-        themes = sorted(fetch_naver_theme_list(limit=25), key=lambda t: t["change_pct"], reverse=True)[:3]
+        snap = None
+        if (now_kst().hour, now_kst().minute) < (9, 5):
+            r = supabase.table("brief_cache").select("data").eq("key", "theme_top_prevday").limit(1).execute().data
+            snap = r[0]["data"] if r else None
         tl = []
-        for t in themes:
-            try:
-                stocks, _ = fetch_naver_theme_detail(t["theme_no"], limit=20)
-            except Exception:
-                stocks = []
-            top = sorted(stocks, key=lambda x: x["change_pct"], reverse=True)[:2]
-            tl.append(f"· {t['theme_name']} {t['change_pct']:+.1f}%")
-            for x in top:
-                tl.append(f"   {x['stock_name']} {x['change_pct']:+.1f}% 🔗 {_stock_link(x['stock_code'])}")
+        for t in (snap or {}).get("themes") or _theme_top_now():
+            tl.append(f"· {t['name']} {t['pct']:+.1f}%")
+            for x in t["stocks"]:
+                tl.append(f"   {x['name']} {x['pct']:+.1f}% 🔗 {_stock_link(x['code'])}")
         if tl:
-            lines.append("🔥 전일 강세 테마\n" + "\n".join(tl))
+            lines.append("🔥 전일 강세 테마" + (f" ({snap.get('date')} 마감)" if snap else "") + "\n" + "\n".join(tl))
     except Exception as e:
         print(f"[brief:candidates] 테마 실패: {e}")
     # ③ 전일 장 마감 후 ~ 오늘 아침 실적 공시
@@ -6149,9 +6259,11 @@ def _build_watch_candidates() -> str:
                 el = []
                 for r in res:
                     nums = fetch_earnings_numbers(r["rcept_no"])
-                    num_txt = f" · {_earnings_numbers_text(nums)}" if nums else ""
-                    el.append(f"· {r['corp_name']}{num_txt}\n   🔗 {_stock_link(r['stock_code'])}")
-                lines.append("📊 최근 실적 공시\n" + "\n".join(el))
+                    if not nums:
+                        continue  # 숫자를 못 읽은 공시는 빼기 (빈 줄만 나오던 문제)
+                    el.append(f"· {r['corp_name']} · {_earnings_numbers_text(nums)}\n   🔗 {_stock_link(r['stock_code'])}")
+                if el:
+                    lines.append("📊 최근 실적 공시\n" + "\n".join(el))
         except Exception as e:
             print(f"[brief:candidates] 실적 공시 실패: {e}")
     # ④ 전일 외국인 순매수 TOP5
@@ -6686,6 +6798,13 @@ def _run_telegram_briefs():
             if send_telegram(text):
                 _mark_brief_sent(kind, ref)
                 print(f"[brief] {kind} 발송 완료 ({ref})")
+                if kind == "morning" and _flash_state.get("morning_keys"):
+                    used = set(_flash_state.pop("morning_keys"))
+                    for k in used:
+                        _flash_mark(k)
+                    _flash_state["pending"] = [i for i in _flash_state.get("pending", []) if i["key"] not in used]
+            else:
+                print(f"[brief] {kind} 텔레그램 발송 실패 — 다음 주기에 다시 시도")
         except Exception as e:
             print(f"[brief] {kind} 만들기 실패: {e}")
 
@@ -8692,6 +8811,11 @@ def _us_close_extras() -> str:
         g = sorted(rows, key=lambda r: -r["pct"])[:5]
         l = sorted(rows, key=lambda r: r["pct"])[:5]
         parts.append("🔺 대형주 상승 TOP5: " + ", ".join(f"{r['name']} {r['pct']:+.1f}%" for r in g))
+        hot = sorted([r for r in fetch_us_screener() if r["cap"] >= 2e9 and r["value"] >= 2e8 and abs(r["pct"]) >= 7],
+                     key=lambda r: -abs(r["pct"]))[:5]
+        if hot:
+            parts.append("🔥 해외 특징주 (시총 20억$↑·거래대금 2억$↑·±7%↑)\n" + "\n".join(
+                f"· {r['name']} ({r['symbol']}) {r['pct']:+.1f}%" + (f" → 🇰🇷 {KR_LINKS[r['symbol']]}" if r['symbol'] in KR_LINKS else "") for r in hot))
         parts.append("🔻 대형주 하락 TOP5: " + ", ".join(f"{r['name']} {r['pct']:+.1f}%" for r in l))
         links = []
         by = {r["symbol"]: r for r in rows}
@@ -9056,30 +9180,67 @@ _world_news_cache: dict = {}
 _ko_cache: dict = {}
 
 
-def translate_to_ko(texts: list) -> list:
-    """원어 제목 → 한국어 (구글 번역 무료 엔드포인트, 결과는 보관해서 같은 제목은 다시 안 물어봄)"""
+_gtx_block = {"until": 0.0}
+_LANG_MYMEMORY = {"en": "en", "ru": "ru", "ja": "ja", "zh": "zh-CN", "zh-CN": "zh-CN", "ar": "ar", "es": "es", "en-US": "en"}
+
+
+def _gtx_one_batch(texts: list):
+    """구글 무료 번역 한 번 호출 — 막혔으면(429·이상한 응답) 30분 쉼"""
+    if time.time() < _gtx_block["until"]:
+        return None
+    try:
+        res = requests.get("https://translate.googleapis.com/translate_a/single",
+                           params={"client": "gtx", "sl": "auto", "tl": "ko", "dt": "t", "q": "\n".join(texts)},
+                           headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
+        if res.status_code != 200:
+            _gtx_block["until"] = time.time() + 1800
+            print(f"[translate] 구글 번역 응답 {res.status_code} → 30분 쉬고 대체 번역 사용")
+            return None
+        joined = "".join(seg[0] for seg in (res.json()[0] or []) if seg and seg[0])
+        return [x.strip() for x in joined.split("\n")]
+    except Exception as e:
+        print(f"[translate] 구글 번역 실패: {e}")
+        return None
+
+
+def _mymemory_one(text: str, src: str):
+    """대체 번역 (MyMemory 무료) — 원어 언어를 알아야 함"""
+    sl = _LANG_MYMEMORY.get(src or "")
+    if not sl:
+        return None
+    try:
+        j = requests.get("https://api.mymemory.translated.net/get", params={"q": text[:480], "langpair": f"{sl}|ko"}, timeout=10).json()
+        t = ((j or {}).get("responseData") or {}).get("translatedText")
+        return t.strip() if t and "MYMEMORY WARNING" not in t.upper() else None
+    except Exception:
+        return None
+
+
+def translate_to_ko(texts: list, src: str = None) -> list:
+    """원어 제목 → 한국어. ① 구글 무료(20개씩 묶음) → 줄 수가 안 맞으면 한 줄씩 → ② 구글이 막히면 MyMemory.
+    한 번 번역한 제목은 기억해서 다시 안 물어봄 (2026-10-23: 번역이 통째로 사라지던 문제 수정)"""
     out = [None] * len(texts)
-    todo = [(i, t) for i, t in enumerate(texts) if t and t not in _ko_cache]
     for i, t in enumerate(texts):
         if t in _ko_cache:
             out[i] = _ko_cache[t]
-    # 20개씩 줄바꿈으로 묶어서 한 번에
+    todo = [(i, t) for i, t in enumerate(texts) if t and out[i] is None]
     for k in range(0, len(todo), 20):
         chunk = todo[k:k + 20]
-        try:
-            res = requests.get("https://translate.googleapis.com/translate_a/single",
-                               params={"client": "gtx", "sl": "auto", "tl": "ko", "dt": "t", "q": "\n".join(t for _, t in chunk)},
-                               headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
-            joined = "".join(seg[0] for seg in (res.json()[0] or []) if seg and seg[0])
-            parts = [x.strip() for x in joined.split("\n")]
-            if len(parts) == len(chunk):
-                for (i, t), ko in zip(chunk, parts):
-                    _ko_cache[t] = ko
-                    out[i] = ko
-        except Exception as e:
-            print(f"[translate] 실패: {e}")
+        parts = _gtx_one_batch([t.replace("\n", " ") for _, t in chunk])
+        if parts and len(parts) == len(chunk):
+            for (i, t), ko in zip(chunk, parts):
+                _ko_cache[t] = ko
+                out[i] = ko
+            continue
+        for i, t in chunk:  # 묶음이 어긋나거나 막혔으면 한 줄씩
+            one = _gtx_one_batch([t.replace("\n", " ")])
+            ko = one[0] if one else _mymemory_one(t, src)
+            if ko:
+                _ko_cache[t] = ko
+                out[i] = ko
+            time.sleep(0.15)
         time.sleep(0.2)
-    if len(_ko_cache) > 5000:
+    if len(_ko_cache) > 20000:
         _ko_cache.clear()
     return out
 
@@ -9113,7 +9274,7 @@ def fetch_world_news(country: str = "us", topic: str = "top", limit: int = 30):
             at = ""
         items.append({"title": title, "source": src, "link": (it.findtext("link") or "").strip(), "at": at})
     if country != "kr" and items:
-        kos = translate_to_ko([n["title"] for n in items[:60]])
+        kos = translate_to_ko([n["title"] for n in items[:60]], src=c["hl"].split("-")[0] if c["hl"] != "zh-CN" else "zh-CN")
         for n, ko in zip(items, kos):
             n["ko"] = ko
     _world_news_cache[key] = (time.time(), items)
@@ -9185,7 +9346,13 @@ FLASH_DART_RULES = [
     (r"기술이전|라이선스", "🧬 기술이전·라이선스", ""), (r"투자판단\s*관련\s*주요경영사항", "🧪 주요경영사항(임상·특허 등)", ""),
     (r"신규시설투자", "🏭 신규 시설투자", ""), (r"^주권매매거래정지|상장적격성\s*실질심사\s*대상\s*결정|관리종목\s*지정", "🚫 거래정지·적격성", ""),
 ]
-FLASH_KR_NEWS_QUERIES = ["수주 공급계약", "단독 수주", "FDA 승인", "품목허가 획득", "임상 성공", "기술이전 계약", "인수합병 단독"]
+FLASH_KR_NEWS_QUERIES = ['"수주"', '"공급계약"', '"FDA 승인"', '"품목허가"', '"임상 성공"', '"톱라인"', '"기술이전"', '"기술수출"', '"인수"', '"단독"']
+# 제목에 이 말이 꼭 있어야 보냄 (구글 검색이 느슨해서 키워드 없는 기사도 섞였음 — 2026-10-23)
+FLASH_KR_MUST = re.compile(r"수주|공급계약|계약\s*체결|FDA\s*(승인|허가)|품목허가|임상.{0,6}(성공|승인|유효|달성)|톱라인|기술이전|기술수출|인수|합병|M&A|최대\s*실적|단독")
+# 기획·인터뷰·칼럼은 매매와 상관없어서 제외
+FLASH_KR_SKIP = re.compile(r"인터뷰|칼럼|기고|사설|기획|커버스토리|COVER STORY|비즈리더|돋보기|창립|\d+년\s*-|100년|주간|리뷰|전망|분석|\?|…까|할까|될까|볼까|"
+                           r"박차|추진|노린다|목표|참가|참석|전시회|박람회|기대감")  # "수주 확대 박차" 같은 다짐·행사 기사 제외
+FLASH_KR_TAG = re.compile(r"^\[(?!단독|속보)[^\]]{1,30}\]")
 FLASH_GLOBAL_COMPANIES = {
     "TSMC": "삼성전자·DB하이텍", "Micron": "SK하이닉스·삼성전자", "Nvidia": "SK하이닉스·한미반도체", "Samsung": "삼성전자",
     "SK hynix": "SK하이닉스", "ASML": "반도체 장비주", "Apple": "LG이노텍·비에이치", "Tesla": "LG에너지솔루션·에코프로비엠",
@@ -9280,8 +9447,13 @@ def _contract_details(rcept_no: str) -> str:
 
 
 def _flash_quote_txt(code: str) -> str:
+    now = now_kst()
+    if now.weekday() >= 5 or (now.hour, now.minute) < (9, 0):
+        return " (장 시작 전)"  # 장 전엔 시세가 0으로 나와서 헷갈렸음
     try:
         q = _kis_quote(code)
+        if not q.get("value_eok"):
+            return " (장 시작 전)"
         return f" ({'🔴' if q['pct'] > 0 else '🔵'}{q['pct']:+.2f}% · {q['price']:,.0f}원 · 거래대금 {q['value_eok']:,.0f}억)"
     except Exception:
         return ""
@@ -9311,6 +9483,7 @@ def _collect_flash_domestic() -> list:
             nm_clean = re.sub(r"\s+", " ", nm).strip()  # (f-string 안 백슬래시는 Python 3.11 이하에서 오류라 밖으로 뺌)
             out.append({"key": key, "text": f"{rule[1]} · {r.get('corp_name')}{_flash_quote_txt(r['stock_code'])}\n   {nm_clean}"
                         + (f"\n   {extra}" if extra else "")
+                        + f"\n   📎 공시 원문: https://dart.fss.or.kr/dsaf001/main.do?rcpNo={r['rcept_no']}"
                         + f"\n   🔗 {FRONTEND_URL}/stock-analysis?code={r['stock_code']}", "cat": "kr"})
     # ② 뉴스 키워드 (최근 1시간, 종목명이 제목에 있을 때만)
     names = _flash_stock_names()
@@ -9321,8 +9494,11 @@ def _collect_flash_domestic() -> list:
             for it in ET.fromstring(res.content).iter("item"):
                 title = (it.findtext("title") or "").strip()
                 src = (it.findtext("source") or "").strip()
+                link = (it.findtext("link") or "").strip()
                 if src and title.endswith(f" - {src}"):
                     title = title[: -len(src) - 3]
+                if not FLASH_KR_MUST.search(title) or FLASH_KR_SKIP.search(title) or FLASH_KR_TAG.search(title):
+                    continue
                 hit = max((n for n in names if n in title), key=len, default=None)
                 if not hit:
                     continue
@@ -9334,7 +9510,7 @@ def _collect_flash_domestic() -> list:
                 if _flash_seen(skey) or any(o.get("skey") == skey for o in out):
                     _flash_mark(key)
                     continue
-                out.append({"key": key, "skey": skey, "text": f"📰 {hit}{_flash_quote_txt(code)}\n   {title} ({src})\n   🔗 {FRONTEND_URL}/stock-analysis?code={code}", "cat": "kr"})
+                out.append({"key": key, "skey": skey, "text": f"📰 {hit}{_flash_quote_txt(code)}\n   {title} ({src})\n   📎 원문: {link}\n   🔗 {FRONTEND_URL}/stock-analysis?code={code}", "cat": "kr"})
         except Exception as e:
             print(f"[flash] 국내 뉴스 실패 {q}: {e}")
         time.sleep(0.2)
@@ -9357,35 +9533,40 @@ def _collect_flash_global() -> list:
                 src = (it.findtext("source") or "").strip()
                 if src and title.endswith(f" - {src}"):
                     title = title[: -len(src) - 3]
-                items.append((lang, title, src))
+                items.append((lang, title, src, (it.findtext("link") or "").strip()))
         except Exception as e:
             print(f"[flash] 해외 뉴스 실패: {e}")
-    kos = translate_to_ko([t for l, t, _ in items if l == "en"]) if any(l == "en" for l, _, _ in items) else []
-    ko_iter = iter(kos)
-    groups = {}  # (회사, 사건) → 같은 사건 기사 묶음 (예: 마이크론 파업 기사 5개 → 알림 1개)
+    groups = {}  # (회사, 사건) → 같은 사건 기사 묶음
     today = now_kst().strftime("%Y-%m-%d")
     ko_alias = {"마이크론": "Micron", "엔비디아": "Nvidia", "애플": "Apple", "테슬라": "Tesla", "인텔": "Intel", "폭스콘": "Foxconn"}
-    for lang, title, src in items:
-        ko = next(ko_iter, None) if lang == "en" else None
+    for lang, title, src, link in items:
         if FLASH_GLOBAL_FALSE.search(title):
             continue
         low = title.lower()
         comp = next((c for c in comps if re.search(rf"\b{re.escape(c.lower())}\b", low)), None) \
             or ko_alias.get(next((k for k in ko_alias if k in title), ""), None) or next((c for c in comps if c in title), None)
-        event = next((v for k, v in FLASH_EVENT_WORDS.items() if re.search(rf"\b{re.escape(k)}", low) if k.isascii()) , None) \
+        event = next((v for k, v in FLASH_EVENT_WORDS.items() if k.isascii() and re.search(rf"\b{re.escape(k)}", low)), None) \
             or next((v for k, v in FLASH_EVENT_WORDS.items() if not k.isascii() and k in title), None)
         if not comp or not event:
             continue
-        g = groups.setdefault((comp, event), [])
-        g.append((title, src, ko))
+        groups.setdefault((comp, event), []).append((lang, title, src, link))
+    picked = []
     for (comp, event), arts in groups.items():
         key = f"glevent:{comp}:{event}:{today}"  # 같은 회사·같은 사건은 하루 한 번
-        if _flash_seen(key) or any(o["key"] == key for o in out):
+        if _flash_seen(key) or any(p[0] == key for p in picked):
             continue
-        title, src, ko = arts[0]
+        picked.append((key, comp, event, arts))
+    picked = picked[:8]
+    # 번역은 실제로 보낼 기사 제목만 (예전엔 모든 기사를 번역해서 구글 번역이 막혔음)
+    en_titles = [arts[0][1] for _, _, _, arts in picked if arts[0][0] == "en"]
+    kos = iter(translate_to_ko(en_titles, src="en") if en_titles else [])
+    for key, comp, event, arts in picked:
+        lang, title, src, link = arts[0]
+        ko = next(kos, None) if lang == "en" else None
         kr = FLASH_GLOBAL_COMPANIES.get(comp, "")
         more = f"\n   (같은 사건 기사 {len(arts) - 1}건 더)" if len(arts) > 1 else ""
-        out.append({"key": key, "text": f"🌐 [{comp} · {event}] {title} ({src})" + (f"\n   ↳ {ko}" if ko else "") + more + (f"\n   🇰🇷 관련: {kr}" if kr else ""), "cat": "gl"})
+        out.append({"key": key, "text": f"🌐 [{comp} · {event}] {title} ({src})" + (f"\n   ↳ {ko}" if ko else "") + more
+                    + (f"\n   🇰🇷 관련: {kr}" if kr else "") + (f"\n   📎 원문: {link}" if link else ""), "cat": "gl"})
     return out[:8]
 
 
