@@ -6246,6 +6246,13 @@ def build_flow_brief():
             lines.append(f"\n📌 시장 체크 — {ok}/{len(chk)} 충족 (재진입 조건)\n" + "\n".join(chk))
     except Exception as e:
         print(f"[brief:flow] 시장 체크 실패: {e}")
+    try:  # 🔥 52주 신고가 (근접 1% 이내 · 거래대금 50억↑ · 상승)
+        hs = [h for h in fetch_new_highs(40) if h["value_eok"] >= 50 and h["pct"] > 0][:5]
+        if hs:
+            lines.append("\n🔥 52주 신고가 (근접 1% 이내 · 거래대금 50억↑)\n" + "\n".join(
+                f"{i} {h['name']} {h['pct']:+.2f}% · {_fmt_eok(h['value_eok'], signed=False)}" for i, h in enumerate(hs, 1)))
+    except Exception as e:
+        print(f"[brief:flow] 52주 신고가 실패: {e}")
     # 사모 TOP5 (최근 2거래일)
     try:
         dates = (
@@ -10072,6 +10079,78 @@ def flash_check_endpoint(send: bool = False):
     if send and items:
         _send_flash(items, " (수동 확인)")
     return {"ok": True, "count": len(items), "items": [i["text"] for i in items]}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 🧪 한투 시장별 투자자매매동향(일별) FHPTJ04040000 — KRX 단독 숫자와 비교해서
+#    다른 곳(KRX+NXT 통합으로 보이는 숫자)과 같은지 확인하는 용도 (2026-10-23)
+# 🔥 52주 신고가 — 한투 "국내주식 신고/신저근접종목 상위" FHPST01870000
+# ══════════════════════════════════════════════════════════════════════════
+@app.get("/api/kis-investor-daily")
+def kis_investor_daily_endpoint(date: str = ""):
+    """date=YYYYMMDD (비우면 오늘) — 코스피·코스닥 투자자별 순매수(한투) 원본. KRX 숫자와 비교용"""
+    d = date or now_kst().strftime("%Y%m%d")
+    out = {}
+    for label, iscd, iscd1 in (("KOSPI", "0001", "KSP"), ("KOSDAQ", "1001", "KSQ")):
+        try:
+            data = kis_get("/uapi/domestic-stock/v1/quotations/inquire-investor-daily-by-market", "FHPTJ04040000",
+                           {"FID_COND_MRKT_DIV_CODE": "U", "FID_INPUT_ISCD": iscd, "FID_INPUT_DATE_1": d,
+                            "FID_INPUT_ISCD_1": iscd1, "FID_INPUT_DATE_2": d, "FID_INPUT_ISCD_2": iscd})
+            rows = data.get("output") or data.get("output1") or []
+            if isinstance(rows, dict):
+                rows = [rows]
+            first = rows[0] if rows else {}
+            # 금액 필드(…_ntby_tr_pbmn: 순매수 거래대금, 보통 백만원)만 골라 억원으로
+            amt = {k: round(float(v) / 100, 1) for k, v in first.items() if k.endswith("ntby_tr_pbmn") and str(v).lstrip("-").replace(".", "").isdigit()}
+            out[label] = {"rt_cd": data.get("rt_cd"), "msg": data.get("msg1"), "amount_eok": amt, "raw_first": first}
+        except Exception as e:
+            out[label] = {"error": str(e)}
+    try:  # 같은 날 KRX(pykrx) 숫자도 같이
+        for label in ("KOSPI", "KOSDAQ"):
+            r = supabase.table("market_flow_trend").select("individual,foreign_amt,institution").eq("market", label) \
+                .eq("trade_date", f"{d[:4]}-{d[4:6]}-{d[6:]}").limit(1).execute().data
+            if r:
+                out[label]["krx"] = r[0]
+    except Exception:
+        pass
+    return {"ok": True, "date": d, "markets": out}
+
+
+def fetch_new_highs(limit: int = 30, gap_max: str = "1") -> list:
+    """52주 신고가 근접(괴리율 0~gap_max%) 종목 — 거래대금 순"""
+    data = kis_get("/uapi/domestic-stock/v1/ranking/near-new-highlow", "FHPST01870000", {
+        "fid_aply_rang_vol": "0", "fid_cond_mrkt_div_code": "J", "fid_cond_scr_div_code": "20187",
+        "fid_div_cls_code": "0", "fid_input_cnt_1": "0", "fid_input_cnt_2": gap_max, "fid_prc_cls_code": "0",
+        "fid_input_iscd": "0000", "fid_trgt_cls_code": "0", "fid_trgt_exls_cls_code": "0",
+        "fid_aply_rang_prc_1": "", "fid_aply_rang_prc_2": ""})
+    rows = data.get("output") or []
+    out = []
+    for r in rows:
+        g = lambda *ks: next((r[k] for k in ks if r.get(k) not in (None, "")), None)
+        code = g("mksc_shrn_iscd", "stck_shrn_iscd", "shrn_iscd")
+        name = g("hts_kor_isu_nm", "kor_isu_nm")
+        if not code or not name or THEME_SKIP_NAMES.search(name):
+            continue
+        price = float(g("stck_prpr") or 0)
+        vol = float(g("acml_vol") or 0)
+        val = float(g("acml_tr_pbmn") or 0) / 1e8 if g("acml_tr_pbmn") else price * vol / 1e8
+        out.append({"code": code, "name": name, "price": price, "pct": float(g("prdy_ctrt") or 0), "value_eok": round(val, 1)})
+    return sorted(out, key=lambda x: -x["value_eok"])[:limit]
+
+
+@app.get("/api/new-highs")
+def new_highs_endpoint(raw: bool = False):
+    try:
+        if raw:
+            data = kis_get("/uapi/domestic-stock/v1/ranking/near-new-highlow", "FHPST01870000", {
+                "fid_aply_rang_vol": "0", "fid_cond_mrkt_div_code": "J", "fid_cond_scr_div_code": "20187",
+                "fid_div_cls_code": "0", "fid_input_cnt_1": "0", "fid_input_cnt_2": "1", "fid_prc_cls_code": "0",
+                "fid_input_iscd": "0000", "fid_trgt_cls_code": "0", "fid_trgt_exls_cls_code": "0",
+                "fid_aply_rang_prc_1": "", "fid_aply_rang_prc_2": ""})
+            return {"ok": True, "rt_cd": data.get("rt_cd"), "msg": data.get("msg1"), "first3": (data.get("output") or [])[:3]}
+        return {"ok": True, "items": fetch_new_highs()}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/api/ping")
