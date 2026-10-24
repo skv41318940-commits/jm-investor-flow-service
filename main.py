@@ -5929,7 +5929,7 @@ BRIEF_SCHEDULE = {
     "ir_2010": (20, 10),  # 📢 실적발표 예고·IR (16시 이후 분)
     "news_2020": (20, 20),  # 🌍 세계 증시 이슈 (저녁)
     "closing": (20, 40),  # 📝 오늘의 마감 리포트 초안 (피날레)
-    "flow": (16, 10),
+    "flow": (16, 10),  # 다른 곳과 숫자 차이는 시간 문제가 아니라 KRX 단독 vs KRX+NXT 통합 차이로 보여 시간은 그대로
     "theme": (20, 0),
 }
 
@@ -6215,8 +6215,37 @@ def build_flow_brief():
                         lines.append(f"  └ 기관 {'매수' if inst_total > 0 else '매도'}는 {lead}{josa} 주도 ({share:.0f}%)")
         except Exception as e:
             print(f"[brief:flow] 기관 세부 실패: {e}")
+    fut = None
+    try:
+        fut = fetch_futures_investor()
+        summary.append(f"선물 순{'매수' if fut['foreign_qty'] > 0 else '매도'}")
+    except Exception as e:
+        print(f"[brief:flow] 선물 실패: {e}")
     if summary:
         lines.insert(1, "외국인 · " + " / ".join(summary) + "\n")
+    # 📌 시장 체크 (재진입 조건 3가지) — 외국인 현물 순매도 1조 이하 · 외국인 선물 순매수 · 코스피 120일선 종가 지지
+    try:
+        chk = []
+        r = supabase.table("market_flow_trend").select("foreign_amt").eq("market", "KOSPI").eq("trade_date", day).limit(1).execute().data
+        if r:
+            fa = float(r[0]["foreign_amt"] or 0)
+            chk.append(f"{'✅' if fa > -10000 else '❌'} 외국인 현물 순매도 1조 이하 — {_fmt_eok(fa)}")
+        if fut:
+            chk.append(f"{'✅' if fut['foreign_qty'] > 0 else '❌'} 외국인 선물 순매수 — {fut['foreign_qty']:+,.0f}계약")
+        try:
+            res = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/%5EKS11", params={"range": "1y", "interval": "1d"},
+                               headers={"User-Agent": "Mozilla/5.0"}, timeout=10).json()
+            closes = [c for c in res["chart"]["result"][0]["indicators"]["quote"][0]["close"] if c]
+            if len(closes) >= 120:
+                ma120 = sum(closes[-120:]) / 120
+                chk.append(f"{'✅' if closes[-1] >= ma120 else '❌'} 코스피 120일선 종가 지지 — {closes[-1]:,.2f} / 120일선 {ma120:,.2f}")
+        except Exception:
+            pass
+        if chk:
+            ok = sum(1 for c in chk if c.startswith("✅"))
+            lines.append(f"\n📌 시장 체크 — {ok}/{len(chk)} 충족 (재진입 조건)\n" + "\n".join(chk))
+    except Exception as e:
+        print(f"[brief:flow] 시장 체크 실패: {e}")
     # 사모 TOP5 (최근 2거래일)
     try:
         dates = (
@@ -6261,26 +6290,90 @@ def _to_eok_from_naver(v: float, price: float = 0, volume: float = 0) -> float:
     return won / 1e8
 
 
+THEME_SKIP_NAMES = re.compile(r"신규상장|하반기|상반기|스팩|SPAC|우선주|관리종목|정리매매")
+
+
+def _theme_news(names: list, limit: int = 2) -> list:
+    """테마 종목들의 최근 하루 뉴스에서 쓸 만한 제목 몇 개 (기획·리포트·분쟁 기사 제외)"""
+    out, seen = [], set()
+    for nm in names:
+        try:
+            res = requests.get("https://news.google.com/rss/search", params={"q": f'"{nm}" when:1d', "hl": "ko", "gl": "KR", "ceid": "KR:ko"},
+                               headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+            for it in ET.fromstring(res.content).iter("item"):
+                title = (it.findtext("title") or "").strip()
+                src = (it.findtext("source") or "").strip()
+                if src and title.endswith(f" - {src}"):
+                    title = title[: -len(src) - 3]
+                if nm not in title or FLASH_KR_SKIP.search(title) or FLASH_KR_TAG.search(title) or FLASH_KR_SKIP2.search(title) or FLASH_KR_SKIP_SRC.search(src):
+                    continue
+                k = re.sub(r"[^가-힣A-Za-z0-9]", "", title)[:30]
+                if k in seen:
+                    continue
+                seen.add(k)
+                out.append({"name": nm, "title": title, "src": src, "link": (it.findtext("link") or "").strip()})
+                break
+        except Exception:
+            pass
+        if len(out) >= limit:
+            break
+        time.sleep(0.15)
+    return out
+
+
 def build_theme_brief(top_n: int = 5, title: str = "🔥 오늘의 테마 이슈"):
-    themes = fetch_naver_theme_list(limit=25)
-    themes = sorted(themes, key=lambda t: t["change_pct"], reverse=True)[:top_n]
+    """오늘 '진짜 돈이 몰린' 테마 — 2026-10-23 개선
+    · 점수 = 오른 종목들의 거래대금 합 (+ 주도주 등락률). 평균 등락률 순이던 예전 방식은 조용한 소형 테마가 위로 올라왔음
+    · 주도주 거래대금 100억↑·+3%↑ 테마만, 같은 주도주는 한 테마에만(디티에스가 3개 테마를 차지하던 문제)
+    · 거래대금 10억 미만 종목은 숨김, 테마마다 ↳ 왜 올랐나(뉴스) + 📰 관련 뉴스 링크"""
+    themes = fetch_naver_theme_list(limit=40)
     now = now_kst()
-    parts = [f"{title} {now.month}/{now.day}({WEEKDAY_KR[now.weekday()]} {now.strftime('%H:%M')})\n━━━━━━━━━━━━"]
+    scored = []
     for t in themes:
+        if THEME_SKIP_NAMES.search(t["theme_name"]):
+            continue
         try:
             stocks, _ = fetch_naver_theme_detail(t["theme_no"], limit=30)
         except Exception:
-            stocks = []
-        stocks = sorted(stocks, key=lambda x: x["change_pct"], reverse=True)[:4]
+            continue
         for x in stocks:
             x["eok"] = _to_eok_from_naver(x["trading_value"], x.get("price", 0), x.get("volume", 0))
-        total = sum(x["eok"] for x in stocks)
-        top_val = max((x["eok"] for x in stocks), default=0)
-        lines = [f"📌 {t['theme_name']} {t['change_pct']:+.2f}% · 주도주 거래대금 {_fmt_eok(total, signed=False)}"]
-        for x in stocks:
-            tags = (" 👑" if x["eok"] == top_val and top_val else "") + (" 🔥" if x["change_pct"] >= 29 else "")
-            lines.append(f"{x['stock_name']} {x['change_pct']:+.2f}% · {_fmt_eok(x['eok'], signed=False)}{tags}")
+        risers = [x for x in stocks if x["change_pct"] > 0 and x["eok"] >= 10]
+        if not risers:
+            continue
+        leader = max(risers, key=lambda x: (x["eok"] >= 100, x["change_pct"] * min(x["eok"], 3000) ** 0.5))
+        if leader["eok"] < 100 or leader["change_pct"] < 3:
+            continue
+        money = sum(x["eok"] for x in risers)
+        scored.append({"theme": t, "leader": leader, "stocks": sorted(risers, key=lambda x: -x["eok"])[:4],
+                       "score": money ** 0.5 * (1 + leader["change_pct"] / 10), "money": money})
+        time.sleep(0.05)
+    scored.sort(key=lambda x: -x["score"])
+    picked, used = [], set()
+    for sc in scored:
+        if sc["leader"]["stock_code"] in used:
+            continue
+        used.add(sc["leader"]["stock_code"])
+        picked.append(sc)
+        if len(picked) >= top_n:
+            break
+    parts = [f"{title} {now.month}/{now.day}({WEEKDAY_KR[now.weekday()]} {now.strftime('%H:%M')})\n━━━━━━━━━━━━"]
+    if not picked:
+        parts.append("오늘은 돈이 크게 몰린 테마가 없어요 (주도주 거래대금 100억·+3% 이상 기준).")
+    for sc in picked:
+        t, lead = sc["theme"], sc["leader"]
+        lines = [f"📌 {t['theme_name']} · 오른 종목 거래대금 {_fmt_eok(sc['money'], signed=False)}"]
+        for x in sc["stocks"]:
+            tags = (" 👑" if x is lead else "") + (" 🔥" if x["change_pct"] >= 29 else "")
+            lines.append(f" {x['stock_name']} {x['change_pct']:+.2f}% · {_fmt_eok(x['eok'], signed=False)}{tags}")
+        news = _theme_news([x["stock_name"] for x in sc["stocks"]], limit=2)
+        if news:
+            lines.append(f"   ↳ {news[0]['title']} ({news[0]['src']})")
+            lines.append("📰 관련 뉴스: " + " · ".join(f"{n['name']} 📎 {n['link']}" for n in news))
+        else:
+            lines.append("   ↳ 관련 뉴스 없음 — 수급·테마 순환 가능성")
         parts.append("\n".join(lines))
+    parts.append("※ 오른 종목 거래대금 기준 · 거래대금 10억 미만 종목 제외 · ↳는 관련 뉴스(원인이 아닐 수도)")
     return "\n\n".join(parts), now.strftime("%Y-%m-%d")
 
 
