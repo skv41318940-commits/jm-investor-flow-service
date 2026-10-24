@@ -2757,6 +2757,7 @@ async def _daily_jobs_worker():
         ("world_news", _run_world_news_alerts, ()),
         ("flash", _run_flash_alerts, ()),
         ("theme_snap", _save_theme_snapshot, ()),
+        ("new_highs", _save_new_highs_snapshot, ()),
         ("target_reach", _check_target_reach, ()),
         ("earnings_disclosure", _check_earnings_disclosures, ()),
     ]
@@ -6177,7 +6178,7 @@ def build_flow_brief():
     ltd = _latest_trading_day()
     day = f"{ltd[:4]}-{ltd[4:6]}-{ltd[6:8]}"
     sync_market_flow(days=5)  # 오늘 값 확정치로 한 번 더 갱신
-    lines = [f"💰 오늘의 수급 ({_kr_date(day)})\n━━━━━━━━━━━━"]
+    lines = [f"💰 오늘의 수급 ({_kr_date(day)}) · KRX 기준(NXT 제외)\n━━━━━━━━━━━━"]
     summary = []
     for market, label in (("KOSPI", "코스피"), ("KOSDAQ", "코스닥")):
         try:
@@ -6247,7 +6248,7 @@ def build_flow_brief():
     except Exception as e:
         print(f"[brief:flow] 시장 체크 실패: {e}")
     try:  # 🔥 52주 신고가 (근접 1% 이내 · 거래대금 50억↑ · 상승)
-        hs = [h for h in fetch_new_highs(40) if h["value_eok"] >= 50 and h["pct"] > 0][:5]
+        hs = [h for h in _new_highs_for_brief() if h["value_eok"] >= 50 and h["pct"] > 0][:5]
         if hs:
             lines.append("\n🔥 52주 신고가 (근접 1% 이내 · 거래대금 50억↑)\n" + "\n".join(
                 f"{i} {h['name']} {h['pct']:+.2f}% · {_fmt_eok(h['value_eok'], signed=False)}" for i, h in enumerate(hs, 1)))
@@ -10128,14 +10129,43 @@ def fetch_new_highs(limit: int = 30, gap_max: str = "1") -> list:
     for r in rows:
         g = lambda *ks: next((r[k] for k in ks if r.get(k) not in (None, "")), None)
         code = g("mksc_shrn_iscd", "stck_shrn_iscd", "shrn_iscd")
-        name = g("hts_kor_isu_nm", "kor_isu_nm")
+        name = g("hts_kor_isnm", "hts_kor_isu_nm", "kor_isu_nm")  # 실제 응답 이름은 hts_kor_isnm (2026-10-23 확인)
         if not code or not name or THEME_SKIP_NAMES.search(name):
             continue
         price = float(g("stck_prpr") or 0)
         vol = float(g("acml_vol") or 0)
+        if vol <= 0:
+            continue  # 거래 없는 종목(거래정지·장 마감 후 빈 값)은 제외
         val = float(g("acml_tr_pbmn") or 0) / 1e8 if g("acml_tr_pbmn") else price * vol / 1e8
         out.append({"code": code, "name": name, "price": price, "pct": float(g("prdy_ctrt") or 0), "value_eok": round(val, 1)})
     return sorted(out, key=lambda x: -x["value_eok"])[:limit]
+
+
+def _save_new_highs_snapshot():
+    """장 마감 직전(15:20~15:35) 52주 신고가를 저장 — 장 마감 뒤엔 이 순위가 비어서 16:10 수급 알림에 씀"""
+    now = now_kst()
+    if now.weekday() >= 5 or not ((15, 20) <= (now.hour, now.minute) <= (15, 35)):
+        return
+    key = now.strftime("%Y-%m-%d")
+    if _brief_already_sent("job_new_highs", key):
+        return
+    try:
+        items = fetch_new_highs(40)
+        if items:
+            supabase.table("brief_cache").upsert({"key": "new_highs_today", "data": {"date": key, "items": items}, "updated_at": now.isoformat()}).execute()
+            _mark_brief_sent("job_new_highs", key)
+    except Exception as e:
+        print(f"[new_highs] 저장 실패: {e}")
+
+
+def _new_highs_for_brief() -> list:
+    try:
+        r = supabase.table("brief_cache").select("data").eq("key", "new_highs_today").limit(1).execute().data
+        if r and r[0]["data"].get("date") == now_kst().strftime("%Y-%m-%d"):
+            return r[0]["data"]["items"]
+    except Exception:
+        pass
+    return fetch_new_highs(40)
 
 
 @app.get("/api/new-highs")
