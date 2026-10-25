@@ -10194,6 +10194,23 @@ def new_highs_endpoint(raw: bool = False):
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/stock-minute-multi")
+def stock_minute_multi_endpoint(code: str, days: int = 5, end: str = ""):
+    """최근 N거래일 1분봉 (end=YYYY-MM-DD, 비우면 오늘) — 분봉 세력평단 여러 날 보기 (2026-10-26)"""
+    days = max(1, min(int(days), 5))
+    d = datetime.strptime(end, "%Y-%m-%d") if end else now_kst().replace(tzinfo=None)
+    out, tries = [], 0
+    while len(out) < days and tries < days + 6:
+        tries += 1
+        if d.weekday() < 5:
+            r = stock_minute_by_date_endpoint(code, d.strftime("%Y-%m-%d"))
+            if r.get("ok") and r.get("candles"):
+                out.append({"date": d.strftime("%Y-%m-%d"), "candles": r["candles"]})
+        d -= timedelta(days=1)
+    out.reverse()
+    return {"ok": bool(out), "code": code, "days": out, "error": None if out else "분봉 데이터가 없어요"}
+
+
 @app.get("/api/ping")
 def ping():
     return {"ok": True}
