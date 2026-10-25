@@ -10195,20 +10195,30 @@ def new_highs_endpoint(raw: bool = False):
 
 
 @app.get("/api/stock-minute-multi")
-def stock_minute_multi_endpoint(code: str, days: int = 5, end: str = ""):
-    """최근 N거래일 1분봉 (end=YYYY-MM-DD, 비우면 오늘) — 분봉 세력평단 여러 날 보기 (2026-10-26)"""
-    days = max(1, min(int(days), 5))
-    d = datetime.strptime(end, "%Y-%m-%d") if end else now_kst().replace(tzinfo=None)
-    out, tries = [], 0
-    while len(out) < days and tries < days + 6:
-        tries += 1
-        if d.weekday() < 5:
-            r = stock_minute_by_date_endpoint(code, d.strftime("%Y-%m-%d"))
-            if r.get("ok") and r.get("candles"):
-                out.append({"date": d.strftime("%Y-%m-%d"), "candles": r["candles"]})
-        d -= timedelta(days=1)
-    out.reverse()
-    return {"ok": bool(out), "code": code, "days": out, "error": None if out else "분봉 데이터가 없어요"}
+def stock_minute_multi_endpoint(code: str, days: int = 5, end: str = "", start: str = ""):
+    """여러 날 1분봉 — start~end(YYYY-MM-DD, end 비우면 오늘) 또는 end까지 최근 N거래일. 최대 10거래일 (2026-10-26)"""
+    e = datetime.strptime(end, "%Y-%m-%d") if end else now_kst().replace(tzinfo=None)
+    if start:
+        st = datetime.strptime(start, "%Y-%m-%d")
+        dates, d = [], st
+        while d <= e and len(dates) < 10:
+            if d.weekday() < 5:
+                dates.append(d)
+            d += timedelta(days=1)
+    else:
+        need, dates, d, tries = max(1, min(int(days), 10)), [], e, 0
+        while len(dates) < need and tries < need + 8:
+            tries += 1
+            if d.weekday() < 5:
+                dates.append(d)
+            d -= timedelta(days=1)
+        dates.reverse()
+    out = []
+    for d in dates:
+        r = stock_minute_by_date_endpoint(code, d.strftime("%Y-%m-%d"))
+        if r.get("ok") and r.get("candles"):
+            out.append({"date": d.strftime("%Y-%m-%d"), "candles": r["candles"]})
+    return {"ok": bool(out), "code": code, "days": out, "error": None if out else "분봉 데이터가 없어요 (휴장일이거나 너무 오래된 날짜)"}
 
 
 @app.get("/api/ping")
