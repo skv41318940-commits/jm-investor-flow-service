@@ -6068,10 +6068,12 @@ def build_morning_brief():
             print(f"[brief:morning] 확장 실패(기본 알림은 발송): {e}")
     # 🌙 내가 잠든 사이 해외 속보 (밤에 모아둔 것)
     try:
-        night = [i for i in _flash_state.get("pending", []) if i.get("cat") == "gl"][:6]
+        allnight = [i for i in _flash_state.get("pending", []) if i.get("cat") == "gl"]
+        night = allnight[-8:]  # 가장 최근 8개
         if night:
-            text += "\n\n🌙 밤사이 해외 속보\n" + "\n\n".join(i["text"] for i in night)
-            _flash_state["morning_keys"] = [i["key"] for i in night]
+            label = "🌙 주말·밤사이 해외 속보" if now_kst().weekday() == 0 else "🌙 밤사이 해외 속보"
+            text += f"\n\n{label}\n" + "\n\n".join(i["text"] for i in night) + (f"\n(외 {len(allnight) - len(night)}건)" if len(allnight) > len(night) else "")
+            _flash_state["morning_keys"] = [i["key"] for i in allnight]
     except Exception as e:
         print(f"[brief:morning] 밤사이 속보 실패: {e}")
     return text, us_date
@@ -7115,7 +7117,7 @@ def _run_telegram_briefs():
     for kind, (h, m) in BRIEF_SCHEDULE.items():
         if (now.hour, now.minute) < (h, m) or now.hour >= 23:
             continue
-        if kind == "morning" and wd not in (1, 2, 3, 4, 5):  # 화~토 아침 = 미국 월~금장
+        if kind == "morning" and wd not in (0, 1, 2, 3, 4):  # 월~금 아침만 (주말 알림 없음 — 월요일 아침에 금요일 미국·유럽 마감을 받음, 2026-10-26)
             continue
         if kind == "morning" and (now.hour, now.minute) >= (9, 0):
             # ⚠️ 야후 일봉 확정이 늦으면 하루 종일 재시도하다가 밤 10시 반(미국장 개장)에 엉뚱하게 보낸 일이 있어서
@@ -9493,10 +9495,13 @@ MAINTENANCE_REMINDERS = [
 
 def _maintenance_reminders():
     now = now_kst()
-    if now.hour < 9:
-        return
+    if now.hour < 9 or now.weekday() >= 5:
+        return  # 주말이면 월요일에 몰아서
+    days = [now] + ([now - timedelta(days=1), now - timedelta(days=2)] if now.weekday() == 0 else [])
     for (m, d), text in MAINTENANCE_REMINDERS:
-        if (now.month, now.day) == (m, d):
+        hit = next((x for x in days if (x.month, x.day) == (m, d)), None)
+        if hit:
+            now = hit
             key = f"maint-{m:02d}{d:02d}-{now.year}"
             if not _brief_already_sent("maintenance", key) and send_telegram(text):
                 _mark_brief_sent("maintenance", key)
@@ -9654,6 +9659,8 @@ def _run_world_news_alerts():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     now = now_kst()
+    if now.weekday() >= 5:
+        return  # 주말 알림 없음
     for kind, (h, m) in (("worldnews_am", (7, 10)), ("worldnews_pm", (18, 10))):
         at = now.replace(hour=h, minute=m, second=0, microsecond=0)
         if not (at <= now <= at + timedelta(minutes=40)):
@@ -10009,7 +10016,9 @@ def _collect_flash_global() -> list:
     picked = []
     for (comp, event), arts in groups.items():
         key = f"glevent:{comp}:{event}:{today}"  # 같은 회사·같은 사건은 하루 한 번
-        if _flash_seen(key) or any(p[0] == key for p in picked):
+        # 같은 사건이 며칠씩 기사로 이어져서 중복이 많았음 → 최근 3일 안에 보낸 같은 사건은 다시 안 보냄 (2026-10-26)
+        recent = [f"glevent:{comp}:{event}:{(now_kst() - timedelta(days=d)).strftime('%Y-%m-%d')}" for d in (1, 2)]
+        if _flash_seen(key) or any(_flash_seen(k) for k in recent) or any(p[0] == key for p in picked):
             continue
         picked.append((key, comp, event, arts))
     picked = picked[:8]
@@ -10050,25 +10059,27 @@ def _run_flash_alerts():
         return
     st["at"] = time.time()
     now = now_kst()
-    quiet = now.hour < 6 or (now.hour == 6 and now.minute < 30)
+    # 주말(토·일)과 평일 새벽엔 보내지 않고 모아뒀다가 → 다음 평일 06:15 아침 알림에 같이 (2026-10-26)
+    quiet = now.weekday() >= 5 or now.hour < 6 or (now.hour == 6 and now.minute < 30)
     items = []
     try:
         if now.weekday() < 5 and (7, 0) <= (now.hour, now.minute) <= (20, 30):
             items += _collect_flash_domestic()
         if now.weekday() < 5 and (9, 10) <= (now.hour, now.minute) <= (15, 20):
             items += _check_flash_waiting()  # 재료 뒤 늦게 거래대금이 터진 종목
-        items += _collect_flash_global()
+        if now.weekday() < 5:  # 해외 속보는 평일(월~금)만 — 주말엔 안 보냄 (2026-10-26)
+            items += _collect_flash_global()
     except Exception as e:
         print(f"[flash] 수집 실패: {e}")
     if quiet:
         known = {p["key"] for p in st["pending"]}
-        st["pending"] += [i for i in items if i["key"] not in known]
+        st["pending"] = (st["pending"] + [i for i in items if i["key"] not in known])[-40:]
         return
     if st["pending"]:
-        items = st["pending"] + [i for i in items if i["key"] not in {p["key"] for p in st["pending"]}]
+        # 아침 알림(06:15)에 못 들어간 나머지는 한꺼번에 쏟아내지 않고 '본 것'으로만 표시 (중복·폭탄 알림 방지)
+        for i in st["pending"]:
+            _flash_mark(i["key"])
         st["pending"] = []
-        _send_flash(items, " (밤사이 모음)")
-        return
     if items:
         _send_flash(items, "")
 
