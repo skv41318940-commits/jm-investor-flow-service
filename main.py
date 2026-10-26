@@ -10214,6 +10214,10 @@ def fetch_new_highs(limit: int = 30, gap_max: str = "1") -> list:
         name = g("hts_kor_isnm", "hts_kor_isu_nm", "kor_isu_nm")  # 실제 응답 이름은 hts_kor_isnm (2026-10-23 확인)
         if not code or not name or THEME_SKIP_NAMES.search(name):
             continue
+        # ETF·ETN은 빼기 (머니마켓 ETF 같은 게 '신고가'로 잡혔음 — 2026-10-26)
+        if re.match(r"^(KODEX|TIGER|RISE|KBSTAR|ACE|SOL|HANARO|KOSEF|ARIRANG|PLUS|TIMEFOLIO|KIWOOM|KoAct|WON|BNK|UNICORN|마이티|파워|히어로즈|TREX|FOCUS|에셋플러스|VITA|DAISHIN343|1Q|TRUSTON)\b", name) \
+                or re.search(r"ETN|머니마켓|액티브$", name):
+            continue
         price = float(g("stck_prpr") or 0)
         vol = float(g("acml_vol") or 0)
         if vol <= 0:
