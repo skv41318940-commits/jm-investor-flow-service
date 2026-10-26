@@ -10268,6 +10268,56 @@ def minute_calib_post(payload: dict):
         return {"ok": False, "error": str(e)}
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 🗺 오늘의 시장 지도 (테마 기준) — 크기 = 오늘 거래대금, 색 = 등락률, 묶음 = 오늘 돈이 몰린 테마 (2026-10-26)
+#   업종(네이버 업종)이 너무 거칠고, 시가총액 크기는 삼성·하이닉스만 커 보여서 교체
+# ══════════════════════════════════════════════════════════════════════════
+_theme_map_cache = {"at": 0.0, "data": None}
+
+
+@app.get("/api/theme-map")
+def theme_map_endpoint(top: int = 14, refresh: bool = False):
+    c = _theme_map_cache
+    if not refresh and c["data"] and time.time() - c["at"] < 180:
+        return c["data"]
+    try:
+        themes = fetch_naver_theme_list(limit=40)
+        out, used = [], set()
+        for t in themes:
+            if THEME_SKIP_NAMES.search(t["theme_name"]):
+                continue
+            try:
+                stocks, _ = fetch_naver_theme_detail(t["theme_no"], limit=30)
+            except Exception:
+                continue
+            items = []
+            for x in stocks:
+                eok = _to_eok_from_naver(x["trading_value"], x.get("price", 0), x.get("volume", 0))
+                if eok >= 10 and x["stock_code"] not in used:
+                    items.append({"name": x["stock_name"], "code": x["stock_code"], "pct": round(x["change_pct"], 2), "eok": round(eok, 1)})
+            if not items:
+                continue
+            money = sum(i["eok"] for i in items)
+            up_money = sum(i["eok"] for i in items if i["pct"] > 0)
+            out.append({"theme": t["theme_name"], "pct": round(t["change_pct"], 2), "money": round(money, 1),
+                        "score": up_money * (1 + max(0, t["change_pct"]) / 10), "stocks": sorted(items, key=lambda i: -i["eok"])[:10]})
+            time.sleep(0.05)
+        out.sort(key=lambda x: -x["score"])
+        picked = []
+        for th in out:  # 같은 종목은 한 테마에만 (돈이 가장 많이 몰린 테마 쪽으로)
+            th["stocks"] = [i for i in th["stocks"] if i["code"] not in used]
+            if th["stocks"]:
+                used.update(i["code"] for i in th["stocks"])
+                picked.append(th)
+            if len(picked) >= top:
+                break
+        data = {"ok": True, "at": now_kst().strftime("%H:%M"), "themes": picked, "note": "KRX 기준(넥스트레이드 제외) · 3분마다 갱신"}
+        c.update({"at": time.time(), "data": data})
+        return data
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/ping")
 def ping():
     return {"ok": True}
