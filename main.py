@@ -10649,6 +10649,18 @@ def etf_components_endpoint(code: str, n: int = 15):
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/test-bot")
+def test_bot_endpoint(channel: str = "flash"):
+    """봇 연결 테스트 — channel=main/report/news/flash/sports 로 '테스트' 메시지 한 통 보내기 (2026-10-26)"""
+    names = {"main": "JM 전용", "report": "JM 리포트", "news": "뉴스", "flash": "공시·속보", "sports": "스포츠"}
+    tok, chat = bot(channel)
+    if channel != "main" and not tok:
+        return {"ok": False, "channel": channel, "error": f"Render에 TELEGRAM_BOT_TOKEN_{channel.upper()} 가 없어요"}
+    text = f"🧪🦀【테스트】 {names.get(channel, channel)} 봇 연결 확인\n━━━━━━━━━━━━\n이 메시지가 보이면 정상이에요 ✅ ({now_kst().strftime('%m/%d %H:%M')})"
+    sent = send_telegram(text, tok, chat)
+    return {"ok": True, "channel": channel, "sent": sent, "send_error": None if sent else _tg_last_error["msg"]}
+
+
 @app.get("/api/ping")
 def ping():
     return {"ok": True}
