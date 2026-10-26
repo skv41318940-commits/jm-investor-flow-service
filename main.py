@@ -2758,6 +2758,7 @@ async def _daily_jobs_worker():
         ("flash", _run_flash_alerts, ()),
         ("theme_snap", _save_theme_snapshot, ()),
         ("new_highs", _save_new_highs_snapshot, ()),
+        ("report_digest", _run_report_digest, ()),
         ("target_reach", _check_target_reach, ()),
         ("earnings_disclosure", _check_earnings_disclosures, ()),
     ]
@@ -5063,15 +5064,159 @@ def format_brief(kind: str, text: str, strip_site_links: bool = False) -> str:
     return "\n".join([head, "━━━━━━━━━━━━", f"【{label}】 {title}"] + [ln for ln in body if ln.strip() != "━━━━━━━━━━━━"])
 
 
+DIGEST_ORDER = ["morning", "targets", "rally", "theme_am", "schedule", "flow", "theme", "closing", "us_pre", "us_open30"]
+
+
+def _digest_add(kind: str, text: str):
+    """오늘 리포트 모음에 쌓기 (리포트용 본문 = 사이트 링크 뺀 것)"""
+    if kind not in DIGEST_ORDER:
+        return
+    try:
+        day = now_kst().strftime("%Y-%m-%d")
+        key = f"digest:{day}"
+        r = supabase.table("brief_cache").select("data").eq("key", key).limit(1).execute().data
+        items = (r[0]["data"].get("items") if r else None) or []
+        items = [i for i in items if i["kind"] != kind] + [{"kind": kind, "at": now_kst().strftime("%H:%M"),
+                                                           "text": format_brief(kind, text, strip_site_links=True)}]
+        supabase.table("brief_cache").upsert({"key": key, "data": {"day": day, "items": items}, "updated_at": now_kst().isoformat()}).execute()
+    except Exception as e:
+        print(f"[digest] 저장 실패: {e}")
+
+
 def send_brief(kind: str, text: str) -> bool:
     """브리핑 보내기: 뉴스·IR은 각자 봇, 나머지는 JM 리포트 봇(있으면, 사이트 링크 없이) → 없으면 기존 봇"""
     ch = BRIEF_BOT.get(kind)
     if ch:
         return send_telegram(format_brief(kind, text), *bot(ch))
     tok, chat = bot("report")
-    if tok:
-        return send_telegram(format_brief(kind, text, strip_site_links=True), tok, chat)
-    return send_telegram(format_brief(kind, text))
+    ok = send_telegram(format_brief(kind, text, strip_site_links=True), tok, chat) if tok else send_telegram(format_brief(kind, text))
+    if ok:
+        _digest_add(kind, text)
+    return ok
+
+
+def build_report_digest(day: str = None) -> tuple:
+    """🦀 오늘 리포트 모음 — 그날 리포트 봇으로 간 브리핑을 순서대로 한 덩어리로 (본문만, 첫 줄 꾸밈은 빼고)"""
+    day = day or now_kst().strftime("%Y-%m-%d")
+    r = supabase.table("brief_cache").select("data").eq("key", f"digest:{day}").limit(1).execute().data
+    items = (r[0]["data"].get("items") if r else None) or []
+    if not items:
+        return None, day
+    items.sort(key=lambda i: DIGEST_ORDER.index(i["kind"]) if i["kind"] in DIGEST_ORDER else 99)
+    parts = [f"🟥🦀【오늘 리포트 모음】 {_kr_date(day)}", "━━━━━━━━━━━━"]
+    for it in items:
+        body = it["text"].split("\n")[2:]  # 첫 줄(꾸밈)·구분선 빼고 【종류】부터
+        parts.append("\n".join(body).strip())
+        parts.append("")
+    return "\n".join(parts).strip(), day
+
+
+def send_document(content: bytes, filename: str, caption: str, token: str = None, chat_id: str = None) -> bool:
+    token = token or TELEGRAM_BOT_TOKEN
+    chat_id = chat_id or TELEGRAM_CHAT_ID
+    try:
+        res = requests.post(f"https://api.telegram.org/bot{token}/sendDocument",
+                            data={"chat_id": chat_id, "caption": caption[:1000]},
+                            files={"document": (filename, content)}, timeout=20)
+        if not res.ok:
+            print(f"[telegram] 파일 전송 실패: {res.status_code} {res.text[:200]}")
+        return res.ok
+    except Exception as e:
+        print(f"[telegram] 파일 전송 오류: {e}")
+        return False
+
+
+_KR_FONT = {"path": None}
+
+
+def _kr_font_path():
+    """PDF용 한글 글꼴 (나눔고딕) — 서버에 없어서 처음 한 번 내려받아 /tmp에 둠"""
+    if _KR_FONT["path"] and os.path.exists(_KR_FONT["path"]):
+        return _KR_FONT["path"]
+    path = "/tmp/NanumGothic-Regular.ttf"
+    if not os.path.exists(path):
+        for url in ("https://github.com/google/fonts/raw/main/ofl/nanumgothic/NanumGothic-Regular.ttf",
+                    "https://raw.githubusercontent.com/google/fonts/main/ofl/nanumgothic/NanumGothic-Regular.ttf"):
+            try:
+                r = requests.get(url, timeout=30)
+                if r.ok and len(r.content) > 100000:
+                    open(path, "wb").write(r.content)
+                    break
+            except Exception:
+                pass
+    _KR_FONT["path"] = path if os.path.exists(path) else None
+    return _KR_FONT["path"]
+
+
+def make_report_pdf(text: str, title: str) -> bytes:
+    """리포트 모음 → A4 PDF (글자만, 이모티콘은 PDF 글꼴에 없어서 뺌)"""
+    import textwrap
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+    from matplotlib.font_manager import FontProperties
+    fp = _kr_font_path()
+    font = FontProperties(fname=fp) if fp else FontProperties()
+    clean = re.sub(r"[\U0001F000-\U0001FFFF\u2600-\u27BF\uFE0F\u200d\u2B00-\u2BFF]", "", text)
+    clean = clean.replace("━", "─").replace("▪", "·").replace("⟨", "(").replace("⟩", ")").replace("▲", "↑").replace("▼", "↓")
+    lines = []
+    for ln in clean.split("\n"):
+        ln = ln.rstrip()
+        if not ln:
+            lines.append("")
+            continue
+        indent = len(ln) - len(ln.lstrip())
+        lines += textwrap.wrap(ln, width=58, subsequent_indent=" " * (indent + 2)) or [""]
+    per = 52
+    buf = io.BytesIO()
+    with PdfPages(buf) as pdf:
+        pages = [lines[i:i + per] for i in range(0, max(1, len(lines)), per)]
+        for pi, chunk in enumerate(pages, 1):
+            fig = plt.figure(figsize=(8.27, 11.69))
+            fig.text(0.07, 0.965, title, fontproperties=font, fontsize=13, weight="bold")
+            fig.text(0.93, 0.965, f"{pi} / {len(pages)}", fontproperties=font, fontsize=8, ha="right", color="#666")
+            y = 0.93
+            for ln in chunk:
+                bold = ln.startswith("【")
+                fig.text(0.07, y, ln, fontproperties=font, fontsize=10.5 if bold else 9.3,
+                         weight="bold" if bold else "normal", color="#111" if bold else "#222")
+                y -= 0.0172
+            pdf.savefig(fig)
+            plt.close(fig)
+    return buf.getvalue()
+
+
+def send_report_digest(day: str = None) -> bool:
+    """🦀 JM 리포트 봇에만, PDF 파일 한 개로 (2026-10-27 JM 요청: 평일 21:00)"""
+    text, day = build_report_digest(day)
+    if not text:
+        return False
+    tok, chat = bot("report")
+    title = f"JM 리포트 · {_kr_date(day)}"
+    pdf = make_report_pdf(text, title)
+    return send_document(pdf, f"JM리포트_{day}.pdf", f"🟥🦀【오늘 리포트 모음】 {_kr_date(day)} — PDF", tok, chat)
+
+
+def _run_report_digest():
+    now = now_kst()
+    if now.weekday() >= 5 or not ((21, 0) <= (now.hour, now.minute) <= (21, 40)):
+        return
+    day = now.strftime("%Y-%m-%d")
+    if _brief_already_sent("report_digest", day):
+        return
+    if send_report_digest(day):
+        _mark_brief_sent("report_digest", day)
+
+
+@app.get("/api/report-digest")
+def report_digest_endpoint(day: str = "", send: bool = False):
+    try:
+        text, d = build_report_digest(day or None)
+        sent = send_report_digest(d) if (send and text) else False
+        return {"ok": True, "day": d, "sent": sent, "text": text}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 def send_telegram(text: str, token: str = None, chat_id: str = None) -> bool:
