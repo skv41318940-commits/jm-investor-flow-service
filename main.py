@@ -5094,7 +5094,11 @@ def send_telegram(text: str, token: str = None, chat_id: str = None) -> bool:
     return _send_telegram_once(text, token, chat_id)
 
 
+_tg_last_error = {"msg": ""}
+
+
 def _send_telegram_once(text: str, token: str, chat_id: str) -> bool:
+    _tg_last_error["msg"] = ""
     try:
         res = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
@@ -5103,6 +5107,11 @@ def _send_telegram_once(text: str, token: str, chat_id: str) -> bool:
         )
         if not res.ok:
             print(f"[telegram] 전송 실패: {res.status_code} {res.text[:200]}")
+            # 이유를 쉬운 말로 남겨서 테스트 화면에 보여줌 (2026-10-26)
+            why = {401: "토큰이 틀렸어요 (Render 환경변수 값 확인)",
+                   403: "이 봇 대화방에서 /start를 안 눌렀어요 (봇이 먼저 말을 걸 수 없음)",
+                   400: "대화방을 못 찾았어요 (봇 방에서 /start 필요, 또는 채팅 ID 확인)"}.get(res.status_code, "")
+            _tg_last_error["msg"] = f"{res.status_code} · {why} · {res.text[:120]}"
         return res.ok
     except Exception as e:
         print(f"[telegram] 전송 오류: {e}")
@@ -7230,7 +7239,8 @@ def brief_preview_endpoint(kind: str = "flow", send: bool = False):
     try:
         text, ref = BRIEF_BUILDERS[kind]()
         sent = send_brief(kind, text) if (send and text) else False
-        return {"ok": True, "kind": kind, "ref_date": ref, "sent": sent, "text": text}
+        send_error = _tg_last_error["msg"] if (send and text and not sent) else None
+        return {"ok": True, "kind": kind, "ref_date": ref, "sent": sent, "send_error": send_error, "bot": BRIEF_BOT.get(kind) or ("report" if bot("report")[0] else "main"), "text": text}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
