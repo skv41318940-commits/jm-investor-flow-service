@@ -6679,7 +6679,7 @@ def _kis_quote(code: str) -> dict:
     )
     o = data.get("output") or {}
     f = lambda k: float(o.get(k) or 0)
-    return {"price": f("stck_prpr"), "open": f("stck_oprc"), "high": f("stck_hgpr"),
+    return {"price": f("stck_prpr"), "open": f("stck_oprc"), "high": f("stck_hgpr"), "low": f("stck_lwpr"),
             "pct": f("prdy_ctrt"), "value_eok": f("acml_tr_pbmn") / 1e8}
 
 
@@ -10400,6 +10400,82 @@ def _etf_universe(n: int = 60) -> list:
     out = out[:n]
     _etf_cache["universe"] = (time.time(), out)
     return out
+
+
+def _etf_all() -> list:
+    c = _etf_cache.get("all")
+    if c and time.time() - c[0] < 3600:
+        return c[1]
+    res = requests.get("https://finance.naver.com/api/sise/etfItemList.nhn", params={"etfType": "0"},
+                       headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.naver.com/sise/etf.naver"}, timeout=12)
+    try:
+        j = res.json()
+    except Exception:
+        j = json.loads(res.content.decode("euc-kr", errors="replace"))
+    items = (j.get("result") or {}).get("etfItemList") or []
+    _etf_cache["all"] = (time.time(), items)
+    return items
+
+
+# 📊 섹터 대표 ETF — 섹터마다 하나씩, 시장 색깔을 한눈에 (이름으로 찾아서 코드가 바뀌어도 안전)
+SECTOR_ETFS = [
+    ("코스피", "KODEX 200"), ("코스닥", "KODEX 코스닥150"), ("반도체", "TIGER 반도체TOP10"), ("반도체 소부장", "SOL AI반도체소부장"),
+    ("바이오", "KoAct 바이오헬스케어액티브"), ("2차전지", "KODEX 2차전지산업"), ("자동차", "KODEX 자동차"), ("조선", "SOL 조선TOP3플러스"),
+    ("방산", "PLUS K방산"), ("AI 전력", "KODEX AI전력핵심설비"), ("원자력", "TIGER 코리아원자력"), ("로봇", "KODEX 로봇액티브"),
+    ("우주항공", "PLUS 우주항공"), ("태양광·ESS", "PLUS 태양광&ESS"), ("신재생", "KODEX 신재생에너지액티브"), ("수소", "RISE 수소경제테마"),
+    ("화장품", "TIGER 화장품"), ("K-POP", "ACE KPOP포커스"), ("건설", "KODEX 건설"), ("은행", "TIGER 은행고배당플러스TOP10"),
+    ("증권", "KODEX 증권"), ("인터넷", "TIGER 인터넷TOP10"), ("게임", "KODEX 게임산업"), ("철강", "KODEX 철강"),
+]
+
+
+@app.get("/api/etf-sectors")
+def etf_sectors_endpoint():
+    c = _etf_cache.get("sectors")
+    if c and time.time() - c[0] < 120:
+        return c[1]
+    try:
+        items = _etf_all()
+        by_name = {it["itemname"].replace(" ", ""): it for it in items}
+        rows = []
+        for sector, nm in SECTOR_ETFS:
+            key = nm.replace(" ", "")
+            it = by_name.get(key) or next((v for k, v in by_name.items() if k.startswith(key)), None)
+            if not it:
+                continue
+            code = it["itemcode"]
+            row = {"sector": sector, "code": code, "name": it["itemname"], "pct": float(it.get("changeRate") or 0),
+                   "price": float(it.get("nowVal") or 0), "value_eok": round(float(it.get("amonut") or 0) / 100, 1),
+                   "cap_eok": float(it.get("marketSum") or 0)}
+            try:
+                q = _kis_quote(code)
+                row.update({"price": q["price"] or row["price"], "pct": q["pct"], "open": q["open"], "high": q["high"], "low": q["low"]})
+            except Exception:
+                pass
+            try:
+                ck = f"inv:{code}"
+                ic = _etf_cache.get(ck)
+                if not ic or time.time() - ic[0] > 600:
+                    ic = (time.time(), _investor_daily(code))
+                    _etf_cache[ck] = ic
+                if ic[1]:
+                    row.update({"foreign": ic[1]["foreign"], "institution": ic[1]["institution"], "inv_date": ic[1]["date"]})
+            except Exception:
+                pass
+            rows.append(row)
+            time.sleep(0.05)
+        body = [r for r in rows if r["sector"] not in ("코스피", "코스닥")]
+        up = sum(1 for r in body if r["pct"] > 0)
+        strong = [r["sector"] for r in sorted(body, key=lambda r: -r["pct"])[:3]]
+        weak = [r["sector"] for r in sorted(body, key=lambda r: r["pct"])[:3]]
+        mood = ("🔴 대부분 상승 — 시장 전체가 강함" if up >= len(body) * 0.75 else
+                "🔵 대부분 하락 — 시장 색깔 없음, 관망" if up <= len(body) * 0.25 else
+                "🟡 섹터별로 갈림 — 강한 섹터 위주로")
+        out = {"ok": True, "at": now_kst().strftime("%H:%M"), "rows": rows,
+               "summary": {"up": up, "down": len(body) - up, "strong": strong, "weak": weak, "mood": mood}}
+        _etf_cache["sectors"] = (time.time(), out)
+        return out
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 def _investor_daily(code: str):
