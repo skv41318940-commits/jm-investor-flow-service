@@ -5010,6 +5010,26 @@ HEALTH_REPORT_HOUR, HEALTH_REPORT_MINUTE = 18, 40
 _health_sent = {"date": None}
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 🤖 알림 봇 나누기 (2026-10-26) — 봇마다 텔레그램 대화방이 따로 생겨서 알림을 골라 받을 수 있음
+#   main  = 기존 봇 (브리핑: 06:15·장전·랭킹·테마·일정·수급·마감·미국장·점검·정비)
+#   news  = 📰 뉴스 봇 (세계 주요뉴스 07:10·18:10, 세계 증시 이슈 11:00·15:00·20:20)
+#   flash = 🚨 공시·속보 봇 (국내 속보, 잠정실적 공시, IR 예고)
+#   sports = ⚽ (나중에 스포츠 프로젝트용)
+#   Render 환경변수 TELEGRAM_BOT_TOKEN_NEWS / _FLASH / _SPORTS 를 넣으면 그 봇으로, 없으면 기존 봇으로 그대로 감
+#   (채팅방이 다르면 TELEGRAM_CHAT_ID_NEWS 등도 넣을 수 있음 — 보통은 같은 사람이라 안 넣어도 됨)
+# ══════════════════════════════════════════════════════════════════════════
+BRIEF_BOT = {"news_11": "news", "news_15": "news", "news_2020": "news", "ir_16": "flash", "ir_2010": "flash"}
+
+
+def bot(channel: str = "main"):
+    if channel == "main":
+        return None, None
+    tok = os.environ.get(f"TELEGRAM_BOT_TOKEN_{channel.upper()}") or None
+    chat = os.environ.get(f"TELEGRAM_CHAT_ID_{channel.upper()}") or None
+    return tok, chat
+
+
 def send_telegram(text: str, token: str = None, chat_id: str = None) -> bool:
     token = token or TELEGRAM_BOT_TOKEN
     chat_id = chat_id or TELEGRAM_CHAT_ID
@@ -7144,7 +7164,7 @@ def _run_telegram_briefs():
             text, ref = BRIEF_BUILDERS[kind]()
             if not text or not ref or _brief_already_sent(kind, ref):
                 continue
-            if send_telegram(text):
+            if send_telegram(text, *bot(BRIEF_BOT.get(kind, "main"))):
                 _mark_brief_sent(kind, ref)
                 print(f"[brief] {kind} 발송 완료 ({ref})")
                 if kind == "morning" and _flash_state.get("morning_keys"):
@@ -7165,7 +7185,7 @@ def brief_preview_endpoint(kind: str = "flow", send: bool = False):
         return {"ok": False, "error": f"kind는 {'/'.join(BRIEF_BUILDERS)} 중 하나예요."}
     try:
         text, ref = BRIEF_BUILDERS[kind]()
-        sent = send_telegram(text) if (send and text) else False
+        sent = send_telegram(text, *bot(BRIEF_BOT.get(kind, "main"))) if (send and text) else False
         return {"ok": True, "kind": kind, "ref_date": ref, "sent": sent, "text": text}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -7524,7 +7544,7 @@ def _check_earnings_disclosures():
     except Exception as e:
         print(f"[earnings] 공시 확인 실패: {e}")
         return
-    if text and send_telegram(text):
+    if text and send_telegram(text, *bot("flash")):
         for r in rows:
             _mark_brief_sent("dart_earn", r["rcept_no"])
 
@@ -9674,7 +9694,7 @@ def _run_world_news_alerts():
             continue
         try:
             text, _ = build_world_news_digest()
-            if send_telegram(text):
+            if send_telegram(text, *bot("news")):
                 _mark_brief_sent(kind, key)
         except Exception as e:
             print(f"[worldnews] {kind} 실패: {e}")
@@ -10051,7 +10071,7 @@ def _send_flash(items: list, title: str):
         for k in range(0, len(group), 8):  # 메시지가 너무 길지 않게 8개씩
             chunk = group[k:k + 8]
             text = f"{head}{title}\n━━━━━━━━━━━━\n" + "\n\n".join(i["text"] for i in chunk) + "\n\n※ 속보는 확인 전 1차 정보 — 원문·공시로 꼭 확인"
-            if send_telegram(text):
+            if send_telegram(text, *bot("flash")):
                 for i in chunk:
                     _flash_mark(i["key"])
                     if i.get("skey"):
