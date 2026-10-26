@@ -3926,6 +3926,7 @@ def fetch_investor_flow(code: str, days: int = 20):
             + row.get("사모", 0)
             + row.get("은행", 0)
             + row.get("기타금융", 0)
+            + row.get("연기금", 0)  # HTS·KRX '기관합계'에는 연기금이 포함됨 — 빠져 있어서 기관 숫자가 달랐음 (2026-10-26 수정)
         )
         # pykrx 버전에 따라 '외국인' 또는 '외국인합계'로 컬럼명이 다를 수 있어 둘 다 시도
         foreign = row.get("외국인", None)
@@ -10314,6 +10315,49 @@ def theme_map_endpoint(top: int = 14, refresh: bool = False):
         data = {"ok": True, "at": now_kst().strftime("%H:%M"), "themes": picked, "note": "KRX 기준(넥스트레이드 제외) · 3분마다 갱신"}
         c.update({"at": time.time(), "data": data})
         return data
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 📈 코스피200 선물 미결제약정 · 베이시스 — 한투 '선물옵션 시세' FHMIF10000000 (최근월물 101000) (2026-10-26)
+#   응답 칸 이름이 문서마다 조금 달라서 여러 후보로 읽고, 베이시스가 없으면 '선물 − 코스피200'으로 계산
+# ══════════════════════════════════════════════════════════════════════════
+_fut_basis_cache = {"at": 0.0, "data": None}
+
+
+@app.get("/api/futures-basis")
+def futures_basis_endpoint(iscd: str = "101000", raw: bool = False):
+    c = _fut_basis_cache
+    if not raw and c["data"] and time.time() - c["at"] < 60:
+        return c["data"]
+    try:
+        data = kis_get("/uapi/domestic-futureoption/v1/quotations/inquire-price", "FHMIF10000000",
+                       {"FID_COND_MRKT_DIV_CODE": "F", "FID_INPUT_ISCD": iscd})
+        if raw:
+            return {"ok": True, "raw": data}
+        if data.get("rt_cd") != "0":
+            return {"ok": False, "error": data.get("msg1")}
+        o1 = data.get("output1") or {}
+        o3 = data.get("output3") or {}
+        f = lambda d, *ks: next((float(str(d[k]).replace(",", "")) for k in ks if d.get(k) not in (None, "")), None)
+        price = f(o1, "futs_prpr")
+        chg = f(o1, "futs_prdy_vrss") or 0
+        if o1.get("prdy_vrss_sign") in ("4", "5"):
+            chg = -abs(chg)
+        oi = f(o1, "hts_otst_stpl_qty", "otst_stpl_qty")
+        oi_chg = f(o1, "otst_stpl_qty_icdc", "hts_otst_stpl_qty_icdc")
+        k200 = f(o3, "bstp_nmix_prpr", "kospi200_nmix") or f(o1, "kospi200_nmix")
+        basis = f(o1, "basis", "mrkt_basis")
+        if basis is None and price and k200:
+            basis = round(price - k200, 2)
+        theo = f(o1, "hts_thpr", "thpr")
+        out = {"ok": True, "at": now_kst().strftime("%H:%M"), "name": o1.get("hts_kor_isnm", "코스피200 선물"),
+               "price": price, "change": chg, "kospi200": k200, "basis": basis, "theory": theo,
+               "theory_basis": round(theo - k200, 2) if theo and k200 else None,
+               "oi": oi, "oi_change": oi_chg}
+        c.update({"at": time.time(), "data": out})
+        return out
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
