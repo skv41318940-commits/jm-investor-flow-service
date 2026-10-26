@@ -5015,6 +5015,8 @@ _health_sent = {"date": None}
 #   main  = 기존 봇 (브리핑: 06:15·장전·랭킹·테마·일정·수급·마감·미국장·점검·정비)
 #   news  = 📰 뉴스 봇 (세계 주요뉴스 07:10·18:10, 세계 증시 이슈 11:00·15:00·20:20)
 #   flash = 🚨 공시·속보 봇 (국내 속보, 잠정실적 공시, IR 예고)
+#   report = 🦀 JM 리포트 봇 (브리핑 전부 — 우리 사이트 링크 없이, 리포트에 바로 붙이기용)
+#   main  = 기존 봇은 'JM 전용' (목표가 도달·데이터 점검·정비 알림)
 #   sports = ⚽ (나중에 스포츠 프로젝트용)
 #   Render 환경변수 TELEGRAM_BOT_TOKEN_NEWS / _FLASH / _SPORTS 를 넣으면 그 봇으로, 없으면 기존 봇으로 그대로 감
 #   (채팅방이 다르면 TELEGRAM_CHAT_ID_NEWS 등도 넣을 수 있음 — 보통은 같은 사람이라 안 넣어도 됨)
@@ -5028,6 +5030,48 @@ def bot(channel: str = "main"):
     tok = os.environ.get(f"TELEGRAM_BOT_TOKEN_{channel.upper()}") or None
     chat = os.environ.get(f"TELEGRAM_CHAT_ID_{channel.upper()}") or None
     return tok, chat
+
+
+# 🦀 리포트용 알림 꾸미기 (2026-10-27) — 첫 줄은 텔레그램에서 알아보기 쉽게(색 띠 + 🦀 + 【종류】),
+#    구분선 아래는 리포트에 그대로 붙일 수 있게. JM 리포트 봇으로 갈 땐 우리 사이트 링크(🔗)를 뺌
+BRIEF_STYLE = {
+    "closing": ("🟥", "리포트"), "targets": ("🟧", "장전"), "rally": ("🟨", "랭킹"), "flow": ("🟩", "수급"),
+    "theme": ("🟦", "테마"), "theme_am": ("🟦", "오전 테마"), "schedule": ("🟪", "일정"),
+    "morning": ("🟫", "미국 마감"), "us_pre": ("🟫", "미국 장전"), "us_open30": ("🟫", "미국 개장"),
+    "news_11": ("⬜", "세계 이슈"), "news_15": ("⬜", "세계 이슈"), "news_2020": ("⬜", "세계 이슈"),
+    "ir_16": ("⬜", "IR 예고"), "ir_2010": ("⬜", "IR 예고"),
+}
+
+
+def format_brief(kind: str, text: str, strip_site_links: bool = False) -> str:
+    color, label = BRIEF_STYLE.get(kind, ("⬜", "알림"))
+    lines = text.split("\n")
+    title = re.sub(r"^[^\w가-힣(]+", "", lines[0]).strip()  # 맨 앞 이모티콘 떼기
+    body = lines[1:]
+    if strip_site_links:
+        site = re.escape(FRONTEND_URL.rstrip("/"))
+        cleaned = []
+        for ln in body:
+            had = site.replace("\\", "") in ln or "🔗" in ln
+            ln2 = re.sub(rf"\s*🔗\s*{site}\S*", "", ln)
+            ln2 = re.sub(rf"\s*{site}\S*", "", ln2)
+            if had and not ln2.strip():
+                continue  # 링크만 있던 줄은 통째로 빼기
+            cleaned.append(ln2)
+        body = cleaned
+    head = f"{color}🦀【{label}】 {title}"
+    return "\n".join([head, "━━━━━━━━━━━━", f"【{label}】 {title}"] + [ln for ln in body if ln.strip() != "━━━━━━━━━━━━"])
+
+
+def send_brief(kind: str, text: str) -> bool:
+    """브리핑 보내기: 뉴스·IR은 각자 봇, 나머지는 JM 리포트 봇(있으면, 사이트 링크 없이) → 없으면 기존 봇"""
+    ch = BRIEF_BOT.get(kind)
+    if ch:
+        return send_telegram(format_brief(kind, text), *bot(ch))
+    tok, chat = bot("report")
+    if tok:
+        return send_telegram(format_brief(kind, text, strip_site_links=True), tok, chat)
+    return send_telegram(format_brief(kind, text))
 
 
 def send_telegram(text: str, token: str = None, chat_id: str = None) -> bool:
@@ -7164,7 +7208,7 @@ def _run_telegram_briefs():
             text, ref = BRIEF_BUILDERS[kind]()
             if not text or not ref or _brief_already_sent(kind, ref):
                 continue
-            if send_telegram(text, *bot(BRIEF_BOT.get(kind, "main"))):
+            if send_brief(kind, text):
                 _mark_brief_sent(kind, ref)
                 print(f"[brief] {kind} 발송 완료 ({ref})")
                 if kind == "morning" and _flash_state.get("morning_keys"):
@@ -7185,7 +7229,7 @@ def brief_preview_endpoint(kind: str = "flow", send: bool = False):
         return {"ok": False, "error": f"kind는 {'/'.join(BRIEF_BUILDERS)} 중 하나예요."}
     try:
         text, ref = BRIEF_BUILDERS[kind]()
-        sent = send_telegram(text, *bot(BRIEF_BOT.get(kind, "main"))) if (send and text) else False
+        sent = send_brief(kind, text) if (send and text) else False
         return {"ok": True, "kind": kind, "ref_date": ref, "sent": sent, "text": text}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -9241,7 +9285,7 @@ def _run_us_briefs():
             continue
         try:
             text, ref = builder()
-            if text and send_telegram(text):
+            if text and send_brief(kind, text):
                 _mark_brief_sent(kind, today)
                 print(f"[us_briefs] {kind} 발송")
         except Exception as e:
