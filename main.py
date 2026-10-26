@@ -10369,6 +10369,129 @@ def futures_basis_endpoint(iscd: str = "101000", raw: bool = False):
         return {"ok": False, "error": str(e)}
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 🧺 ETF 투자자별 순매수 TOP — "금요일 ETF로 돈이 들어오면 월요일 그 섹터로 돈이 들어온다" (JM 관찰, 2026-10-26)
+#   · ETF 목록: 네이버 ETF 목록(국내 업종·테마, 레버리지·인버스 제외) 거래대금 상위 60개
+#   · 투자자별 순매수: 한투 '주식현재가 투자자'(FHKST01010900) — 가장 최근 확정일 (장중엔 전 거래일)
+#   · ETF 누르면 구성종목: 한투 'ETF 구성종목시세'(FHKST121600C0) + 종목별 외국인·기관(확정→없으면 장중 추정)·프로그램
+# ══════════════════════════════════════════════════════════════════════════
+_etf_cache: dict = {}
+ETF_SKIP = re.compile(r"레버리지|인버스|2X|선물|커버드콜|채권|금리|머니마켓|CD|KOFR|합성")
+
+
+def _etf_universe(n: int = 60) -> list:
+    c = _etf_cache.get("universe")
+    if c and time.time() - c[0] < 3600:
+        return c[1]
+    res = requests.get("https://finance.naver.com/api/sise/etfItemList.nhn", params={"etfType": "0"},
+                       headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.naver.com/sise/etf.naver"}, timeout=12)
+    try:
+        j = res.json()
+    except Exception:
+        j = json.loads(res.content.decode("euc-kr", errors="replace"))
+    items = (j.get("result") or {}).get("etfItemList") or []
+    out = []
+    for it in items:
+        if str(it.get("etfTabCode")) != "2" or ETF_SKIP.search(it.get("itemname", "")):
+            continue
+        out.append({"code": it["itemcode"], "name": it["itemname"], "pct": float(it.get("changeRate") or 0),
+                    "price": float(it.get("nowVal") or 0), "value_eok": round(float(it.get("amonut") or 0) / 100, 1)})
+    out.sort(key=lambda x: -x["value_eok"])
+    out = out[:n]
+    _etf_cache["universe"] = (time.time(), out)
+    return out
+
+
+def _investor_daily(code: str):
+    """가장 최근 확정일의 개인·외국인·기관 순매수(억) — 장중엔 오늘 줄이 비어서 전 거래일"""
+    data = kis_get("/uapi/domestic-stock/v1/quotations/inquire-investor", "FHKST01010900",
+                   {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code})
+    for r in data.get("output") or []:
+        f = lambda k: float(r.get(k) or 0)
+        p, fr, o = f("prsn_ntby_tr_pbmn"), f("frgn_ntby_tr_pbmn"), f("orgn_ntby_tr_pbmn")
+        if p or fr or o:
+            d = r.get("stck_bsop_date", "")
+            return {"date": f"{d[:4]}-{d[4:6]}-{d[6:]}", "individual": round(p / 100, 1), "foreign": round(fr / 100, 1), "institution": round(o / 100, 1)}
+    return None
+
+
+@app.get("/api/etf-flow-top")
+def etf_flow_top_endpoint(who: str = "foreign", side: str = "buy", n: int = 30):
+    key = "flows"
+    c = _etf_cache.get(key)
+    try:
+        if not c or time.time() - c[0] > 600:
+            rows = []
+            for e in _etf_universe():
+                try:
+                    inv = _investor_daily(e["code"])
+                except Exception:
+                    inv = None
+                if inv:
+                    rows.append({**e, **inv})
+                time.sleep(0.06)
+            c = (time.time(), rows)
+            _etf_cache[key] = c
+        rows = c[1]
+        k = {"foreign": "foreign", "institution": "institution", "individual": "individual"}.get(who, "foreign")
+        rows = sorted(rows, key=lambda r: -r[k] if side == "buy" else r[k])[: max(5, min(n, 60))]
+        date = max((r["date"] for r in rows), default="")
+        return {"ok": True, "who": k, "side": side, "date": date, "rows": rows,
+                "note": "국내 업종·테마 ETF(레버리지·인버스 제외) 거래대금 상위 60개 중 · 가장 최근 확정일 기준"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/etf-components")
+def etf_components_endpoint(code: str, n: int = 15):
+    ck = f"comp:{code}"
+    c = _etf_cache.get(ck)
+    if c and time.time() - c[0] < 180:
+        return c[1]
+    try:
+        data = kis_get("/uapi/etfetn/v1/quotations/inquire-component-stock-price", "FHKST121600C0",
+                       {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code, "FID_COND_SCR_DIV_CODE": "11216"})
+        comp = data.get("output2") or []
+        g = lambda r, *ks: next((r[k] for k in ks if r.get(k) not in (None, "")), None)
+        items = []
+        for r in comp:
+            sc = g(r, "stck_shrn_iscd", "mksc_shrn_iscd")
+            if not sc or not str(sc).isdigit():
+                continue  # 현금·선물 등 제외
+            items.append({"code": sc, "name": g(r, "hts_kor_isnm"), "pct": float(g(r, "prdy_ctrt") or 0),
+                          "weight": float(g(r, "etf_cnfg_issu_rlim", "etf_vltn_amt") or 0)})
+        items.sort(key=lambda x: -x["weight"])
+        items = items[: max(5, min(n, 25))]
+        now = now_kst()
+        live = now.weekday() < 5 and (9, 0) <= (now.hour, now.minute) <= (15, 40)
+        for it in items:
+            it["foreign"] = it["institution"] = it["program"] = None
+            it["basis"] = ""
+            try:
+                if live:
+                    est = stock_live_flow_endpoint(it["code"])
+                    if est.get("ok") and est.get("slots"):
+                        last = est["slots"][-1]
+                        it.update({"foreign": last.get("foreign_eok"), "institution": last.get("institution_eok"), "basis": "장중 추정"})
+                if it["foreign"] is None:
+                    inv = _investor_daily(it["code"])
+                    if inv:
+                        it.update({"foreign": inv["foreign"], "institution": inv["institution"], "basis": inv["date"][5:]})
+            except Exception:
+                pass
+            try:
+                pr = fetch_program_trade_daily(it["code"])
+                it["program"] = pr[0]["net_amt"] if pr else None
+            except Exception:
+                pass
+            time.sleep(0.05)
+        out = {"ok": True, "code": code, "rows": items, "at": now.strftime("%H:%M"), "rt_cd": data.get("rt_cd"), "msg": data.get("msg1")}
+        _etf_cache[ck] = (time.time(), out)
+        return out
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/ping")
 def ping():
     return {"ok": True}
