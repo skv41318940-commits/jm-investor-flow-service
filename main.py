@@ -9727,6 +9727,9 @@ FLASH_GLOBAL_EVENTS_EN = ['"workers strike"', '"on strike"', '"to strike"', '"st
                           'outage', 'earthquake', '"production halt"', '"export controls"', 'recall', 'explosion']
 FLASH_GLOBAL_EVENTS_KO = ["파업", "화재", "정전", "지진", "가동중단", "수출규제", "관세", "리콜", "폭발"]
 _flash_state = {"at": 0.0, "names": None, "names_at": 0.0, "pending": [], "waiting": {}}
+# 🌐 해외 증시 속보 끄기 (2026-10-26 JM: 리포트 쓰는 데 쓸모가 적음) — 다시 켜려면 True
+#   꺼두면 06:15 아침 알림의 "🌙 밤사이 해외 속보"도 같이 안 나옴. 국내 속보는 그대로
+FLASH_GLOBAL_ENABLED = False
 # 회사 이름에 사건 단어가 들어 있거나 다른 뜻인 경우 (예: 삼성화재 = Samsung Fire, 뉴욕 별명 Big Apple)
 FLASH_GLOBAL_FALSE = re.compile(r"samsung fire|fire\s*&\s*marine|big apple|apple(bee|ton)|pineapple|apple tv|ordered to pay|lawsuit|verdict|"
                                 r"strikes? (a )?deal|strike(s)? .{0,20}(deal|partnership|agreement)|tv deals?|black friday|lit a|ends .{0,10}strike", re.I)
@@ -10071,7 +10074,7 @@ def _run_flash_alerts():
             items += _collect_flash_domestic()
         if now.weekday() < 5 and (9, 10) <= (now.hour, now.minute) <= (15, 20):
             items += _check_flash_waiting()  # 재료 뒤 늦게 거래대금이 터진 종목
-        if now.weekday() < 5:  # 해외 속보는 평일(월~금)만 — 주말엔 안 보냄 (2026-10-26)
+        if now.weekday() < 5 and FLASH_GLOBAL_ENABLED:  # 해외 속보: 평일만 + 지금은 꺼둠 (FLASH_GLOBAL_ENABLED)
             items += _collect_flash_global()
     except Exception as e:
         print(f"[flash] 수집 실패: {e}")
@@ -10091,7 +10094,7 @@ def _run_flash_alerts():
 @app.get("/api/flash-check")
 def flash_check_endpoint(send: bool = False):
     """속보 미리보기 — send=true면 지금 바로 보냄 (보낸 건 다시 안 보냄)"""
-    items = _collect_flash_domestic() + _collect_flash_global()
+    items = _collect_flash_domestic() + (_collect_flash_global() if FLASH_GLOBAL_ENABLED else [])
     if send and items:
         _send_flash(items, " (수동 확인)")
     return {"ok": True, "count": len(items), "items": [i["text"] for i in items]}
