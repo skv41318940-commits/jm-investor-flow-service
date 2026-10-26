@@ -10221,6 +10221,53 @@ def stock_minute_multi_endpoint(code: str, days: int = 5, end: str = "", start: 
     return {"ok": bool(out), "code": code, "days": out, "error": None if out else "분봉 데이터가 없어요 (휴장일이거나 너무 오래된 날짜)"}
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 🎯 분봉 세력평단 근사치 보정 — 정밀값(실시간 체결)이 있는 날, 같은 구간의 근사치와 비교해
+#    "정밀 ÷ 근사" 비율을 종목별로 모아두고, 여러 날(근사치) 조회 때 곱해서 보정값을 보여줌 (2026-10-26)
+# ══════════════════════════════════════════════════════════════════════════
+@app.get("/api/minute-calib")
+def minute_calib_get(code: str):
+    try:
+        rows = supabase.table("minute_calibration").select("*").execute().data or []
+        me = next((r for r in rows if r["code"] == code), None)
+        allr = [r for r in rows if r["n"] > 0]
+        gn = sum(r["n"] for r in allr)
+        glob = (sum(r["ratio_sum"] for r in allr) / gn) if gn else None
+        out = {"ok": True, "code": code, "global_ratio": glob, "global_n": gn}
+        if me and me["n"] > 0:
+            mean = me["ratio_sum"] / me["n"]
+            var = max(0.0, me["ratio_sq"] / me["n"] - mean * mean)
+            out.update({"ratio": mean, "n": me["n"], "sd": var ** 0.5, "min": me["ratio_min"], "max": me["ratio_max"]})
+        return out
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/minute-calib")
+def minute_calib_post(payload: dict):
+    """{code, precise, approx} — 같은 구간의 정밀값과 근사치를 받아 비율을 쌓음 (하루 같은 구간은 1번만)"""
+    try:
+        code, p, a = payload.get("code"), float(payload.get("precise") or 0), float(payload.get("approx") or 0)
+        if not code or p <= 0 or a <= 0:
+            return {"ok": False, "error": "값이 없어요"}
+        r = p / a
+        if not (0.5 < r < 1.5):
+            return {"ok": False, "error": "비율이 너무 커서 무시 (데이터 이상)"}
+        key = f"{code}:{payload.get('day', '')}:{payload.get('start', '')}"
+        if _brief_already_sent("minute_calib", key):
+            return {"ok": True, "skipped": True}
+        cur = supabase.table("minute_calibration").select("*").eq("code", code).limit(1).execute().data
+        c = cur[0] if cur else {"code": code, "n": 0, "ratio_sum": 0, "ratio_sq": 0, "ratio_min": None, "ratio_max": None}
+        c.update({"n": c["n"] + 1, "ratio_sum": c["ratio_sum"] + r, "ratio_sq": c["ratio_sq"] + r * r,
+                  "ratio_min": r if c["ratio_min"] is None else min(c["ratio_min"], r),
+                  "ratio_max": r if c["ratio_max"] is None else max(c["ratio_max"], r), "updated_at": now_kst().isoformat()})
+        supabase.table("minute_calibration").upsert(c).execute()
+        _mark_brief_sent("minute_calib", key)
+        return {"ok": True, "ratio": r, "n": c["n"]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/ping")
 def ping():
     return {"ok": True}
