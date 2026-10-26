@@ -6816,11 +6816,14 @@ def build_rally_brief(top_n: int = 20, min_value_eok: float = 50):
             candles, latest, *_ = fetch_minute_candles_paginated(r["code"], "J", "09:00")
             if latest and latest != now.strftime("%Y%m%d"):
                 return None, None  # 오늘 분봉이 없음 = 휴장
-            est = estimate_force_avg([{"date": c["time"], "open": c["open"], "close": c["close"], "volume": c["volume"]} for c in candles])
+            # ⛰ JM 방식: 09:00(상승 시작) ~ 장중 고점 봉까지만 평단 → 고점 이후 하락분이 섞이지 않아 정밀값에 가까움 (2026-10-26)
+            pk = max(range(len(candles)), key=lambda i: candles[i]["high"]) if candles else -1
+            leg = candles[: pk + 1] if pk >= 0 else candles
+            est = estimate_force_avg([{"date": c["time"], "open": c["open"], "close": c["close"], "volume": c["volume"]} for c in leg])
             hi = max(c["high"] for c in candles) if candles else r["high"]
             avg = est[-1]["avg_price"] if est else 0
             if avg:
-                extra = (f"\n   세력평단(근사) {avg:,.0f} · 평단 대비 {(r['price'] / avg - 1) * 100:+.1f}%"
+                extra = (f"\n   세력평단(⛰근사) {avg:,.0f} · 평단 대비 {(r['price'] / avg - 1) * 100:+.1f}%"
                          f" · 장중 고점 대비 {(r['price'] / hi - 1) * 100:+.1f}%")
         except Exception as e:
             print(f"[brief:rally] {r['code']} 분봉 실패: {e}")
@@ -10348,13 +10351,17 @@ def futures_basis_endpoint(iscd: str = "101000", raw: bool = False):
         oi = f(o1, "hts_otst_stpl_qty", "otst_stpl_qty")
         oi_chg = f(o1, "otst_stpl_qty_icdc", "hts_otst_stpl_qty_icdc")
         k200 = f(o3, "bstp_nmix_prpr", "kospi200_nmix") or f(o1, "kospi200_nmix")
-        basis = f(o1, "basis", "mrkt_basis")
+        # 실제 응답 확인(2026-10-26): mrkt_basis = 시장 베이시스, basis = 이론 베이시스, dprt = 괴리율(%)
+        basis = f(o1, "mrkt_basis")
         if basis is None and price and k200:
             basis = round(price - k200, 2)
         theo = f(o1, "hts_thpr", "thpr")
+        theo_basis = f(o1, "basis")
+        if theo_basis is None and theo and k200:
+            theo_basis = round(theo - k200, 2)
         out = {"ok": True, "at": now_kst().strftime("%H:%M"), "name": o1.get("hts_kor_isnm", "코스피200 선물"),
                "price": price, "change": chg, "kospi200": k200, "basis": basis, "theory": theo,
-               "theory_basis": round(theo - k200, 2) if theo and k200 else None,
+               "theory_basis": theo_basis, "gap_pct": f(o1, "dprt"), "days_left": f(o1, "hts_rmnn_dynu"),
                "oi": oi, "oi_change": oi_chg}
         c.update({"at": time.time(), "data": out})
         return out
