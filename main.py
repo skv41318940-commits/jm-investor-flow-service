@@ -2759,6 +2759,7 @@ async def _daily_jobs_worker():
         ("theme_snap", _save_theme_snapshot, ()),
         ("new_highs", _save_new_highs_snapshot, ()),
         ("report_digest", _run_report_digest, ()),
+        ("fut_close", _save_futures_close, ()),
         ("target_reach", _check_target_reach, ()),
         ("earnings_disclosure", _check_earnings_disclosures, ()),
     ]
@@ -5210,8 +5211,17 @@ def _run_report_digest():
 
 
 @app.get("/api/report-digest")
-def report_digest_endpoint(day: str = "", send: bool = False):
+def report_digest_endpoint(day: str = "", send: bool = False, rebuild: bool = False):
+    """rebuild=true: 오늘 브리핑을 지금 다시 만들어서 모음을 채움 (테스트용 — 처음 배포한 날처럼 모음이 비어 있을 때)"""
     try:
+        if rebuild:
+            for k in ("morning", "targets", "rally", "theme_am", "schedule", "flow", "theme", "closing"):
+                try:
+                    t, _ = BRIEF_BUILDERS[k]()
+                    if t:
+                        _digest_add(k, t)
+                except Exception as e:
+                    print(f"[digest] {k} 다시 만들기 실패: {e}")
         text, d = build_report_digest(day or None)
         sent = send_report_digest(d) if (send and text) else False
         return {"ok": True, "day": d, "sent": sent, "text": text}
@@ -10555,8 +10565,38 @@ def theme_map_endpoint(top: int = 14, refresh: bool = False):
 _fut_basis_cache = {"at": 0.0, "data": None}
 
 
+def _save_futures_close():
+    """📸 장 마감 직후(15:40~15:55) 선물 미결제약정·베이시스를 저장 → 장 마감 뒤엔 이 값을 보여줌 (2026-10-27)
+    (마감 뒤 실시간 값은 야간 선물 vs 마감 지수라 리포트에 쓰면 헷갈림)"""
+    now = now_kst()
+    if now.weekday() >= 5 or not ((15, 40) <= (now.hour, now.minute) <= (15, 55)):
+        return
+    key = now.strftime("%Y-%m-%d")
+    if _brief_already_sent("job_fut_close", key):
+        return
+    _fut_basis_cache["at"] = 0  # 새로 받기
+    d = futures_basis_endpoint(live_only=True)
+    if d.get("ok") and d.get("basis") is not None:
+        supabase.table("brief_cache").upsert({"key": "fut_close", "data": {**d, "date": key, "saved_at": now.strftime("%H:%M")},
+                                              "updated_at": now.isoformat()}).execute()
+        _mark_brief_sent("job_fut_close", key)
+
+
 @app.get("/api/futures-basis")
-def futures_basis_endpoint(iscd: str = "101000", raw: bool = False):
+def futures_basis_endpoint(iscd: str = "101000", raw: bool = False, live_only: bool = False):
+    now = now_kst()
+    regular = now.weekday() < 5 and (9, 0) <= (now.hour, now.minute) <= (15, 45)
+    if not raw and not live_only and not regular:
+        # 장 마감 뒤·장 전: 마감 직후 저장해 둔 값 + 지금 야간 선물은 참고로
+        try:
+            r = supabase.table("brief_cache").select("data").eq("key", "fut_close").limit(1).execute().data
+            if r:
+                snap = dict(r[0]["data"])
+                night = futures_basis_endpoint(iscd, live_only=True)
+                snap.update({"closed": True, "night_price": night.get("price"), "night_basis": night.get("basis")})
+                return snap
+        except Exception:
+            pass
     c = _fut_basis_cache
     if not raw and c["data"] and time.time() - c["at"] < 60:
         return c["data"]
@@ -10804,6 +10844,42 @@ def test_bot_endpoint(channel: str = "flash"):
     text = f"🧪🦀【테스트】 {names.get(channel, channel)} 봇 연결 확인\n━━━━━━━━━━━━\n이 메시지가 보이면 정상이에요 ✅ ({now_kst().strftime('%m/%d %H:%M')})"
     sent = send_telegram(text, tok, chat)
     return {"ok": True, "channel": channel, "sent": sent, "send_error": None if sent else _tg_last_error["msg"]}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 📊 매크로 지수 시세 — 등락률을 "전 거래일 종가 대비"로 정확하게 (2026-10-27)
+#   예전 화면 시세는 며칠 전 값과 비교돼서 코스피 −1.46%가 −5.18%로 나왔음 (리포트에 그대로 옮겨질 뻔)
+# ══════════════════════════════════════════════════════════════════════════
+_mq_cache: dict = {}
+
+
+def _macro_quote(sym: str) -> dict:
+    c = _mq_cache.get(sym)
+    if c and time.time() - c[0] < 25:
+        return c[1]
+    j = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{requests.utils.quote(sym)}",
+                     params={"range": "5d", "interval": "1d"}, headers={"User-Agent": "Mozilla/5.0"}, timeout=10).json()
+    res = j["chart"]["result"][0]
+    meta = res.get("meta") or {}
+    closes = [x for x in (res["indicators"]["quote"][0].get("close") or []) if x is not None]
+    price = meta.get("regularMarketPrice") or (closes[-1] if closes else None)
+    prev = closes[-2] if len(closes) >= 2 else meta.get("previousClose") or meta.get("chartPreviousClose")
+    if not price or not prev:
+        raise ValueError("시세 없음")
+    out = {"symbol": sym, "ok": True, "price": price, "change": price - prev, "changePct": (price - prev) / prev * 100, "prev": prev}
+    _mq_cache[sym] = (time.time(), out)
+    return out
+
+
+@app.get("/api/macro-quotes")
+def macro_quotes_endpoint(symbols: str):
+    out = []
+    for sym in [x for x in symbols.split(",") if x][:60]:
+        try:
+            out.append(_macro_quote(sym))
+        except Exception as e:
+            out.append({"symbol": sym, "ok": False, "error": str(e)})
+    return {"ok": True, "quotes": out}
 
 
 @app.get("/api/ping")
