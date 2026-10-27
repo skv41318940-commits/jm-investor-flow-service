@@ -7695,12 +7695,14 @@ def fetch_earnings_numbers(rcept_no: str):
             if not nums or not isinstance(nums[0], float):
                 continue
             cur = nums[0]
-            yoy = qoq = None
+            yoy = qoq = prev = None
             if len(nums) >= 5:  # 당기, 전기, 전기대비%, 전년동기, 전년동기대비%
                 qoq, yoy = nums[2], nums[4]
+                prev = nums[3] if isinstance(nums[3], float) else None
             elif len(nums) >= 2 and isinstance(nums[1], float) and nums[1]:  # 당기, 전기(또는 전년)
+                prev = nums[1]
                 yoy = (cur / nums[1] - 1) * 100 if nums[1] > 0 else ("흑자전환" if cur > 0 > nums[1] else None)
-            found[key] = {"cur": cur * mul if mul else None, "raw": cur, "qoq": qoq, "yoy": yoy}
+            found[key] = {"cur": cur * mul if mul else None, "raw": cur, "qoq": qoq, "yoy": yoy, "prev": prev}
         out = found or None
     except Exception as e:
         print(f"[earnings] {rcept_no} 숫자 읽기 실패: {e}")
@@ -7728,16 +7730,34 @@ def _earnings_numbers_text(nums: dict) -> str:
     return " · ".join(parts)
 
 
+def _profit_badge(nums: dict) -> str:
+    """실적 공시 흑자·적자 색 표시 (2026-10-28) — 영업이익 기준(없으면 순이익). 전년 동기와 비교해 전환도 표시"""
+    v = (nums or {}).get("영업이익") or (nums or {}).get("순이익")
+    if not v or v.get("raw") is None:
+        return ""
+    cur, prev = v["raw"], v.get("prev")
+    if prev is not None and cur > 0 > prev:
+        return "⭐흑자전환"
+    if prev is not None and cur < 0 < prev:
+        return "⚠️적자전환"
+    if cur < 0 and prev is not None and prev < 0:
+        return "🔵적자지속"
+    return "🔴흑자" if cur > 0 else "🔵적자" if cur < 0 else ""
+
+
 def _disclosure_line(r: dict, watch: set) -> str:
     star = "⭐" if r.get("stock_code") in watch else ""
     mkt = {"Y": "코스피", "K": "코스닥"}.get(r.get("corp_cls"), "")
     name = re.sub(r"\s+", " ", r.get("report_nm") or "").strip()
     nums_line = ""
+    badge = ""
     if _classify_disclosure(r.get("report_nm")) == "result":
         nums = fetch_earnings_numbers(r.get("rcept_no"))
         if nums:
             nums_line = f"\n   💰 {_earnings_numbers_text(nums)}"
-    return (f"{star}{r.get('corp_name')}" + (f" ({mkt})" if mkt else "") + f"\n   {name}{nums_line}"
+            b = _profit_badge(nums)
+            badge = f"{b} " if b else ""
+    return (f"{badge}{star}{r.get('corp_name')}" + (f" ({mkt})" if mkt else "") + f"\n   {name}{nums_line}"
             f"\n   🔗 https://dart.fss.or.kr/dsaf001/main.do?rcpNo={r.get('rcept_no')}")
 
 
