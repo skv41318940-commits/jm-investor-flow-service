@@ -7346,6 +7346,35 @@ BRIEF_BUILDERS = {
 }
 
 
+def _brief_claim(kind: str, day: str) -> bool:
+    """🔒 같은 브리핑을 두 번 만들지 않게 '만드는 중' 표시를 DB에 먼저 박음 (2026-10-27: 14:00 일정이 2번 옴)
+    — 만드는 데 몇 분 걸리는 브리핑(일정·IR 원문 읽기)이 겹쳐 돌면서 둘 다 보내졌음. 이미 표시가 있으면 False"""
+    try:
+        supabase.table("telegram_sent_log").insert({"kind": f"lock:{kind}", "ref_date": day}).execute()
+        return True
+    except Exception:
+        pass
+    # 표시가 15분 넘게 남아 있는데 실제로는 안 보내졌으면(만들다 서버가 재시작된 경우 등) 풀고 다시
+    try:
+        r = supabase.table("telegram_sent_log").select("sent_at").eq("kind", f"lock:{kind}").eq("ref_date", day).limit(1).execute().data
+        if r and not _brief_already_sent(f"done:{kind}", day):
+            at = datetime.fromisoformat(str(r[0]["sent_at"]).replace("Z", "+00:00"))
+            if (datetime.now(timezone.utc) - at).total_seconds() > 900:
+                _brief_unclaim(kind, day)
+                supabase.table("telegram_sent_log").insert({"kind": f"lock:{kind}", "ref_date": day}).execute()
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _brief_unclaim(kind: str, day: str):
+    try:
+        supabase.table("telegram_sent_log").delete().eq("kind", f"lock:{kind}").eq("ref_date", day).execute()
+    except Exception:
+        pass
+
+
 def _run_telegram_briefs():
     """daily_jobs_worker가 5분마다 부름 — 정해진 시각이 지났고 아직 안 보낸 브리핑만 보냄"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -7375,11 +7404,20 @@ def _run_telegram_briefs():
             # 기준 날짜를 먼저 정해서 이미 보냈는지 확인 (모닝·목표가는 내용 날짜, 나머지는 오늘)
             if kind in ("flow", "theme", "schedule", "theme_am", "rally", "news_11", "news_15", "news_2020", "ir_16", "ir_2010", "closing") and _brief_already_sent(kind, now.strftime("%Y-%m-%d")):
                 continue
-            text, ref = BRIEF_BUILDERS[kind]()
+            today = now.strftime("%Y-%m-%d")
+            if not _brief_claim(kind, today):
+                continue  # 다른 쪽에서 지금 만들고 있거나 이미 보냄
+            try:
+                text, ref = BRIEF_BUILDERS[kind]()
+            except Exception:
+                _brief_unclaim(kind, today)
+                raise
             if not text or not ref or _brief_already_sent(kind, ref):
+                _brief_unclaim(kind, today)  # 보낼 게 없으면 표시를 풀어 다음 주기에 다시 (모닝 데이터 늦을 때 등)
                 continue
             if send_brief(kind, text):
                 _mark_brief_sent(kind, ref)
+                _mark_brief_sent(f"done:{kind}", today)  # 오늘 보냄 표시 (잠금 정리용 — 모닝처럼 기준 날짜가 다른 브리핑도)
                 print(f"[brief] {kind} 발송 완료 ({ref})")
                 if kind == "morning" and _flash_state.get("morning_keys"):
                     used = set(_flash_state.pop("morning_keys"))
@@ -7387,6 +7425,7 @@ def _run_telegram_briefs():
                         _flash_mark(k)
                     _flash_state["pending"] = [i for i in _flash_state.get("pending", []) if i["key"] not in used]
             else:
+                _brief_unclaim(kind, today)
                 print(f"[brief] {kind} 텔레그램 발송 실패 — 다음 주기에 다시 시도")
         except Exception as e:
             print(f"[brief] {kind} 만들기 실패: {e}")
