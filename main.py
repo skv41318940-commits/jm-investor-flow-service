@@ -2760,6 +2760,9 @@ async def _daily_jobs_worker():
         ("new_highs", _save_new_highs_snapshot, ()),
         ("report_digest", _run_report_digest, ()),
         ("fut_close", _save_futures_close, ()),
+        ("theme_map", _run_theme_map_job, ()),
+        ("krx_map", _run_krx_map_job, ()),
+        ("new_listing", _run_new_listing_job, ()),
         ("target_reach", _check_target_reach, ()),
         ("earnings_disclosure", _check_earnings_disclosures, ()),
     ]
@@ -5093,6 +5096,9 @@ def send_brief(kind: str, text: str) -> bool:
     ok = send_telegram(format_brief(kind, text, strip_site_links=True), tok, chat) if tok else send_telegram(format_brief(kind, text))
     if ok:
         _digest_add(kind, text)
+    # 🚀 09:30 상승 랭킹은 매매용 → JM 전용에도 (사이트 링크 그대로, 바로 눌러서 분봉 확인) (2026-10-28)
+    if kind in ("rally",) and tok:
+        send_telegram(format_brief(kind, text))
     return ok
 
 
@@ -10515,45 +10521,76 @@ def minute_calib_post(payload: dict):
 _theme_map_cache = {"at": 0.0, "data": None}
 
 
+def _theme_map_build(top: int = 14) -> dict:
+    """테마 30개를 동시에(8개씩) 훑어서 지도 데이터 만들기 — 예전엔 하나씩 40개를 훑어 너무 오래 걸려 '서버 연결 실패'가 났음 (2026-10-28)"""
+    import concurrent.futures as cf
+    themes = [t for t in fetch_naver_theme_list(limit=30) if not THEME_SKIP_NAMES.search(t["theme_name"])]
+
+    def one(t):
+        try:
+            stocks, _ = fetch_naver_theme_detail(t["theme_no"], limit=30)
+        except Exception:
+            return None
+        items = []
+        for x in stocks:
+            eok = _to_eok_from_naver(x["trading_value"], x.get("price", 0), x.get("volume", 0))
+            if eok >= 10:
+                items.append({"name": x["stock_name"], "code": x["stock_code"], "pct": round(x["change_pct"], 2), "eok": round(eok, 1)})
+        if not items:
+            return None
+        up_money = sum(i["eok"] for i in items if i["pct"] > 0)
+        return {"theme": t["theme_name"], "pct": round(t["change_pct"], 2), "money": round(sum(i["eok"] for i in items), 1),
+                "score": up_money * (1 + max(0, t["change_pct"]) / 10), "stocks": sorted(items, key=lambda i: -i["eok"])[:10]}
+
+    with cf.ThreadPoolExecutor(max_workers=8) as ex:
+        out = [r for r in ex.map(one, themes) if r]
+    out.sort(key=lambda x: -x["score"])
+    picked, used = [], set()
+    for th in out:  # 같은 종목은 한 테마에만 (돈이 가장 많이 몰린 테마 쪽으로)
+        th["stocks"] = [i for i in th["stocks"] if i["code"] not in used]
+        if th["stocks"]:
+            used.update(i["code"] for i in th["stocks"])
+            picked.append(th)
+        if len(picked) >= top:
+            break
+    return {"ok": True, "at": now_kst().strftime("%H:%M"), "themes": picked, "note": "KRX 기준(넥스트레이드 제외) · 3분마다 갱신"}
+
+
+_theme_map_lock = threading.Lock()
+
+
+def _theme_map_refresh():
+    if not _theme_map_lock.acquire(blocking=False):
+        return  # 이미 만드는 중
+    try:
+        data = _theme_map_build()
+        if data["themes"]:
+            _theme_map_cache.update({"at": time.time(), "data": data})
+    except Exception as e:
+        print(f"[theme_map] 갱신 실패: {e}")
+    finally:
+        _theme_map_lock.release()
+
+
+def _run_theme_map_job():
+    """장중(08:58~15:40) 3분마다 서버가 미리 만들어 둠 → 화면은 바로 뜸"""
+    now = now_kst()
+    if now.weekday() >= 5 or not ((8, 58) <= (now.hour, now.minute) <= (15, 40)):
+        return
+    if time.time() - _theme_map_cache["at"] >= 170:
+        _theme_map_refresh()
+
+
 @app.get("/api/theme-map")
 def theme_map_endpoint(top: int = 14, refresh: bool = False):
     c = _theme_map_cache
-    if not refresh and c["data"] and time.time() - c["at"] < 180:
+    if c["data"] and not refresh:
+        if time.time() - c["at"] >= 180:
+            threading.Thread(target=_theme_map_refresh, daemon=True).start()  # 오래된 건 일단 보여주고 뒤에서 새로
         return c["data"]
     try:
-        themes = fetch_naver_theme_list(limit=40)
-        out, used = [], set()
-        for t in themes:
-            if THEME_SKIP_NAMES.search(t["theme_name"]):
-                continue
-            try:
-                stocks, _ = fetch_naver_theme_detail(t["theme_no"], limit=30)
-            except Exception:
-                continue
-            items = []
-            for x in stocks:
-                eok = _to_eok_from_naver(x["trading_value"], x.get("price", 0), x.get("volume", 0))
-                if eok >= 10 and x["stock_code"] not in used:
-                    items.append({"name": x["stock_name"], "code": x["stock_code"], "pct": round(x["change_pct"], 2), "eok": round(eok, 1)})
-            if not items:
-                continue
-            money = sum(i["eok"] for i in items)
-            up_money = sum(i["eok"] for i in items if i["pct"] > 0)
-            out.append({"theme": t["theme_name"], "pct": round(t["change_pct"], 2), "money": round(money, 1),
-                        "score": up_money * (1 + max(0, t["change_pct"]) / 10), "stocks": sorted(items, key=lambda i: -i["eok"])[:10]})
-            time.sleep(0.05)
-        out.sort(key=lambda x: -x["score"])
-        picked = []
-        for th in out:  # 같은 종목은 한 테마에만 (돈이 가장 많이 몰린 테마 쪽으로)
-            th["stocks"] = [i for i in th["stocks"] if i["code"] not in used]
-            if th["stocks"]:
-                used.update(i["code"] for i in th["stocks"])
-                picked.append(th)
-            if len(picked) >= top:
-                break
-        data = {"ok": True, "at": now_kst().strftime("%H:%M"), "themes": picked, "note": "KRX 기준(넥스트레이드 제외) · 3분마다 갱신"}
-        c.update({"at": time.time(), "data": data})
-        return data
+        _theme_map_refresh()
+        return c["data"] or {"ok": False, "error": "테마 데이터를 아직 못 만들었어요 (잠시 후 다시)"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -10880,6 +10917,151 @@ def macro_quotes_endpoint(symbols: str):
         except Exception as e:
             out.append({"symbol": sym, "ok": False, "error": str(e)})
     return {"ok": True, "quotes": out}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 🏭 KRX 업종 시장 지도 — 네이버 테마 대신 거래소(KRX) 업종 분류로 (네이버는 자주 바뀌어서) (2026-10-28)
+#   묶음 = KRX 업종, 크기 = 오늘 거래대금, 색 = 등락률. 장중엔 3분마다 서버가 미리 만들어 둠
+# ══════════════════════════════════════════════════════════════════════════
+_krx_map_cache = {"at": 0.0, "data": None}
+_krx_map_lock = threading.Lock()
+
+
+def _krx_sector_map_build(top: int = 14) -> dict:
+    if stock is None:
+        raise RuntimeError("pykrx 없음")
+    day = now_kst().strftime("%Y%m%d")
+    ohlcv = _krx_df(stock.get_market_ohlcv, day, market="ALL")
+    if ohlcv is None or ohlcv.empty or float(ohlcv.get("거래대금", ohlcv.iloc[:, 0]).sum() or 0) == 0:
+        day = _latest_trading_day()
+        ohlcv = _krx_df(stock.get_market_ohlcv, day, market="ALL")
+    sect = {}
+    for mk in ("KOSPI", "KOSDAQ"):
+        try:
+            df = _krx_df(stock.get_market_sector_classifications, day, mk)
+            for code, row in df.iterrows():
+                sect[code] = (str(row.get("업종명") or "기타"), str(row.get("종목명") or code))
+        except Exception as e:
+            print(f"[krx_map] {mk} 업종 분류 실패: {e}")
+    groups = {}
+    for code, row in ohlcv.iterrows():
+        if code not in sect:
+            continue  # ETF·ETN·스팩 등 업종 분류 없는 건 빼기
+        ind, name = sect[code]
+        eok = float(row.get("거래대금") or 0) / 1e8
+        if eok < 10:
+            continue
+        g = groups.setdefault(ind, {"theme": ind, "stocks": [], "money": 0.0, "up": 0.0})
+        pct = float(row.get("등락률") or 0)
+        g["stocks"].append({"name": name, "code": code, "pct": round(pct, 2), "eok": round(eok, 1)})
+        g["money"] += eok
+        if pct > 0:
+            g["up"] += eok
+    out = []
+    for g in groups.values():
+        st = sorted(g["stocks"], key=lambda x: -x["eok"])
+        tot = sum(x["eok"] for x in st) or 1
+        g["pct"] = round(sum(x["pct"] * x["eok"] for x in st) / tot, 2)  # 거래대금 가중 평균 등락률
+        g["stocks"] = st[:10]
+        g["money"] = round(g["money"], 1)
+        out.append(g)
+    out.sort(key=lambda g: -g["money"])
+    for g in out:
+        g.pop("up", None)
+    return {"ok": True, "at": now_kst().strftime("%H:%M"), "date": f"{day[:4]}-{day[4:6]}-{day[6:]}", "source": "KRX",
+            "themes": out[:top], "note": "KRX 업종 기준 · 크기 = 거래대금 · 3분마다 갱신"}
+
+
+def _krx_map_refresh():
+    if not _krx_map_lock.acquire(blocking=False):
+        return
+    try:
+        d = _krx_sector_map_build()
+        if d["themes"]:
+            _krx_map_cache.update({"at": time.time(), "data": d})
+    except Exception as e:
+        print(f"[krx_map] 갱신 실패: {e}")
+    finally:
+        _krx_map_lock.release()
+
+
+def _run_krx_map_job():
+    now = now_kst()
+    if now.weekday() >= 5 or not ((8, 58) <= (now.hour, now.minute) <= (15, 40)):
+        return
+    if time.time() - _krx_map_cache["at"] >= 170:
+        _krx_map_refresh()
+
+
+@app.get("/api/krx-sector-map")
+def krx_sector_map_endpoint(refresh: bool = False):
+    c = _krx_map_cache
+    if c["data"] and not refresh:
+        if time.time() - c["at"] >= 180:
+            threading.Thread(target=_krx_map_refresh, daemon=True).start()
+        return c["data"]
+    _krx_map_refresh()
+    return c["data"] or {"ok": False, "error": "KRX 업종 지도를 아직 못 만들었어요 (잠시 후 다시)"}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 🆕 신규상장·검색 안 되는 종목 찾기 — 상장 당일엔 KRX 전체 목록(16시 갱신)에 아직 없어서 검색이 안 됐음
+#   (예: 멜콘). 네이버 종목 자동완성으로 코드를 찾아 검색 목록(stock_fundamentals)에 바로 넣음 (2026-10-28)
+# ══════════════════════════════════════════════════════════════════════════
+def _lookup_stock_code(q: str) -> list:
+    res = requests.get("https://ac.stock.naver.com/ac", params={"q": q, "target": "stock"},
+                       headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+    items = (res.json() or {}).get("items") or []
+    out = []
+    for it in items:
+        code, name = str(it.get("code") or ""), it.get("name") or ""
+        nation = str(it.get("nationCode") or it.get("nation") or "KOR")
+        if re.fullmatch(r"[0-9][0-9A-Z]{5}", code) and "KOR" in nation.upper():
+            out.append({"code": code, "name": name})
+    return out[:8]
+
+
+def _add_to_search(rows: list):
+    now = now_kst().isoformat()
+    for r in rows:
+        try:
+            ex = supabase.table("stock_fundamentals").select("code").eq("code", r["code"]).limit(1).execute().data
+            if not ex:
+                supabase.table("stock_fundamentals").upsert({"code": r["code"], "name": r["name"], "synced_at": now}).execute()
+        except Exception as e:
+            print(f"[lookup] 검색 목록 추가 실패 {r}: {e}")
+
+
+@app.get("/api/stock-lookup")
+def stock_lookup_endpoint(q: str):
+    """종목 검색에서 못 찾으면 화면이 이 주소로 물어봄 → 찾으면 검색 목록에도 넣어둠"""
+    try:
+        rows = _lookup_stock_code(q.strip())
+        _add_to_search(rows)
+        return {"ok": True, "items": rows}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "items": []}
+
+
+def _run_new_listing_job():
+    """평일 08:20~08:50 — 오늘·이번 주 신규상장 종목을 미리 검색 목록에 넣어 둠 (종목분석 바로 가능하게)"""
+    now = now_kst()
+    if now.weekday() >= 5 or not ((8, 20) <= (now.hour, now.minute) <= (8, 50)):
+        return
+    key = now.strftime("%Y-%m-%d")
+    if _brief_already_sent("job_new_listing", key):
+        return
+    try:
+        lo, hi = (now - timedelta(days=10)).strftime("%Y-%m-%d"), (now + timedelta(days=7)).strftime("%Y-%m-%d")
+        for x in fetch_kr_ipo_listings():
+            if lo <= x["date"] <= hi:
+                hits = _lookup_stock_code(x["name"])
+                exact = [h for h in hits if h["name"].replace(" ", "") == x["name"].replace(" ", "")] or hits[:1]
+                _add_to_search(exact)
+                time.sleep(0.2)
+        _mark_brief_sent("job_new_listing", key)
+    except Exception as e:
+        print(f"[new_listing] 실패: {e}")
 
 
 @app.get("/api/ping")
