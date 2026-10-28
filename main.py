@@ -11334,9 +11334,9 @@ def _crab_scan() -> dict:
         return None
 
     with cf.ThreadPoolExecutor(max_workers=2) as ex:  # 후보 2개씩 (분봉은 한 종목에 여러 번 물어봐서 많이 겹치면 한투가 막음)
-        big_ok = [r for r in ex.map(fg, sorted(big, key=lambda x: -x["value_eok"])[:40]) if r]
+        big_ok = [r for r in ex.map(fg, sorted(big, key=lambda x: -x["value_eok"])[:100]) if r]
     print(f"[crab] 큰 꽃게 후보 {len(big)}개 → 5분봉 통과 {len(big_ok)}개")
-    small = sorted(small, key=lambda x: -x["value_eok"])[:60]
+    small = sorted(small, key=lambda x: -x["value_eok"])[:300]  # HTS는 100개 한계 — 우리는 다 보여줌 (안전상 300개까지)
     big_ok = sorted(big_ok, key=lambda x: -x["value_eok"])
     # 정석 위치(볼린저 300)는 종목마다 긴 일봉이 필요해서 거래대금 상위 25개만 (나머지는 "—") — 너무 오래 걸려 결과가 안 나오던 문제 (2026-10-28)
     targets = {r["code"]: r for r in (big_ok + small[:15])}
