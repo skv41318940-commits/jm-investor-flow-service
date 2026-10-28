@@ -2763,6 +2763,7 @@ async def _daily_jobs_worker():
         ("theme_map", _run_theme_map_job, ()),
         ("krx_map", _run_krx_map_job, ()),
         ("new_listing", _run_new_listing_job, ()),
+        ("crab", _run_crab_job, ()),
         ("target_reach", _check_target_reach, ()),
         ("earnings_disclosure", _check_earnings_disclosures, ()),
     ]
@@ -11121,6 +11122,220 @@ def _run_new_listing_job():
         _mark_brief_sent("job_new_listing", key)
     except Exception as e:
         print(f"[new_listing] 실패: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 🦀 꽃게 검색기 (2026-10-28 JM HTS 조건식 그대로) — 작은 꽃게 / 큰 꽃게
+#   대상: 전체(KRX) · 제외: 관리·우선주·증거금100%·거래정지·환기·정리매매·불성실공시·단기과열·ETF·ETN·스팩
+#   작은 꽃게 = B and C and D and E
+#   큰 꽃게   = A and B and C and D and E and F and G
+#   A [일] 1봉전 26봉 이내 전일종가대비 종가 +15% 이상 1회 이상
+#   B [일] 0봉전 5봉 이내 거래대금 ≥ CRAB_B_MIN_EOK (HTS 값 확인 필요)
+#   C [일] 종가 > 5이평           D [일] 1봉전 고가 < 0봉전 종가        E [일] 시가 < 종가 (양봉)
+#   F [5분] 1봉전 5봉 평균거래량 ≥ 50,000     G [5분] 0봉전 거래량 ≥ 1봉전 거래량 × 150%
+#   ※ 하루치 기준(전일 고가·5이평 재료·26일 +15%·5일 거래대금)은 아침에 한 번 만들고, 장중엔 3분마다 오늘 시세로 판정
+# ══════════════════════════════════════════════════════════════════════════
+CRAB_B_MIN_EOK = 50.0  # HTS 조건 B: 5봉 이내 거래대금 5,000(백만원) = 50억 이상 1회 이상 (2026-10-28 확인)
+CRAB_SKIP_NAME = re.compile(r"스팩|SPAC|ETN|우$|우B$|우C$|\(전환\)|^(KODEX|TIGER|RISE|KBSTAR|ACE|SOL|HANARO|KOSEF|ARIRANG|PLUS|TIMEFOLIO|KIWOOM|KoAct|WON|BNK|UNICORN|TREX|FOCUS|마이티|파워|히어로즈|에셋플러스|VITA|1Q|TRUSTON)\b")
+_crab_base = {"day": None, "data": None}
+_crab_cache = {"at": 0.0, "data": None}
+_crab_lock = threading.Lock()
+_crab_bb = {}  # code → (day, bb300_upper)
+
+
+def _crab_build_base() -> dict:
+    """오늘 판정에 쓸 하루치 기준 — 최근 거래일 30일치 전종목 일봉 (KRX)"""
+    today = now_kst().strftime("%Y-%m-%d")
+    if _crab_base["day"] == today and _crab_base["data"]:
+        return _crab_base["data"]
+    days, d = [], now_kst() - timedelta(days=1)
+    while len(days) < 27 and d > now_kst() - timedelta(days=60):
+        if d.weekday() < 5:
+            days.append(d.strftime("%Y%m%d"))
+        d -= timedelta(days=1)
+    hist = {}  # code → list of (date, open, high, close, value_eok) 최신→과거
+    names = {}
+    for ymd in days:
+        try:
+            df = _krx_df(stock.get_market_ohlcv, ymd, market="ALL")
+        except Exception:
+            continue
+        if df is None or df.empty or float(df["종가"].sum()) == 0:
+            continue  # 휴장일
+        for code, r in df.iterrows():
+            hist.setdefault(code, []).append((ymd, float(r["시가"]), float(r["고가"]), float(r["종가"]), float(r.get("거래대금", 0)) / 1e8,
+                                              float(r.get("등락률", 0))))
+    try:
+        for mk in ("KOSPI", "KOSDAQ"):
+            for code in stock.get_market_ticker_list(market=mk):
+                names[code] = stock.get_market_ticker_name(code)
+    except Exception:
+        pass
+    base = {}
+    for code, h in hist.items():
+        if len(h) < 5:
+            continue
+        name = names.get(code) or ""
+        if name and CRAB_SKIP_NAME.search(name):
+            continue
+        prev = h[0]  # 1봉전(어제)
+        closes4 = [x[3] for x in h[:4]]  # 5이평용 어제까지 4개
+        jump15 = any(x[5] >= 15 for x in h[:26])  # A: 1봉전부터 26봉 이내 +15% 이상
+        val4 = max([x[4] for x in h[:4]] or [0])  # B: 어제까지 4일 거래대금 최대 (오늘 것과 합쳐 5봉)
+        base[code] = {"name": name, "prev_high": prev[2], "prev_close": prev[3], "closes4": closes4, "jump15": jump15, "val4": val4}
+    _crab_base.update({"day": today, "data": base})
+    return base
+
+
+def _crab_bb300(code: str):
+    """볼린저 300 상단 (차트의 정석 위치용) — 종목당 하루 한 번"""
+    today = now_kst().strftime("%Y-%m-%d")
+    c = _crab_bb.get(code)
+    if c and c[0] == today:
+        return c[1]
+    try:
+        st = (now_kst() - timedelta(days=480)).strftime("%Y%m%d")
+        df = _krx_df(stock.get_market_ohlcv, st, now_kst().strftime("%Y%m%d"), code)
+        cl = [float(x) for x in df["종가"].tolist()][-300:]
+        if len(cl) < 120:
+            _crab_bb[code] = (today, None)
+            return None
+        m = sum(cl) / len(cl)
+        sd = (sum((x - m) ** 2 for x in cl) / len(cl)) ** 0.5
+        up = m + 2 * sd
+        _crab_bb[code] = (today, up)
+        return up
+    except Exception:
+        return None
+
+
+def _crab_position(price: float, ma5: float, bb: float) -> str:
+    """차트의 정석 위치 (간이) — 볼린저 300 상단 · 5이평 기준"""
+    if bb is None:
+        return "—"
+    gap = (price / bb - 1) * 100
+    if gap >= 0:
+        return "1번 돌파" if gap < 5 else "3번 진행"
+    if gap > -5:
+        return "1번 직전" if price >= ma5 else "2번 눌림"
+    return "볼린저 아래"
+
+
+def _crab_scan() -> dict:
+    base = _crab_build_base()
+    now = now_kst()
+    snap = _krx_df(stock.get_market_ohlcv, now.strftime("%Y%m%d"), market="ALL")
+    if snap is None or snap.empty or float(snap["종가"].sum()) == 0:
+        return {"ok": False, "error": "오늘 시세가 아직 없어요 (장 시작 전·휴장)"}
+    small, big = [], []
+    for code, r in snap.iterrows():
+        b = base.get(code)
+        if not b:
+            continue
+        o, c, v = float(r["시가"]), float(r["종가"]), float(r.get("거래대금", 0)) / 1e8
+        vol = float(r.get("거래량", 0))
+        if o <= 0 or c <= 0:
+            continue
+        ma5 = (sum(b["closes4"]) + c) / 5
+        B = max(b["val4"], v) >= CRAB_B_MIN_EOK
+        C = c > ma5
+        D = c > b["prev_high"]
+        E = c > o
+        if not (B and C and D and E):
+            continue
+        row = {"code": code, "name": b["name"] or code, "price": c, "pct": round((c / b["prev_close"] - 1) * 100, 2) if b["prev_close"] else 0,
+               "value_eok": round(v, 1), "volume": int(vol), "ma5": ma5}
+        small.append(row)
+        if b["jump15"]:
+            big.append(row)
+    # 큰 꽃게 F·G (5분봉) — 후보만 확인
+    big_ok = []
+    for row in sorted(big, key=lambda x: -x["value_eok"])[:40]:
+        try:
+            candles, *_ = fetch_minute_candles_paginated(row["code"], "J", "09:00")
+            bars5 = {}
+            for cd in candles:
+                hh, mm = int(cd["time"][:2]), int(cd["time"][3:5])
+                k = hh * 60 + (mm // 5) * 5
+                bars5[k] = bars5.get(k, 0) + float(cd.get("volume", 0))
+            vols = [bars5[k] for k in sorted(bars5)]
+            if len(vols) >= 6:
+                prev5 = vols[-6:-1]
+                F = sum(prev5) / 5 >= 50000
+                G = vols[-1] >= vols[-2] * 1.5 if vols[-2] > 0 else False
+                if F and G:
+                    big_ok.append(row)
+        except Exception:
+            pass
+        time.sleep(0.05)
+    for lst in (small, big_ok):
+        for row in lst[:60]:
+            row["position"] = _crab_position(row["price"], row["ma5"], _crab_bb300(row["code"]))
+            row.pop("ma5", None)
+    small = sorted(small, key=lambda x: -x["value_eok"])[:60]
+    big_ok = sorted(big_ok, key=lambda x: -x["value_eok"])
+    for row in small + big_ok:
+        row.pop("ma5", None)
+    return {"ok": True, "at": now.strftime("%H:%M"), "small": small, "big": big_ok,
+            "note": f"KRX 기준 · 3분마다 · 거래대금 5봉 이내 {CRAB_B_MIN_EOK:.0f}억↑"}
+
+
+def _crab_refresh():
+    if not _crab_lock.acquire(blocking=False):
+        return
+    try:
+        d = _crab_scan()
+        if d.get("ok"):
+            _crab_cache.update({"at": time.time(), "data": d})
+    except Exception as e:
+        print(f"[crab] 검색 실패: {e}")
+    finally:
+        _crab_lock.release()
+
+
+def _run_crab_job():
+    now = now_kst()
+    if now.weekday() >= 5:
+        return
+    if (8, 30) <= (now.hour, now.minute) < (9, 0) and _crab_base["day"] != now.strftime("%Y-%m-%d"):
+        try:
+            _crab_build_base()  # 장 전에 하루치 기준 미리
+        except Exception as e:
+            print(f"[crab] 기준 만들기 실패: {e}")
+    if (9, 2) <= (now.hour, now.minute) <= (15, 35) and time.time() - _crab_cache["at"] >= 170:
+        _crab_refresh()
+
+
+@app.get("/api/crab-screener")
+def crab_screener_endpoint(refresh: bool = False):
+    c = _crab_cache
+    if c["data"] and not refresh:
+        if time.time() - c["at"] >= 180:
+            threading.Thread(target=_crab_refresh, daemon=True).start()
+        return c["data"]
+    if _crab_lock.locked():
+        for _ in range(60):  # 다른 쪽에서 만드는 중이면 최대 60초 기다림
+            time.sleep(1)
+            if c["data"]:
+                return c["data"]
+    _crab_refresh()
+    return c["data"] or {"ok": False, "error": "검색 결과를 아직 못 만들었어요 (잠시 후 다시)"}
+
+
+@app.post("/api/watchlist-add")
+def watchlist_add_endpoint(payload: dict):
+    """☆ 별표 → 관심종목 추가 (이미 있으면 그대로)"""
+    try:
+        code, name = payload.get("code"), payload.get("name")
+        if not code:
+            return {"ok": False, "error": "종목코드 없음"}
+        ex = supabase.table("watchlist").select("id").eq("code", code).limit(1).execute().data
+        if ex:
+            return {"ok": True, "added": False}
+        supabase.table("watchlist").insert({"code": code, "name": name or code, "horizon": "short"}).execute()
+        return {"ok": True, "added": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/api/ping")
