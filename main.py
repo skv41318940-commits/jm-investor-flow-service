@@ -10500,6 +10500,39 @@ def new_highs_endpoint(raw: bool = False):
         return {"ok": False, "error": str(e)}
 
 
+_minute_mem: dict = {}
+
+
+def _minute_day_cached(code: str, day: str) -> dict:
+    """⚡ 지난 날짜 1분봉은 한 번 받으면 보관 (메모리 → DB → 한투 순서). 오늘은 장중에 바뀌니 짧게만 (2026-10-28)
+    — 분봉 화면이 느리던 가장 큰 이유가 매번 날짜마다 한투에 여러 번씩 물어보던 것"""
+    key = (code, day)
+    today = now_kst().strftime("%Y-%m-%d")
+    hit = _minute_mem.get(key)
+    if hit and (day < today or time.time() - hit[0] < 60):
+        return hit[1]
+    if day < today:
+        try:
+            r = supabase.table("minute_candles_cache").select("candles").eq("code", code).eq("day", day).limit(1).execute().data
+            if r and r[0]["candles"]:
+                out = {"ok": True, "candles": r[0]["candles"], "cached": True}
+                _minute_mem[key] = (time.time(), out)
+                return out
+        except Exception:
+            pass
+    out = stock_minute_by_date_endpoint(code, day)
+    if out.get("ok") and out.get("candles"):
+        _minute_mem[key] = (time.time(), out)
+        if day < today and len(out["candles"]) >= 300:  # 하루치가 다 찼을 때만 보관
+            try:
+                supabase.table("minute_candles_cache").upsert({"code": code, "day": day, "candles": out["candles"]}).execute()
+            except Exception:
+                pass
+    if len(_minute_mem) > 3000:
+        _minute_mem.clear()
+    return out
+
+
 @app.get("/api/stock-minute-multi")
 def stock_minute_multi_endpoint(code: str, days: int = 5, end: str = "", start: str = ""):
     """여러 날 1분봉 — start~end(YYYY-MM-DD, end 비우면 오늘) 또는 end까지 최근 N거래일. 최대 10거래일 (2026-10-26)"""
@@ -10519,11 +10552,14 @@ def stock_minute_multi_endpoint(code: str, days: int = 5, end: str = "", start: 
                 dates.append(d)
             d -= timedelta(days=1)
         dates.reverse()
+    import concurrent.futures as cf
+    days = [d.strftime("%Y-%m-%d") for d in dates]
+    with cf.ThreadPoolExecutor(max_workers=4) as ex:  # 날짜별로 동시에 (한투 초당 제한 안쪽)
+        results = list(ex.map(lambda dd: _minute_day_cached(code, dd), days))
     out = []
-    for d in dates:
-        r = stock_minute_by_date_endpoint(code, d.strftime("%Y-%m-%d"))
+    for dd, r in zip(days, results):
         if r.get("ok") and r.get("candles"):
-            out.append({"date": d.strftime("%Y-%m-%d"), "candles": r["candles"]})
+            out.append({"date": dd, "candles": r["candles"]})
     return {"ok": bool(out), "code": code, "days": out, "error": None if out else "분봉 데이터가 없어요 (휴장일이거나 너무 오래된 날짜)"}
 
 
