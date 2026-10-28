@@ -11189,22 +11189,41 @@ def _crab_build_base() -> dict:
         if d.weekday() < 5:
             days.append(d.strftime("%Y%m%d"))
         d -= timedelta(days=1)
-    hist = {}  # code → list of (date, open, high, close, value_eok) 최신→과거
-    names = {}
-    for ymd in days:
+    # 장 전에 만들어 DB에 둔 게 있으면 그걸 씀 (서버가 재시작돼도 다시 안 만듦)
+    try:
+        r = supabase.table("brief_cache").select("data").eq("key", "crab_base").limit(1).execute().data
+        if r and r[0]["data"].get("day") == today and r[0]["data"].get("base"):
+            _crab_base.update({"day": today, "data": r[0]["data"]["base"]})
+            return _crab_base["data"]
+    except Exception:
+        pass
+    import concurrent.futures as cf
+
+    def get_day(ymd):
         try:
-            df = _krx_df(stock.get_market_ohlcv, ymd, market="ALL")
+            return ymd, _krx_df(stock.get_market_ohlcv, ymd, market="ALL")
         except Exception:
-            continue
+            return ymd, None
+
+    with cf.ThreadPoolExecutor(max_workers=4) as ex:  # 날짜별로 동시에 — 예전엔 하나씩 27번
+        got = dict(ex.map(get_day, days))
+    hist = {}  # code → list of (date, open, high, close, value_eok, pct) 최신→과거
+    for ymd in days:
+        df = got.get(ymd)
         if df is None or df.empty or float(df["종가"].sum()) == 0:
             continue  # 휴장일
         for code, r in df.iterrows():
             hist.setdefault(code, []).append((ymd, float(r["시가"]), float(r["고가"]), float(r["종가"]), float(r.get("거래대금", 0)) / 1e8,
                                               float(r.get("등락률", 0))))
+    # 종목 이름은 DB(검색 목록)에서 한 번에 — 예전엔 종목마다 KRX에 물어봐서(2,700번) 아주 느렸음
+    names = {}
     try:
-        for mk in ("KOSPI", "KOSDAQ"):
-            for code in stock.get_market_ticker_list(market=mk):
-                names[code] = stock.get_market_ticker_name(code)
+        for start in range(0, 6000, 1000):
+            rows = supabase.table("stock_fundamentals").select("code,name").range(start, start + 999).execute().data or []
+            for x in rows:
+                names[x["code"]] = x["name"]
+            if len(rows) < 1000:
+                break
     except Exception:
         pass
     base = {}
@@ -11220,6 +11239,10 @@ def _crab_build_base() -> dict:
         val4 = max([x[4] for x in h[:4]] or [0])  # B: 어제까지 4일 거래대금 최대 (오늘 것과 합쳐 5봉)
         base[code] = {"name": name, "prev_high": prev[2], "prev_close": prev[3], "closes4": closes4, "jump15": jump15, "val4": val4}
     _crab_base.update({"day": today, "data": base})
+    try:
+        supabase.table("brief_cache").upsert({"key": "crab_base", "data": {"day": today, "base": base}, "updated_at": now_kst().isoformat()}).execute()
+    except Exception:
+        pass
     return base
 
 
@@ -11285,8 +11308,9 @@ def _crab_scan() -> dict:
         if b["jump15"]:
             big.append(row)
     # 큰 꽃게 F·G (5분봉) — 후보만 확인
-    big_ok = []
-    for row in sorted(big, key=lambda x: -x["value_eok"])[:40]:
+    import concurrent.futures as cf
+
+    def fg(row):
         try:
             candles, *_ = fetch_minute_candles_paginated(row["code"], "J", "09:00")
             bars5 = {}
@@ -11300,17 +11324,22 @@ def _crab_scan() -> dict:
                 F = sum(prev5) / 5 >= 50000
                 G = vols[-1] >= vols[-2] * 1.5 if vols[-2] > 0 else False
                 if F and G:
-                    big_ok.append(row)
+                    return row
         except Exception:
             pass
-        time.sleep(0.05)
+        return None
+
+    with cf.ThreadPoolExecutor(max_workers=5) as ex:  # 후보 5개씩 동시에
+        big_ok = [r for r in ex.map(fg, sorted(big, key=lambda x: -x["value_eok"])[:40]) if r]
     small = sorted(small, key=lambda x: -x["value_eok"])[:60]
     big_ok = sorted(big_ok, key=lambda x: -x["value_eok"])
     # 정석 위치(볼린저 300)는 종목마다 긴 일봉이 필요해서 거래대금 상위 25개만 (나머지는 "—") — 너무 오래 걸려 결과가 안 나오던 문제 (2026-10-28)
-    for lst in (big_ok, small):
-        for row in lst[:25]:
-            if "position" not in row:
-                row["position"] = _crab_position(row["price"], row["ma5"], _crab_bb300(row["code"]))
+    targets = {r["code"]: r for r in (big_ok + small[:15])}
+    with cf.ThreadPoolExecutor(max_workers=5) as ex:
+        bbs = dict(zip(targets.keys(), ex.map(_crab_bb300, targets.keys())))
+    for row in big_ok + small:
+        if row["code"] in bbs:
+            row["position"] = _crab_position(row["price"], row["ma5"], bbs[row["code"]])
     for row in small + big_ok:
         row.pop("ma5", None)
     return {"ok": True, "at": now.strftime("%H:%M"), "small": small, "big": big_ok,
