@@ -11268,26 +11268,37 @@ def _crab_scan() -> dict:
         except Exception:
             pass
         time.sleep(0.05)
-    for lst in (small, big_ok):
-        for row in lst[:60]:
-            row["position"] = _crab_position(row["price"], row["ma5"], _crab_bb300(row["code"]))
-            row.pop("ma5", None)
     small = sorted(small, key=lambda x: -x["value_eok"])[:60]
     big_ok = sorted(big_ok, key=lambda x: -x["value_eok"])
+    # 정석 위치(볼린저 300)는 종목마다 긴 일봉이 필요해서 거래대금 상위 25개만 (나머지는 "—") — 너무 오래 걸려 결과가 안 나오던 문제 (2026-10-28)
+    for lst in (big_ok, small):
+        for row in lst[:25]:
+            if "position" not in row:
+                row["position"] = _crab_position(row["price"], row["ma5"], _crab_bb300(row["code"]))
     for row in small + big_ok:
         row.pop("ma5", None)
     return {"ok": True, "at": now.strftime("%H:%M"), "small": small, "big": big_ok,
             "note": f"KRX 기준 · 3분마다 · 거래대금 5봉 이내 {CRAB_B_MIN_EOK:.0f}억↑"}
 
 
+_crab_status = {"msg": "", "at": 0.0}
+
+
 def _crab_refresh():
     if not _crab_lock.acquire(blocking=False):
         return
+    t0 = time.time()
     try:
+        _crab_status.update({"msg": "만드는 중", "at": t0})
         d = _crab_scan()
         if d.get("ok"):
             _crab_cache.update({"at": time.time(), "data": d})
+            _crab_status["msg"] = ""
+        else:
+            _crab_status["msg"] = d.get("error", "실패")
+        print(f"[crab] 검색 {'완료' if d.get('ok') else '실패'} {time.time() - t0:.0f}초 · 작은 {len(d.get('small', []))} 큰 {len(d.get('big', []))}")
     except Exception as e:
+        _crab_status["msg"] = f"오류: {e}"
         print(f"[crab] 검색 실패: {e}")
     finally:
         _crab_lock.release()
@@ -11308,18 +11319,22 @@ def _run_crab_job():
 
 @app.get("/api/crab-screener")
 def crab_screener_endpoint(refresh: bool = False):
+    """결과가 있으면 바로, 없으면 뒤에서 만들기 시작하고 '만드는 중'을 바로 돌려줌 (화면이 10초마다 다시 물어봄)"""
     c = _crab_cache
+    stale = not c["data"] or time.time() - c["at"] >= 180 or refresh
+    failed_recently = (not c["data"] and _crab_status["msg"] and _crab_status["msg"] != "만드는 중"
+                       and time.time() - _crab_status["at"] < 90)
+    if failed_recently and not _crab_lock.locked():
+        return {"ok": False, "error": f"🦀 {_crab_status['msg']}"}
+    started = False
+    if stale and not _crab_lock.locked():
+        threading.Thread(target=_crab_refresh, daemon=True).start()
+        started = True
     if c["data"] and not refresh:
-        if time.time() - c["at"] >= 180:
-            threading.Thread(target=_crab_refresh, daemon=True).start()
         return c["data"]
-    if _crab_lock.locked():
-        for _ in range(60):  # 다른 쪽에서 만드는 중이면 최대 60초 기다림
-            time.sleep(1)
-            if c["data"]:
-                return c["data"]
-    _crab_refresh()
-    return c["data"] or {"ok": False, "error": "검색 결과를 아직 못 만들었어요 (잠시 후 다시)"}
+    if _crab_lock.locked() or started:
+        return {"ok": False, "building": True, "error": "🦀 검색 중… 처음엔 1~2분 걸려요 (자동으로 다시 확인)"}
+    return {"ok": False, "error": _crab_status["msg"] or "검색 결과가 없어요"}
 
 
 @app.post("/api/watchlist-add")
