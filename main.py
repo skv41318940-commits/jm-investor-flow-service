@@ -11142,7 +11142,7 @@ def stock_lookup_endpoint(q: str):
 def _run_new_listing_job():
     """평일 08:20~08:50 — 오늘·이번 주 신규상장 종목을 미리 검색 목록에 넣어 둠 (종목분석 바로 가능하게)"""
     now = now_kst()
-    if now.weekday() >= 5 or not ((8, 20) <= (now.hour, now.minute) <= (8, 50)):
+    if now.weekday() >= 5 or not ((7, 40) <= (now.hour, now.minute) <= (8, 50)):
         return
     key = now.strftime("%Y-%m-%d")
     if _brief_already_sent("job_new_listing", key):
@@ -11347,7 +11347,7 @@ def _crab_scan() -> dict:
             row["position"] = _crab_position(row["price"], row["ma5"], bbs[row["code"]])
     for row in small + big_ok:
         row.pop("ma5", None)
-    return {"ok": True, "at": now.strftime("%H:%M"), "small": small, "big": big_ok,
+    return {"ok": True, "day": now.strftime("%Y-%m-%d"), "at": now.strftime("%H:%M"), "small": small, "big": big_ok,
             "note": f"KRX 기준 · 3분마다 · 거래대금 5봉 이내 {CRAB_B_MIN_EOK:.0f}억↑"}
 
 
@@ -11378,12 +11378,12 @@ def _run_crab_job():
     now = now_kst()
     if now.weekday() >= 5:
         return
-    if (8, 30) <= (now.hour, now.minute) < (9, 0) and _crab_base["day"] != now.strftime("%Y-%m-%d"):
+    if (7, 50) <= (now.hour, now.minute) < (9, 0) and _crab_base["day"] != now.strftime("%Y-%m-%d"):  # 07:50부터 미리 (PC 원격 켜는 08:30 전에 끝나게)
         try:
             _crab_build_base()  # 장 전에 하루치 기준 미리
         except Exception as e:
             print(f"[crab] 기준 만들기 실패: {e}")
-    if (9, 2) <= (now.hour, now.minute) <= (15, 35) and time.time() - _crab_cache["at"] >= 170:
+    if (9, 0) <= (now.hour, now.minute) <= (15, 35) and time.time() - _crab_cache["at"] >= 170:  # 09:00 장 시작부터
         _crab_refresh()
 
 
@@ -11391,6 +11391,9 @@ def _run_crab_job():
 def crab_screener_endpoint(refresh: bool = False):
     """결과가 있으면 바로, 없으면 뒤에서 만들기 시작하고 '만드는 중'을 바로 돌려줌 (화면이 10초마다 다시 물어봄)"""
     c = _crab_cache
+    nowk = now_kst()
+    if c["data"] and c["data"].get("day") != nowk.strftime("%Y-%m-%d") and nowk.weekday() < 5 and (nowk.hour, nowk.minute) >= (9, 0):
+        c.update({"data": None, "at": 0.0})  # 장이 열리면 어제 결과는 지우고 오늘 것으로 (9시에 어제 종목이 보이지 않게)
     stale = not c["data"] or time.time() - c["at"] >= 180 or refresh
     failed_recently = (not c["data"] and _crab_status["msg"] and _crab_status["msg"] != "만드는 중"
                        and time.time() - _crab_status["at"] < 90)
