@@ -11177,6 +11177,7 @@ _crab_base = {"day": None, "data": None}
 _crab_cache = {"at": 0.0, "data": None}
 _crab_lock = threading.Lock()
 _crab_bb = {}  # code → (day, bb300_upper)
+_crab_seen: dict = {}  # 오늘 검색기별 처음 걸린 시각
 
 
 def _crab_build_base() -> dict:
@@ -11339,6 +11340,14 @@ def _crab_scan() -> dict:
     small = sorted(small, key=lambda x: -x["value_eok"])[:300]  # HTS는 100개 한계 — 우리는 다 보여줌 (안전상 300개까지)
     big_ok = sorted(big_ok, key=lambda x: -x["value_eok"])
     # 정석 위치(볼린저 300)는 종목마다 긴 일봉이 필요해서 거래대금 상위 25개만 (나머지는 "—") — 너무 오래 걸려 결과가 안 나오던 문제 (2026-10-28)
+    # ⏱ 편입 시각: 오늘 그 검색기에 처음 걸린 시각 (조건시간 정렬용)
+    day = now.strftime("%Y-%m-%d")
+    if _crab_seen.get("day") != day:
+        _crab_seen.clear()
+        _crab_seen.update({"day": day, "small": {}, "big": {}})
+    for key, lst in (("small", small), ("big", big_ok)):
+        for row in lst:
+            _crab_seen[key].setdefault(row["code"], now.strftime("%H:%M"))
     targets = {r["code"]: r for r in (big_ok + small[:15])}
     with cf.ThreadPoolExecutor(max_workers=5) as ex:
         bbs = dict(zip(targets.keys(), ex.map(_crab_bb300, targets.keys())))
@@ -11347,6 +11356,8 @@ def _crab_scan() -> dict:
             row["position"] = _crab_position(row["price"], row["ma5"], bbs[row["code"]])
     for row in small + big_ok:
         row.pop("ma5", None)
+    small = [{**r, "since": _crab_seen["small"].get(r["code"])} for r in small]
+    big_ok = [{**r, "since": _crab_seen["big"].get(r["code"])} for r in big_ok]
     return {"ok": True, "day": now.strftime("%Y-%m-%d"), "at": now.strftime("%H:%M"), "small": small, "big": big_ok,
             "note": f"KRX 기준 · 3분마다 · 거래대금 5봉 이내 {CRAB_B_MIN_EOK:.0f}억↑"}
 
@@ -11465,14 +11476,14 @@ def crab_pc_get():
             qq = quotes.get(x["code"]) or {}
             out.append({"code": x["code"], "name": x.get("name") or x["code"], "price": qq.get("price") or 0,
                         "pct": round(qq.get("pct") or 0, 2), "value_eok": round(qq.get("value_eok") or 0, 1), "volume": int(qq.get("volume") or 0),
-                        "position": f"편입 {x.get('since', '')}" + (f" · 이탈 {x.get('out')}" if gone and x.get("out") else ""),
+                        "position": "—", "since": x.get("since"), "out": x.get("out") if gone else None,
                         "gone": gone})
         return sorted(out, key=lambda r: -r["value_eok"])
 
     out = {"ok": True, "source": "pc", "at": str(d.get("at", ""))[11:16], "alive": alive,
            "small": rows(d.get("small", [])), "big": rows(d.get("big", [])),
            "small_removed": rows(d.get("small_removed", []), True), "big_removed": rows(d.get("big_removed", []), True),
-           "note": "🖥 HTS 조건검색 그대로 (PC 프로그램) · 정석 위치 대신 편입 시각"}
+           "note": "🖥 HTS 조건검색 그대로 (PC 프로그램)"}
     v.update({"at": time.time(), "data": out})
     return out
 
