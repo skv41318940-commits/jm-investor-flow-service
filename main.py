@@ -11172,7 +11172,7 @@ def _run_new_listing_job():
 #   ※ 하루치 기준(전일 고가·5이평 재료·26일 +15%·5일 거래대금)은 아침에 한 번 만들고, 장중엔 3분마다 오늘 시세로 판정
 # ══════════════════════════════════════════════════════════════════════════
 CRAB_B_MIN_EOK = 50.0  # HTS 조건 B: 5봉 이내 거래대금 5,000(백만원) = 50억 이상 1회 이상 (2026-10-28 확인)
-CRAB_SKIP_NAME = re.compile(r"스팩|SPAC|ETN|우$|우B$|우C$|\(전환\)|^(KODEX|TIGER|RISE|KBSTAR|ACE|SOL|HANARO|KOSEF|ARIRANG|PLUS|TIMEFOLIO|KIWOOM|KoAct|WON|BNK|UNICORN|TREX|FOCUS|마이티|파워|히어로즈|에셋플러스|VITA|1Q|TRUSTON)\b")
+CRAB_SKIP_NAME = re.compile(r"스팩|SPAC|ETN|\(전환\)|^(KODEX|TIGER|RISE|KBSTAR|ACE|SOL|HANARO|KOSEF|ARIRANG|PLUS|TIMEFOLIO|KIWOOM|KoAct|WON|BNK|UNICORN|TREX|FOCUS|마이티|파워|히어로즈|에셋플러스|VITA|1Q|TRUSTON)\b")
 _crab_base = {"day": None, "data": None}
 _crab_cache = {"at": 0.0, "data": None}
 _crab_lock = threading.Lock()
@@ -11192,7 +11192,7 @@ def _crab_build_base() -> dict:
         d -= timedelta(days=1)
     # 장 전에 만들어 DB에 둔 게 있으면 그걸 씀 (서버가 재시작돼도 다시 안 만듦)
     try:
-        r = supabase.table("brief_cache").select("data").eq("key", "crab_base").limit(1).execute().data
+        r = supabase.table("brief_cache").select("data").eq("key", "crab_base_v2").limit(1).execute().data
         if r and r[0]["data"].get("day") == today and r[0]["data"].get("base"):
             _crab_base.update({"day": today, "data": r[0]["data"]["base"]})
             return _crab_base["data"]
@@ -11227,10 +11227,21 @@ def _crab_build_base() -> dict:
                 break
     except Exception:
         pass
+    # 대상: 코스피·코스닥만 (HTS 업종 '전체'와 같게 — 코넥스 제외)
+    allowed = set()
+    try:
+        for mk in ("KOSPI", "KOSDAQ"):
+            allowed |= set(stock.get_market_ticker_list(days[0], market=mk))
+    except Exception:
+        allowed = set()
     base = {}
     for code, h in hist.items():
         if len(h) < 5:
             continue
+        if allowed and code not in allowed:
+            continue
+        if not code.endswith("0"):
+            continue  # 우선주(끝자리 5·7·9·K 등) — 이름이 아니라 종목코드로 정확하게
         name = names.get(code) or ""
         if name and CRAB_SKIP_NAME.search(name):
             continue
@@ -11241,10 +11252,43 @@ def _crab_build_base() -> dict:
         base[code] = {"name": name, "prev_high": prev[2], "prev_close": prev[3], "closes4": closes4, "jump15": jump15, "val4": val4}
     _crab_base.update({"day": today, "data": base})
     try:
-        supabase.table("brief_cache").upsert({"key": "crab_base", "data": {"day": today, "base": base}, "updated_at": now_kst().isoformat()}).execute()
+        supabase.table("brief_cache").upsert({"key": "crab_base_v2", "data": {"day": today, "base": base}, "updated_at": now_kst().isoformat()}).execute()
     except Exception:
         pass
     return base
+
+
+_crab_status_cache: dict = {}  # code → (day, ok, why)
+
+
+def _crab_status_ok(code: str):
+    """HTS 제외종목과 같게: 관리·거래정지·증거금100%·단기과열·정리매매·투자유의(환기·불성실공시 등) 빼기
+    — 한투 현재가의 종목 상태 칸으로 확인, 종목당 하루 한 번만 (2026-10-29)"""
+    today = now_kst().strftime("%Y-%m-%d")
+    c = _crab_status_cache.get(code)
+    if c and c[0] == today:
+        return c[1], c[2]
+    ok, why = True, ""
+    try:
+        o = kis_get("/uapi/domestic-stock/v1/quotations/inquire-price", "FHKST01010100",
+                    {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code}).get("output") or {}
+        stat = str(o.get("iscd_stat_cls_code") or "")
+        checks = [
+            (stat == "51" or str(o.get("mang_issu_cls_code") or "").upper() == "Y", "관리종목"),
+            (stat == "58" or str(o.get("temp_stop_yn") or "").upper() == "Y", "거래정지"),
+            (stat == "57" or float(str(o.get("marg_rate") or "0").replace(",", "") or 0) >= 100, "증거금100%"),
+            (stat == "59" or str(o.get("short_over_yn") or "").upper() == "Y", "단기과열"),
+            (str(o.get("sltr_yn") or "").upper() == "Y", "정리매매"),
+            (str(o.get("invt_caful_yn") or "").upper() == "Y", "투자유의(환기·불성실공시 등)"),
+        ]
+        for bad, label in checks:
+            if bad:
+                ok, why = False, label
+                break
+    except Exception:
+        ok, why = True, ""  # 확인 못 하면 일단 보여줌
+    _crab_status_cache[code] = (today, ok, why)
+    return ok, why
 
 
 def _crab_bb300(code: str):
@@ -11337,6 +11381,12 @@ def _crab_scan() -> dict:
     with cf.ThreadPoolExecutor(max_workers=2) as ex:  # 후보 2개씩 (분봉은 한 종목에 여러 번 물어봐서 많이 겹치면 한투가 막음)
         big_ok = [r for r in ex.map(fg, sorted(big, key=lambda x: -x["value_eok"])[:100]) if r]
     print(f"[crab] 큰 꽃게 후보 {len(big)}개 → 5분봉 통과 {len(big_ok)}개")
+    # HTS 제외종목(관리·거래정지·증거금100%·단기과열·정리매매·투자유의) 빼기 — 후보만, 종목당 하루 한 번 확인
+    import concurrent.futures as cf
+    with cf.ThreadPoolExecutor(max_workers=4) as ex:
+        st = dict(zip([r["code"] for r in small], ex.map(lambda c: _crab_status_ok(c)[0], [r["code"] for r in small])))
+    small = [r for r in small if st.get(r["code"], True)]
+    big = [r for r in big if st.get(r["code"], True)]
     small = sorted(small, key=lambda x: -x["value_eok"])[:300]  # HTS는 100개 한계 — 우리는 다 보여줌 (안전상 300개까지)
     big_ok = sorted(big_ok, key=lambda x: -x["value_eok"])
     # 정석 위치(볼린저 300)는 종목마다 긴 일봉이 필요해서 거래대금 상위 25개만 (나머지는 "—") — 너무 오래 걸려 결과가 안 나오던 문제 (2026-10-28)
