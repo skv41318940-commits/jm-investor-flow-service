@@ -2776,6 +2776,8 @@ async def _daily_jobs_worker():
         ("theme_map", _run_theme_map_job, ()),
         ("broker_pc_daily", _run_broker_pc_daily, ()),
         ("broker_pc_track", _run_broker_pc_track, ()),
+        ("pc_off_alert", _run_pc_off_alert, ()),
+        ("weekly_review", _run_weekly_review, ()),
         ("krx_map", _run_krx_map_job, ()),
         ("new_listing", _run_new_listing_job, ()),
         # ("crab", _run_crab_job, ()),  # 🦀 꽃게 검색기 잠시 끔 (2026-10-30 JM — 검색기 다시 설계 예정, KRX 부담도 줄임)
@@ -11824,6 +11826,141 @@ def broker_pc_get(code: str):
             "domestic_buy": sorted(dom, key=lambda x: -x["net"])[:5],
             "domestic_sell": sorted(dom, key=lambda x: x["net"])[:5],
             "foreign_net": sum(x["net"] for x in fr)}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 🚨 PC 꺼짐 알림 (하루 1회) — 장중 세력트래커가 5분 넘게 소식 없으면 JM 전용으로 (2026-10-30)
+#   PC는 창구 연동(3초마다)·꽃게(1분마다)로 계속 신호를 보냄 → 둘 다 끊기면 꺼진 것
+# ══════════════════════════════════════════════════════════════════════════
+_SERVER_STARTED = time.time()
+
+
+def _run_pc_off_alert():
+    now = now_kst()
+    if now.weekday() >= 5 or not ((9, 5) <= (now.hour, now.minute) <= (15, 20)):
+        return
+    if time.time() - _SERVER_STARTED < 600:
+        return  # 서버가 막 켜졌을 땐 PC 신호를 아직 못 받았을 수 있어서 10분 기다림
+    last = max(_bpc.get("alive_at", 0.0), _crab_pc.get("at", 0.0))
+    if time.time() - last < 300:
+        return
+    day = now.strftime("%Y-%m-%d")
+    if _brief_already_sent("pc_off_alert", day):
+        return
+    ago = "오늘 아직 신호 없음" if not last else f"{int((time.time() - last) / 60)}분째 신호 없음"
+    send_telegram(f"🚨 PC(세력트래커) 꺼진 것 같아요 ({ago})\n"
+                  f"🦀 꽃게 검색기 · 🏦 키움 창구별 · 💰 창구 평단이 멈춰요\n"
+                  f"→ 원격으로 PC 확인 후 세력트래커.bat 다시 실행\n(오늘은 이 알림 한 번만 보내요)")
+    _mark_brief_sent("pc_off_alert", day)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 📰 주간 정리 (금요일 22:00, JM 리포트) — 월~금 국내증시·해외증시·국내뉴스·해외뉴스 (2026-10-30)
+#   숫자는 시세에서 직접, 뉴스는 이번 주 제목 중 영향 큰 것 (AI 문장 생성 아님, 비용 0)
+# ══════════════════════════════════════════════════════════════════════════
+def _week_change(sym: str, monday: datetime):
+    """이번 주 등락: (지난주 마지막 종가 → 지금)"""
+    j = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{requests.utils.quote(sym)}",
+                     params={"range": "1mo", "interval": "1d"}, headers={"User-Agent": "Mozilla/5.0"}, timeout=10).json()
+    res = j["chart"]["result"][0]
+    ts = res.get("timestamp") or []
+    cl = res["indicators"]["quote"][0].get("close") or []
+    rows = [(datetime.fromtimestamp(t, KST).date(), c) for t, c in zip(ts, cl) if c is not None]
+    before = [c for d, c in rows if d < monday.date()]
+    last = (res.get("meta") or {}).get("regularMarketPrice") or (rows[-1][1] if rows else None)
+    if not before or not last:
+        return None, None
+    return last, (last / before[-1] - 1) * 100
+
+
+def build_weekly_review():
+    now = now_kst()
+    monday = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    friday = monday + timedelta(days=4)
+    title = f"🟥🦀【주간 정리】 {monday.month}/{monday.day}(월) ~ {friday.month}/{friday.day}(금)"
+    parts = [title, "━━━━━━━━━━━━"]
+
+    def line(label, sym, unit=""):
+        try:
+            px, ch = _week_change(sym, monday)
+            if px is None:
+                return None
+            arrow = "🔴▲" if ch > 0 else "🔵▼" if ch < 0 else "⚪"
+            return f"{label} {px:,.2f}{unit} {arrow}{abs(ch):.2f}%"
+        except Exception:
+            return None
+
+    # 🇰🇷 국내증시
+    kr = [x for x in (line("코스피", "^KS11"), line("코스닥", "^KQ11"), line("원/달러", "KRW=X", "원")) if x]
+    try:
+        for mk, nm in (("KOSPI", "코스피"), ("KOSDAQ", "코스닥")):
+            df = _krx_df(stock.get_market_trading_value_by_date, monday.strftime("%Y%m%d"), now.strftime("%Y%m%d"), mk)
+            if df is not None and not df.empty:
+                sm = df.sum()
+                f = lambda k: sm.get(k, 0) / 1e8
+                kr.append(f"{nm} 수급 · 개인 {f('개인'):+,.0f}억 · 외국인 {f('외국인합계') or f('외국인'):+,.0f}억 · 기관 {f('기관합계'):+,.0f}억")
+    except Exception as e:
+        print(f"[weekly] 수급 실패: {e}")
+    parts.append("🇰🇷 국내증시\n" + ("\n".join(f"· {x}" for x in kr) if kr else "· (데이터 없음)"))
+
+    # 🌎 해외증시 (미국은 금요일 밤 장 시작 전이라 목요일 종가까지)
+    gl = [x for x in (line("S&P500", "^GSPC"), line("나스닥", "^IXIC"), line("다우", "^DJI"), line("필라델피아반도체", "^SOX"),
+                      line("니케이", "^N225"), line("대만 가권", "^TWII"), line("홍콩 항셍", "^HSI"),
+                      line("MSCI 한국(EWY)", "EWY"), line("MSCI 신흥국(EEM)", "EEM"),
+                      line("달러인덱스", "DX-Y.NYB"), line("美 10년물", "^TNX"), line("WTI", "CL=F")) if x]
+    parts.append("🌎 해외증시 (미국은 목요일 종가까지)\n" + ("\n".join(f"· {x}" for x in gl) if gl else "· (데이터 없음)"))
+
+    # 📰 뉴스: 이번 주(최대 5일) 제목 중 영향 큰 것
+    def top_news(query, n):
+        try:
+            items = _google_news(query, hours=24 * 5)
+        except Exception:
+            return []
+        seen, out = set(), []
+        for it in sorted(items, key=_news_score, reverse=True):
+            key = re.sub(r"[^가-힣A-Za-z0-9]", "", it["title"])[:22]
+            if not it["title"] or key in seen:
+                continue
+            seen.add(key)
+            out.append(it)
+            if len(out) >= n:
+                break
+        return out
+
+    kn = top_news("코스피 OR 코스닥 OR 외국인 순매도 OR 외국인 순매수 OR 반도체 OR 금리", 6)
+    parts.append("🇰🇷 국내뉴스\n" + ("\n".join(f"· {x['title']} ({x['source']})" for x in kn) if kn else "· (없음)"))
+    wl = []
+    for label, q in NEWS_REGIONS:
+        if label.startswith("🇰🇷"):
+            continue
+        for it in top_news(q, 1):
+            wl.append(f"· {label} {it['title']} ({it['source']})")
+    parts.append("🌍 해외뉴스\n" + ("\n".join(wl) if wl else "· (없음)"))
+    parts.append("※ 숫자는 시세 기준, 뉴스는 이번 주 제목 중 영향 큰 것만 모았어요. 다음 주 일정은 월요일 장전 리포트에서.")
+    return "\n\n".join(parts), now.strftime("%Y-%m-%d")
+
+
+def _run_weekly_review():
+    now = now_kst()
+    if now.weekday() != 4 or not ((22, 0) <= (now.hour, now.minute) <= (22, 40)):
+        return
+    day = now.strftime("%Y-%m-%d")
+    if _brief_already_sent("weekly_review", day):
+        return
+    text, _ = build_weekly_review()
+    tok, chat = bot("report")
+    if send_telegram(text, tok, chat):
+        _mark_brief_sent("weekly_review", day)
+
+
+@app.get("/api/weekly-review")
+def weekly_review_endpoint(send: bool = False):
+    text, d = build_weekly_review()
+    sent = False
+    if send:
+        tok, chat = bot("report")
+        sent = send_telegram(text, tok, chat)
+    return {"ok": True, "sent": sent, "text": text}
 
 
 @app.get("/api/ping")
