@@ -11628,6 +11628,65 @@ def broker_split_endpoint(code: str):
         return {"ok": False, "error": str(e)}
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 🏦 창구(증권사)별 매매 — PC(키움 opt10038) 중계 (2026-10-30)
+#   사이트가 요청 → 서버에 줄 세움 → PC(broker_pc.py)가 3초마다 가져가서 키움으로 조회 → 결과를 올림
+# ══════════════════════════════════════════════════════════════════════════
+_bpc = {"queue": [], "results": {}, "alive_at": 0.0}
+_bpc_lock = threading.Lock()
+
+
+@app.post("/api/broker-pc/request")
+def broker_pc_request(code: str):
+    with _bpc_lock:
+        r = _bpc["results"].get(code)
+        if r and time.time() - r["got"] < 60:
+            return {"ok": True, "queued": False}  # 1분 안에 받은 게 있으면 그거 씀
+        if code not in _bpc["queue"]:
+            _bpc["queue"].append(code)
+    return {"ok": True, "queued": True, "pc_alive": time.time() - _bpc["alive_at"] < 20}
+
+
+@app.get("/api/broker-pc/next")
+def broker_pc_next():
+    with _bpc_lock:
+        _bpc["alive_at"] = time.time()  # PC가 물어보러 옴 = 살아있음
+        if _bpc["queue"]:
+            return {"code": _bpc["queue"].pop(0)}
+    return {}
+
+
+@app.post("/api/broker-pc/result")
+def broker_pc_result(payload: dict):
+    code = payload.get("code")
+    if code:
+        with _bpc_lock:
+            _bpc["results"][code] = {**payload, "got": time.time()}
+            if len(_bpc["results"]) > 300:
+                _bpc["results"].clear()
+    return {"ok": True}
+
+
+@app.get("/api/broker-pc")
+def broker_pc_get(code: str):
+    alive = time.time() - _bpc["alive_at"] < 20
+    r = _bpc["results"].get(code)
+    if not r:
+        return {"ok": False, "pc_alive": alive, "waiting": code in _bpc["queue"] or alive}
+    try:
+        price = _kis_quote(code).get("price") or 0
+    except Exception:
+        price = 0
+    rows = [{**x, "net_eok": round(x["net"] * price / 1e8, 1) if price else None} for x in r.get("rows", [])]
+    fr = [x for x in rows if x.get("foreign")]
+    dom = [x for x in rows if not x.get("foreign")]
+    return {"ok": True, "pc_alive": alive, "at": r.get("at"), "error": r.get("error"),
+            "foreign": sorted(fr, key=lambda x: -abs(x["net"])),
+            "domestic_buy": sorted(dom, key=lambda x: -x["net"])[:5],
+            "domestic_sell": sorted(dom, key=lambda x: x["net"])[:5],
+            "foreign_net": sum(x["net"] for x in fr)}
+
+
 @app.get("/api/ping")
 def ping():
     return {"ok": True}
