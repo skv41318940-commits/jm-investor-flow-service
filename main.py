@@ -12220,6 +12220,32 @@ def weekly_review_endpoint(send: bool = False):
 @app.get("/api/ping")
 def ping():
     return {"ok": True}
+def _kis_daily_candles(code: str, start: str, end: str) -> list:
+    """🛟 한투 일봉 (KRX가 막히거나 점검일 때 대신) — 100개씩 이어 받기 (2026-10-31)"""
+    s_ymd, e_ymd = start.replace("-", ""), end.replace("-", "")
+    out, cur = {}, e_ymd
+    for _ in range(12):
+        j = kis_get("/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice", "FHKST03010100",
+                    {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code, "FID_INPUT_DATE_1": s_ymd,
+                     "FID_INPUT_DATE_2": cur, "FID_PERIOD_DIV_CODE": "D", "FID_ORG_ADJ_PRC": "0"})
+        rows = [r for r in (j.get("output2") or []) if r.get("stck_bsop_date") and r.get("stck_clpr")]
+        if not rows:
+            break
+        for r in rows:
+            d = r["stck_bsop_date"]
+            if s_ymd <= d <= e_ymd:
+                out[d] = {"date": f"{d[:4]}-{d[4:6]}-{d[6:]}", "open": float(r.get("stck_oprc") or 0),
+                          "high": float(r.get("stck_hgpr") or 0), "low": float(r.get("stck_lwpr") or 0),
+                          "close": float(r["stck_clpr"]), "volume": float(r.get("acml_vol") or 0),
+                          "amount": float(r.get("acml_tr_pbmn") or 0)}
+        oldest = min(r["stck_bsop_date"] for r in rows)
+        if oldest <= s_ymd or len(rows) < 90:
+            break
+        cur = (datetime.strptime(oldest, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+        time.sleep(0.1)
+    return [out[k] for k in sorted(out)]
+
+
 @app.get("/api/stock-ohlcv")
 def stock_ohlcv_endpoint(code: str, start: str, end: str):
     """
@@ -12227,14 +12253,25 @@ def stock_ohlcv_endpoint(code: str, start: str, end: str):
     pykrx(KRX 공식 데이터)로 가져오므로 키움/한투 로그인과 무관하게 항상 정확함.
     start/end: "YYYY-MM-DD" 형식.
     """
+    def kis_fallback(why: str):
+        # 🛟 KRX가 안 되면 한투 일봉으로 (밤·주말 점검, KRX 차단 때도 일봉 세력평단이 계속 나오게) — 2026-10-31
+        try:
+            cs = _kis_daily_candles(code, start, end)
+            if cs:
+                print(f"[stock_ohlcv] {code} KRX 실패({why[:60]}) → 한투 일봉 {len(cs)}개로 대신")
+                return {"ok": True, "code": code, "candles": cs, "source": "KIS"}
+        except Exception as e2:
+            print(f"[stock_ohlcv] 한투 대신 받기도 실패: {e2}")
+        return {"ok": False, "error": why}
+
     if stock is None:
-        return {"ok": False, "error": "pykrx를 사용할 수 없습니다 (서버 기동 시 로그인에 실패했을 수 있어요, 잠시 후 다시 시도해주세요)."}
+        return kis_fallback("pykrx를 사용할 수 없습니다")
     try:
         start_ymd = start.replace("-", "")
         end_ymd = end.replace("-", "")
-        df = _krx_df(stock.get_market_ohlcv_by_date, start_ymd, end_ymd, code)
-        if df.empty:
-            return {"ok": False, "error": f"{code} 종목의 {start}~{end} 구간 일봉 데이터가 없습니다."}
+        df = _krx_df(stock.get_market_ohlcv_by_date, start_ymd, end_ymd, code, retries=1)
+        if df is None or df.empty:
+            return kis_fallback(f"{code} 종목의 {start}~{end} 구간 일봉 데이터가 없습니다.")
 
         candles = []
         for date_idx, row in df.iterrows():
@@ -12251,7 +12288,7 @@ def stock_ohlcv_endpoint(code: str, start: str, end: str):
             )
         return {"ok": True, "code": code, "candles": candles}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return kis_fallback(str(e))
 # ── 분봉 페이지네이션 ───────────────────────────────────────────────────────
 # 한투 "주식당일분봉조회"(FHKST03010200)는 한 번 호출에 최대 30개 분봉만 주고,
 # FID_INPUT_HOUR_1(HHMMSS) "이전" 시각의 분봉을 최신순으로 돌려줌. 그래서 응답에서
