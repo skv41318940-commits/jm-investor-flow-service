@@ -11796,6 +11796,7 @@ def broker_split_endpoint(code: str):
 # ══════════════════════════════════════════════════════════════════════════
 _bpc = {"queue": [], "results": {}, "alive_at": 0.0, "tracked": {}, "samples": {}, "tasks": []}
 _pc_task_results: dict = {}  # 🧪 시험·🌅 NXT 결과 (kind → 결과)
+_vp20: dict = {}  # 💰 창구별 20일 평단: code → {"day", "rows", "asked"}
 # 💰 창구 평균단가(추정) — 같은 종목 창구 데이터를 2분마다 다시 받아, 늘어난 수량 × 그때 가격으로 평균을 냄 (2026-10-30)
 #   tracked: 사이트에서 본 종목(1시간 동안 장중 자동 추적) · samples: {code: {"day", "list": [(시각, 가격, {창구: (매수, 매도)})]}}
 _bpc_lock = threading.Lock()
@@ -11803,6 +11804,15 @@ _bpc_lock = threading.Lock()
 
 @app.post("/api/broker-pc/request")
 def broker_pc_request(code: str):
+    # 💰 창구별 20일 평단은 종목당 하루 한 번만 (키움 조회가 창구 수만큼 들어서)
+    today = now_kst().strftime("%Y-%m-%d")
+    v = _vp20.get(code)
+    if not v or (v["day"] != today and time.time() - v.get("asked", 0) > 600):
+        names = [x["name"] for x in (_bpc["results"].get(code) or {}).get("rows", [])[:6]]
+        names += [x["name"] for x in (_bpc["results"].get(code) or {}).get("rows", [])[-4:]]
+        with _bpc_lock:
+            _bpc["tasks"].append({"kind": "vp20", "code": code, "names": names})
+        _vp20[code] = {"day": (v or {}).get("day", ""), "rows": (v or {}).get("rows", []), "asked": time.time()}
     with _bpc_lock:
         _bpc["tracked"][code] = time.time()  # 💰 평균단가용: 본 종목은 1시간 동안 2분마다 자동으로 다시 받음
         r = _bpc["results"].get(code)
@@ -11906,6 +11916,8 @@ def _run_broker_pc_daily():
 def pc_task_result(payload: dict):
     kind = payload.get("kind") or "unknown"
     _pc_task_results[kind] = {**payload, "got": time.time()}
+    if kind == "vp20" and payload.get("code"):
+        _vp20[payload["code"]] = {"day": now_kst().strftime("%Y-%m-%d"), "rows": payload.get("rows", []), "asked": time.time()}
     return {"ok": True}
 
 
@@ -12050,12 +12062,16 @@ def broker_pc_get(code: str):
             return None, None
         return (round(a[0] / a[1]) if a[1] else None), (round(a[2] / a[3]) if a[3] else None)
 
+    norm = lambda t: re.sub(r"\s", "", t or "")
+    v20 = {norm(x["name"]): x for x in (_vp20.get(code) or {}).get("rows", [])}
     rows = []
     for x in r.get("rows", []):
         ab, asl = avgs(x["name"])
+        w = v20.get(norm(x["name"])) or {}
         rows.append({**x, "net_eok": round(x["net"] * price / 1e8, 1) if price else None,
                      "p5": p5.get(x["name"]), "p20": p20.get(x["name"]), "streak": streak(x["name"], x["net"]),
-                     "avg_buy": ab, "avg_sell": asl})
+                     "avg_buy": ab, "avg_sell": asl,
+                     "avg20": w.get("avg_hold"), "hold20": w.get("hold"), "net20": w.get("net20")})
     fr = [x for x in rows if x.get("foreign")]
     dom = [x for x in rows if not x.get("foreign")]
     return {"ok": True, "pc_alive": alive, "at": r.get("at"), "error": r.get("error"), "price": price,
