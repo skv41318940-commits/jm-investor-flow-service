@@ -89,14 +89,14 @@ def _krx_df(fn, *args, retries: int = 3, wait: float = 3.0, **kwargs):
     for attempt in range(retries):
         try:
             # 🚦 KRX는 한 번에 하나씩, 0.6초 간격으로만 (꽃게 검색기 등이 동시에 몰아 보내서 막혔던 문제)
+            # 자물쇠는 '출발 간격'만 맞추고 바로 풂 — 예전엔 KRX가 느릴 때 자물쇠를 쥔 채 기다려서
+            # 다른 요청들이 줄줄이 막혀 서버 전체(매크로 등)가 멈췄음 (2026-10-30)
             with _KRX_LOCK:
                 gap = _KRX_GAP - (time.time() - _KRX_LAST[0])
                 if gap > 0:
                     time.sleep(gap)
-                try:
-                    last = fn(*args, **kwargs)
-                finally:
-                    _KRX_LAST[0] = time.time()
+                _KRX_LAST[0] = time.time()
+            last = fn(*args, **kwargs)
             if last is not None and not getattr(last, "empty", False):
                 return last
         except Exception as e:
