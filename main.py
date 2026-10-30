@@ -71,6 +71,11 @@ if _saved_krx_pw is not None:
 from supabase import create_client
 
 
+_KRX_LOCK = __import__("threading").Lock()
+_KRX_LAST = [0.0]
+_KRX_GAP = 0.6  # KRX 요청 사이 최소 간격(초) — 한꺼번에 몰아 보내면 KRX가 우리 서버를 잠깐 막음 (2026-10-30)
+
+
 def _krx_df(fn, *args, retries: int = 3, wait: float = 3.0, **kwargs):
     """
     pykrx 호출을 감싸는 재시도 래퍼.
@@ -83,7 +88,15 @@ def _krx_df(fn, *args, retries: int = 3, wait: float = 3.0, **kwargs):
     last = None
     for attempt in range(retries):
         try:
-            last = fn(*args, **kwargs)
+            # 🚦 KRX는 한 번에 하나씩, 0.6초 간격으로만 (꽃게 검색기 등이 동시에 몰아 보내서 막혔던 문제)
+            with _KRX_LOCK:
+                gap = _KRX_GAP - (time.time() - _KRX_LAST[0])
+                if gap > 0:
+                    time.sleep(gap)
+                try:
+                    last = fn(*args, **kwargs)
+                finally:
+                    _KRX_LAST[0] = time.time()
             if last is not None and not getattr(last, "empty", False):
                 return last
         except Exception as e:
@@ -2763,7 +2776,7 @@ async def _daily_jobs_worker():
         ("theme_map", _run_theme_map_job, ()),
         ("krx_map", _run_krx_map_job, ()),
         ("new_listing", _run_new_listing_job, ()),
-        ("crab", _run_crab_job, ()),
+        # ("crab", _run_crab_job, ()),  # 🦀 꽃게 검색기 잠시 끔 (2026-10-30 JM — 검색기 다시 설계 예정, KRX 부담도 줄임)
         ("target_reach", _check_target_reach, ()),
         ("earnings_disclosure", _check_earnings_disclosures, ()),
     ]
@@ -2779,6 +2792,11 @@ async def _daily_jobs_worker():
 
 @app.on_event("startup")
 async def _start_ws_worker():
+    # 🛑 "일하지 마" 스위치 (서버 이전용, 2026-10-29) — 환경변수 JOBS_ENABLED=0 이면 실시간 체결·자동 알림·자동 작업을 전부 끔.
+    #    화면용 주소(/api/...)는 그대로 작동. 새 서버 시험할 땐 0, 교대할 때 새 서버 1 + 옛 서버 0
+    if os.environ.get("JOBS_ENABLED", "1") == "0":
+        print("[startup] JOBS_ENABLED=0 → 실시간 체결·알림·자동 작업 꺼짐 (화면용 주소만 작동)")
+        return
     asyncio.create_task(_ws_worker())
     # 해외주식 실시간 체결 수집은 사용 안 함 (2026-10-08 사용자 요청) — 한투가 appkey당 실시간 연결을
     # 1개만 허용해서, 해외 연결이 켜져 있으면 국내 실시간 체결이 "ALREADY IN USE appkey"로 막힘.
@@ -11206,8 +11224,7 @@ def _crab_build_base() -> dict:
         except Exception:
             return ymd, None
 
-    with cf.ThreadPoolExecutor(max_workers=4) as ex:  # 날짜별로 동시에 — 예전엔 하나씩 27번
-        got = dict(ex.map(get_day, days))
+    got = dict(get_day(d) for d in days)  # KRX는 차례로 (몰아 보내면 KRX가 막음) — 하루 한 번이라 괜찮음
     hist = {}  # code → list of (date, open, high, close, value_eok, pct) 최신→과거
     for ymd in days:
         df = got.get(ymd)
@@ -11298,9 +11315,22 @@ def _crab_bb300(code: str):
     if c and c[0] == today:
         return c[1]
     try:
-        st = (now_kst() - timedelta(days=480)).strftime("%Y%m%d")
-        df = _krx_df(stock.get_market_ohlcv, st, now_kst().strftime("%Y%m%d"), code)
-        cl = [float(x) for x in df["종가"].tolist()][-300:]
+        # KRX 대신 한투 일봉으로 (KRX 부담 줄이기) — 100개씩 3번 이어 받기
+        cl, end = [], now_kst().strftime("%Y%m%d")
+        for _ in range(3):
+            j = kis_get("/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice", "FHKST03010100",
+                        {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code, "FID_INPUT_DATE_1": "19900101",
+                         "FID_INPUT_DATE_2": end, "FID_PERIOD_DIV_CODE": "D", "FID_ORG_ADJ_PRC": "0"})
+            rows = j.get("output2") or []
+            rows = [r for r in rows if r.get("stck_clpr")]
+            if not rows:
+                break
+            cl = [float(r["stck_clpr"]) for r in rows][::-1] + cl
+            oldest = min(r["stck_bsop_date"] for r in rows)
+            end = (datetime.strptime(oldest, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+            if len(rows) < 90:
+                break
+        cl = cl[-300:]
         if len(cl) < 120:
             _crab_bb[code] = (today, None)
             return None
@@ -11550,6 +11580,50 @@ def watchlist_add_endpoint(payload: dict):
             return {"ok": True, "added": False}
         supabase.table("watchlist").insert({"code": code, "name": name or code, "horizon": "short"}).execute()
         return {"ok": True, "added": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# 🏦 창구 국내/외국계 나눠 보기 + 외국계 창구 합계 (2026-10-29) — 한투 회원사(FHKST01010600)는 상위 5개 + 외국계 합계를 줌
+_broker_split_cache: dict = {}
+
+
+@app.get("/api/broker-split")
+def broker_split_endpoint(code: str):
+    c = _broker_split_cache.get(code)
+    if c and time.time() - c[0] < 60:
+        return c[1]
+    try:
+        data = kis_get("/uapi/domestic-stock/v1/quotations/inquire-member", tr_id="FHKST01010600",
+                       params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code})
+        out = data.get("output")
+        row = (out[0] if isinstance(out, list) else out) or {}
+        f = lambda k: float(str(row.get(k) or 0).replace(",", "") or 0)
+        try:
+            price = _kis_quote(code).get("price") or 0
+        except Exception:
+            price = 0
+        def side(prefix_name, prefix_qty, prefix_glob):
+            items = []
+            for i in range(1, 6):
+                nm = row.get(f"{prefix_name}{i}", "")
+                if not nm:
+                    continue
+                q = f(f"{prefix_qty}{i}")
+                items.append({"rank": i, "name": nm, "qty": q, "foreign": row.get(f"{prefix_glob}{i}") == "Y",
+                              "eok": round(q * price / 1e8, 1) if price else None})
+            return items
+        buy = side("shnu_mbcr_name", "total_shnu_qty", "shnu_mbcr_glob_yn_")
+        sell = side("seln_mbcr_name", "total_seln_qty", "seln_mbcr_glob_yn_")
+        gb, gs = f("glob_total_shnu_qty"), f("glob_total_seln_qty")
+        gn = f("glob_ntby_qty") or (gb - gs)
+        res = {"ok": True, "code": code, "price": price,
+               "buy": {"domestic": [x for x in buy if not x["foreign"]], "foreign": [x for x in buy if x["foreign"]]},
+               "sell": {"domestic": [x for x in sell if not x["foreign"]], "foreign": [x for x in sell if x["foreign"]]},
+               "glob": {"buy": gb, "sell": gs, "net": gn, "net_eok": round(gn * price / 1e8, 1) if price else None},
+               "at": now_kst().strftime("%H:%M")}
+        _broker_split_cache[code] = (time.time(), res)
+        return res
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
