@@ -2775,6 +2775,7 @@ async def _daily_jobs_worker():
         ("fut_close", _save_futures_close, ()),
         ("theme_map", _run_theme_map_job, ()),
         ("broker_pc_daily", _run_broker_pc_daily, ()),
+        ("broker_pc_track", _run_broker_pc_track, ()),
         ("krx_map", _run_krx_map_job, ()),
         ("new_listing", _run_new_listing_job, ()),
         # ("crab", _run_crab_job, ()),  # 🦀 꽃게 검색기 잠시 끔 (2026-10-30 JM — 검색기 다시 설계 예정, KRX 부담도 줄임)
@@ -11635,13 +11636,16 @@ def broker_split_endpoint(code: str):
 # 🏦 창구(증권사)별 매매 — PC(키움 opt10038) 중계 (2026-10-30)
 #   사이트가 요청 → 서버에 줄 세움 → PC(broker_pc.py)가 3초마다 가져가서 키움으로 조회 → 결과를 올림
 # ══════════════════════════════════════════════════════════════════════════
-_bpc = {"queue": [], "results": {}, "alive_at": 0.0}
+_bpc = {"queue": [], "results": {}, "alive_at": 0.0, "tracked": {}, "samples": {}}
+# 💰 창구 평균단가(추정) — 같은 종목 창구 데이터를 2분마다 다시 받아, 늘어난 수량 × 그때 가격으로 평균을 냄 (2026-10-30)
+#   tracked: 사이트에서 본 종목(1시간 동안 장중 자동 추적) · samples: {code: {"day", "list": [(시각, 가격, {창구: (매수, 매도)})]}}
 _bpc_lock = threading.Lock()
 
 
 @app.post("/api/broker-pc/request")
 def broker_pc_request(code: str):
     with _bpc_lock:
+        _bpc["tracked"][code] = time.time()  # 💰 평균단가용: 본 종목은 1시간 동안 2분마다 자동으로 다시 받음
         r = _bpc["results"].get(code)
         if r and time.time() - r["got"] < 60:
             return {"ok": True, "queued": False}  # 1분 안에 받은 게 있으면 그거 씀
@@ -11652,6 +11656,12 @@ def broker_pc_request(code: str):
 
 @app.get("/api/broker-pc/next")
 def broker_pc_next():
+    # PC가 3초마다 물어보러 올 때 2분 간격 추적도 같이 (작업 반복기는 5분 주기라 여기서 돌림)
+    try:
+        _bpc["alive_at"] = time.time()
+        _run_broker_pc_track()
+    except Exception:
+        pass
     with _bpc_lock:
         _bpc["alive_at"] = time.time()  # PC가 물어보러 옴 = 살아있음
         if _bpc["queue"]:
@@ -11667,6 +11677,21 @@ def broker_pc_result(payload: dict):
             _bpc["results"][code] = {**payload, "got": time.time()}
             if len(_bpc["results"]) > 300:
                 _bpc["results"].clear()
+        # 💰 표본 저장 (장중만): 그때 가격 + 창구별 누적 매수·매도
+        nowk = now_kst()
+        if payload.get("rows") and nowk.weekday() < 5 and (9, 0) <= (nowk.hour, nowk.minute) <= (15, 35):
+            try:
+                px = _kis_quote(code).get("price") or 0
+            except Exception:
+                px = 0
+            if px:
+                day = nowk.strftime("%Y-%m-%d")
+                sm = _bpc["samples"].get(code)
+                if not sm or sm["day"] != day:
+                    sm = {"day": day, "list": []}
+                    _bpc["samples"][code] = sm
+                sm["list"].append((nowk.strftime("%H:%M"), px, {x["name"]: (x["buy"], x["sell"]) for x in payload["rows"]}))
+                sm["list"] = sm["list"][-300:]
         # 📅 장 마감 뒤(15:30~) 받은 건 그날 기록으로 저장 → 며칠째 사는지(연속성) 계산용
         now = now_kst()
         if payload.get("rows") and now.weekday() < 5 and (now.hour, now.minute) >= (15, 30):
@@ -11676,6 +11701,22 @@ def broker_pc_result(payload: dict):
             except Exception as e:
                 print(f"[broker_pc] 기록 저장 실패: {e}")
     return {"ok": True}
+
+
+def _run_broker_pc_track():
+    """장중 2분마다: 사이트에서 최근 1시간 안에 본 종목을 PC에 다시 맡김 → 평균단가 표본이 쌓임"""
+    now = now_kst()
+    if now.weekday() >= 5 or not ((9, 0) <= (now.hour, now.minute) <= (15, 30)):
+        return
+    if time.time() - _bpc.get("track_at", 0) < 115 or time.time() - _bpc["alive_at"] > 20:
+        return
+    _bpc["track_at"] = time.time()
+    with _bpc_lock:
+        live = {c: t for c, t in _bpc["tracked"].items() if time.time() - t < 3600}
+        _bpc["tracked"] = live
+        for c in list(live)[:10]:  # 키움 부담 줄이게 최대 10종목
+            if c not in _bpc["queue"]:
+                _bpc["queue"].append(c)
 
 
 def _run_broker_pc_daily():
@@ -11733,12 +11774,41 @@ def broker_pc_get(code: str):
                 break
         return n
 
-    rows = [{**x, "net_eok": round(x["net"] * price / 1e8, 1) if price else None,
-             "p5": p5.get(x["name"]), "p20": p20.get(x["name"]), "streak": streak(x["name"], x["net"])}
-            for x in r.get("rows", [])]
+    # 💰 평균단가(추정): 표본 사이에 늘어난 매수(매도) 수량 × 그 구간 가격 — 첫 표본 이전 물량은 첫 표본 가격으로 봄
+    sm = _bpc["samples"].get(code)
+    avg = {}
+    if sm and sm["day"] == now_kst().strftime("%Y-%m-%d") and sm["list"]:
+        prev, prev_px = {}, None
+        for t, px, mp in sm["list"]:
+            use_px = px if prev_px is None else (px + prev_px) / 2
+            for nm, (b, sl) in mp.items():
+                pb, ps = prev.get(nm, (0, 0))
+                a = avg.setdefault(nm, [0.0, 0, 0.0, 0])
+                db, ds = max(0, b - pb), max(0, sl - ps)
+                a[0] += db * use_px
+                a[1] += db
+                a[2] += ds * use_px
+                a[3] += ds
+            prev, prev_px = mp, px
+    samples_n = len(sm["list"]) if sm else 0
+    since = sm["list"][0][0] if sm and sm["list"] else None
+
+    def avgs(nm):
+        a = avg.get(nm)
+        if not a:
+            return None, None
+        return (round(a[0] / a[1]) if a[1] else None), (round(a[2] / a[3]) if a[3] else None)
+
+    rows = []
+    for x in r.get("rows", []):
+        ab, asl = avgs(x["name"])
+        rows.append({**x, "net_eok": round(x["net"] * price / 1e8, 1) if price else None,
+                     "p5": p5.get(x["name"]), "p20": p20.get(x["name"]), "streak": streak(x["name"], x["net"]),
+                     "avg_buy": ab, "avg_sell": asl})
     fr = [x for x in rows if x.get("foreign")]
     dom = [x for x in rows if not x.get("foreign")]
-    return {"ok": True, "pc_alive": alive, "at": r.get("at"), "error": r.get("error"),
+    return {"ok": True, "pc_alive": alive, "at": r.get("at"), "error": r.get("error"), "price": price,
+            "avg_samples": samples_n, "avg_since": since,
             "foreign": sorted(fr, key=lambda x: -abs(x["net"])),
             "domestic_buy": sorted(dom, key=lambda x: -x["net"])[:5],
             "domestic_sell": sorted(dom, key=lambda x: x["net"])[:5],
