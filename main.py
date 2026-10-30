@@ -4369,8 +4369,15 @@ def fetch_volume_top30(limit: int = 30):
     return rows
 
 
+_sector_vol_cache = {"at": 0.0, "ymd": "", "data": None}
+
+
 def fetch_sector_volume(limit: int = 30):
     ymd = _latest_trading_day()
+    # 🧹 KRX 점검 (2026-10-30): 업종 80여 개를 하나씩 KRX에 물어보는 무거운 작업 → 10분 동안 결과 재사용 + 간격 지키기
+    c = _sector_vol_cache
+    if c["data"] is not None and c["ymd"] == ymd and time.time() - c["at"] < 600:
+        return c["data"][:limit] if isinstance(c["data"], list) else c["data"]
 
     all_rows = []
     for market in ("KOSPI", "KOSDAQ"):
@@ -4378,7 +4385,7 @@ def fetch_sector_volume(limit: int = 30):
         for ticker in tickers:
             try:
                 name = stock.get_index_ticker_name(ticker)
-                ohlcv = stock.get_index_ohlcv_by_date(ymd, ymd, ticker)
+                ohlcv = _krx_df(stock.get_index_ohlcv_by_date, ymd, ymd, ticker, retries=1)
                 if ohlcv.empty:
                     continue
                 trading_value = float(ohlcv.iloc[0].get("거래대금", 0))
@@ -4405,6 +4412,8 @@ def fetch_sector_volume(limit: int = 30):
                 "trading_value": round(r["trading_value"] / 1e8, 1),
             }
         )
+    if rows:
+        _sector_vol_cache.update({"at": time.time(), "ymd": ymd, "data": rows})
     return rows
 
 
@@ -11521,8 +11530,96 @@ _crab_pc = {"data": None, "at": 0.0}
 _crab_pc_view = {"at": 0.0, "data": None}
 
 
+_crab_big_seen = {"day": "", "codes": set(), "top5": False, "pending": {}, "chk": 0.0}
+_mkt_mood = {"at": 0.0, "weak": False, "txt": ""}
+
+
+def _market_weak() -> tuple:
+    """오늘 시장이 안 좋은가: 코스피·코스닥 중 하나라도 −1% 이하면 '약함' (1분 보관)"""
+    m = _mkt_mood
+    if time.time() - m["at"] < 60:
+        return m["weak"], m["txt"]
+    try:
+        ks, kq = _macro_quote("^KS11")["changePct"], _macro_quote("^KQ11")["changePct"]
+        m.update({"at": time.time(), "weak": min(ks, kq) <= -1.0, "txt": f"코스피 {ks:+.2f}% · 코스닥 {kq:+.2f}%"})
+    except Exception:
+        m["at"] = time.time()
+    return m["weak"], m["txt"]
+
+
+def _crab_big_alert(payload: dict):
+    """🦀 큰 꽃게 알림 규칙 (2026-10-30 JM)
+    ① 장 시작 후(09:03~) 한 번: 큰 꽃게 종목 중 거래대금 TOP 5
+    ② 그 뒤 새로 편입: 거래대금 100억 이상만 (시장이 약한 날 = 코스피·코스닥 −1% 이하면 50억 이상)
+       기준 아래로 편입된 종목은 대기 → 1분마다 다시 보고 기준 넘으면 그때 알림"""
+    now = now_kst()
+    day = now.strftime("%Y-%m-%d")
+    st = _crab_big_seen
+    if st["day"] != day:
+        st.update({"day": day, "codes": set(), "top5": False, "pending": {}, "chk": 0.0})
+    cur = {x["code"]: x for x in payload.get("big", []) or []}
+    in_market = now.weekday() < 5 and (9, 0) <= (now.hour, now.minute) <= (15, 20)
+    if not in_market:
+        st["codes"] |= set(cur)
+        return
+    link = lambda c: f"🔗 https://jm-tracker.vercel.app/stock-analysis?code={c}"
+
+    def q(code):
+        try:
+            return _kis_quote(code)
+        except Exception:
+            return {}
+
+    # ① 장 시작 후 TOP 5 (한 번)
+    if not st["top5"]:
+        if (now.hour, now.minute) < (9, 3) or not cur:
+            return  # 시초 몇 분은 기다렸다가 (시가 단일가 직후 숫자가 들쭉날쭉)
+        import concurrent.futures as cf
+        with cf.ThreadPoolExecutor(max_workers=4) as ex:
+            qs = dict(zip(cur, ex.map(q, list(cur)[:40])))
+        top = sorted(cur, key=lambda c: -(qs.get(c, {}).get("value_eok") or 0))[:5]
+        weak, txt = _market_weak()
+        lines = [f"🦀 큰 꽃게 장 초반 거래대금 TOP 5 ({now.strftime('%H:%M')} · 전체 {len(cur)}종목)", f"시장: {txt}{' 🔵 약함' if weak else ''}"]
+        for i, c in enumerate(top, 1):
+            v = qs.get(c, {})
+            lines.append(f"{i}. {cur[c].get('name') or c} {int(v.get('price') or 0):,}원 ({(v.get('pct') or 0):+.2f}%) · {(v.get('value_eok') or 0):,.0f}억\n   {link(c)}")
+        send_telegram("\n".join(lines))
+        st["top5"] = True
+        st["codes"] |= set(cur)
+        return
+
+    # ② 새 편입 → 거래대금 기준 넘는 것만
+    weak, txt = _market_weak()
+    th = 50 if weak else 100
+    for c in cur:
+        if c not in st["codes"]:
+            st["codes"].add(c)
+            st["pending"][c] = cur[c]
+    for c in list(st["pending"]):
+        if c not in cur:
+            st["pending"].pop(c, None)  # 기준 넘기 전에 조건에서 빠지면 알림 안 함
+    if not st["pending"] or time.time() - st["chk"] < 55:
+        return
+    st["chk"] = time.time()
+    sent = 0
+    for c, x in list(st["pending"].items()):
+        v = q(c)
+        val = v.get("value_eok") or 0
+        if val >= th:
+            send_telegram(f"🦀 큰 꽃게 편입 {x.get('since', now.strftime('%H:%M'))} · 거래대금 {val:,.0f}억 (기준 {th}억{' · 약한 장' if weak else ''})\n"
+                          f"{x.get('name') or c} {int(v.get('price') or 0):,}원 ({(v.get('pct') or 0):+.2f}%)\n{link(c)}")
+            st["pending"].pop(c, None)
+            sent += 1
+            if sent >= 5:
+                break
+
+
 @app.post("/api/crab-pc")
 def crab_pc_post(payload: dict):
+    try:
+        _crab_big_alert(payload)
+    except Exception as e:
+        print(f"[crab] 큰 꽃게 알림 실패: {e}")
     _crab_pc.update({"data": payload, "at": time.time()})
     _crab_pc_view["at"] = 0  # 다음 조회 때 새로 시세 붙이기
     try:
