@@ -2774,6 +2774,7 @@ async def _daily_jobs_worker():
         ("report_digest", _run_report_digest, ()),
         ("fut_close", _save_futures_close, ()),
         ("theme_map", _run_theme_map_job, ()),
+        ("broker_pc_daily", _run_broker_pc_daily, ()),
         ("krx_map", _run_krx_map_job, ()),
         ("new_listing", _run_new_listing_job, ()),
         # ("crab", _run_crab_job, ()),  # 🦀 꽃게 검색기 잠시 끔 (2026-10-30 JM — 검색기 다시 설계 예정, KRX 부담도 줄임)
@@ -11666,7 +11667,37 @@ def broker_pc_result(payload: dict):
             _bpc["results"][code] = {**payload, "got": time.time()}
             if len(_bpc["results"]) > 300:
                 _bpc["results"].clear()
+        # 📅 장 마감 뒤(15:30~) 받은 건 그날 기록으로 저장 → 며칠째 사는지(연속성) 계산용
+        now = now_kst()
+        if payload.get("rows") and now.weekday() < 5 and (now.hour, now.minute) >= (15, 30):
+            try:
+                supabase.table("broker_pc_daily").upsert({"code": code, "day": now.strftime("%Y-%m-%d"),
+                                                          "rows": [{"name": x["name"], "net": x["net"]} for x in payload["rows"]]}).execute()
+            except Exception as e:
+                print(f"[broker_pc] 기록 저장 실패: {e}")
     return {"ok": True}
+
+
+def _run_broker_pc_daily():
+    """장 마감 뒤(15:35~15:50) 관심종목을 PC에 한꺼번에 맡겨서 그날 창구 기록을 자동으로 쌓음 (연속성 계산용)"""
+    now = now_kst()
+    if now.weekday() >= 5 or not ((15, 35) <= (now.hour, now.minute) <= (15, 50)):
+        return
+    day = now.strftime("%Y-%m-%d")
+    if _brief_already_sent("job_broker_pc_daily", day):
+        return
+    if time.time() - _bpc["alive_at"] > 20:
+        return  # PC가 꺼져 있으면 다음 확인 때 다시
+    try:
+        codes = [r["code"] for r in (supabase.table("watchlist").select("code").limit(40).execute().data or []) if r.get("code")]
+        with _bpc_lock:
+            for c in codes:
+                if c not in _bpc["queue"]:
+                    _bpc["queue"].append(c)
+        _mark_brief_sent("job_broker_pc_daily", day)
+        print(f"[broker_pc] 관심종목 {len(codes)}개 창구 기록 요청")
+    except Exception as e:
+        print(f"[broker_pc] 자동 기록 실패: {e}")
 
 
 @app.get("/api/broker-pc")
@@ -11679,7 +11710,32 @@ def broker_pc_get(code: str):
         price = _kis_quote(code).get("price") or 0
     except Exception:
         price = 0
-    rows = [{**x, "net_eok": round(x["net"] * price / 1e8, 1) if price else None} for x in r.get("rows", [])]
+    p5 = {x["name"]: x["net"] for x in r.get("p5", []) or []}
+    p20 = {x["name"]: x["net"] for x in r.get("p20", []) or []}
+    # 📅 연속성: 저장된 지난 날들 + 오늘 순매수 방향이 같은 날이 며칠 이어졌나
+    hist = []
+    try:
+        hist = supabase.table("broker_pc_daily").select("day,rows").eq("code", code).order("day", desc=True).limit(15).execute().data or []
+    except Exception:
+        pass
+    today = now_kst().strftime("%Y-%m-%d")
+    past = [{x["name"]: x["net"] for x in h["rows"]} for h in hist if str(h["day"]) != today]
+
+    def streak(name, net):
+        if not net:
+            return 0
+        n = 1
+        for day in past:
+            v = day.get(name, 0)
+            if v and (v > 0) == (net > 0):
+                n += 1
+            else:
+                break
+        return n
+
+    rows = [{**x, "net_eok": round(x["net"] * price / 1e8, 1) if price else None,
+             "p5": p5.get(x["name"]), "p20": p20.get(x["name"]), "streak": streak(x["name"], x["net"])}
+            for x in r.get("rows", [])]
     fr = [x for x in rows if x.get("foreign")]
     dom = [x for x in rows if not x.get("foreign")]
     return {"ok": True, "pc_alive": alive, "at": r.get("at"), "error": r.get("error"),
