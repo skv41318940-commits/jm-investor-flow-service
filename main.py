@@ -2777,6 +2777,7 @@ async def _daily_jobs_worker():
         ("broker_pc_daily", _run_broker_pc_daily, ()),
         ("broker_pc_track", _run_broker_pc_track, ()),
         ("pc_off_alert", _run_pc_off_alert, ()),
+        ("nxt_premarket", _run_nxt_premarket, ()),
         ("weekly_review", _run_weekly_review, ()),
         ("krx_map", _run_krx_map_job, ()),
         ("new_listing", _run_new_listing_job, ()),
@@ -5134,6 +5135,45 @@ def send_brief(kind: str, text: str) -> bool:
     return ok
 
 
+def _broker_digest_section() -> str:
+    """📝 리포트 PDF용 🏦 창구 요약 — 오늘 장중에 따라간 종목(당일매매)의 외국계 창구·누가 받아줬나·💰 평단 (2026-10-30)"""
+    today = now_kst().strftime("%Y-%m-%d")
+    codes = [c for c, sm in _bpc.get("samples", {}).items() if sm.get("day") == today]
+    if not codes:
+        return ""
+    names = {}
+    try:
+        for r in supabase.table("stock_fundamentals").select("code,name").in_("code", codes).execute().data or []:
+            names[r["code"]] = r["name"]
+    except Exception:
+        pass
+    q = lambda v: f"{v / 10000:+.1f}만" if abs(v) >= 10000 else f"{v:+,.0f}"
+    out = ["【창구】 당일매매 종목 창구 요약 (PC·키움)"]
+    for code in codes[:10]:
+        try:
+            d = broker_pc_get(code)
+        except Exception:
+            continue
+        if not d.get("ok"):
+            continue
+        nm = names.get(code, code)
+        out.append(f"▪ {nm} · 외국계 합계 {q(d.get('foreign_net', 0))}주")
+        fr = d.get("foreign", [])[:4]
+        if fr:
+            out.append("  외국계: " + " · ".join(
+                f"{x['name']} {q(x['net'])}" + (f"(평단 {x['avg_buy']:,})" if x.get("avg_buy") else "") for x in fr))
+        db = [x for x in d.get("domestic_buy", []) if x["net"] > 0][:3]
+        ds = [x for x in d.get("domestic_sell", []) if x["net"] < 0][:3]
+        if db:
+            out.append("  국내 순매수: " + " · ".join(f"{x['name']} {q(x['net'])}" + (f"(평단 {x['avg_buy']:,})" if x.get("avg_buy") else "") for x in db))
+        if ds:
+            out.append("  국내 순매도: " + " · ".join(f"{x['name']} {q(x['net'])}" for x in ds))
+        fs = [x for x in d.get("foreign", []) if x["net"] < 0]
+        if fs and db:
+            out.append(f"  누가 받아줬나: {'·'.join(x['name'] for x in fs[:2])} 매도 → {'·'.join(x['name'] for x in db[:2])} 매수")
+    return "\n".join(out) if len(out) > 1 else ""
+
+
 def build_report_digest(day: str = None) -> tuple:
     """🦀 오늘 리포트 모음 — 그날 리포트 봇으로 간 브리핑을 순서대로 한 덩어리로 (본문만, 첫 줄 꾸밈은 빼고)"""
     day = day or now_kst().strftime("%Y-%m-%d")
@@ -5147,6 +5187,14 @@ def build_report_digest(day: str = None) -> tuple:
         body = it["text"].split("\n")[2:]  # 첫 줄(꾸밈)·구분선 빼고 【종류】부터
         parts.append("\n".join(body).strip())
         parts.append("")
+    if day == now_kst().strftime("%Y-%m-%d"):
+        try:
+            bsec = _broker_digest_section()
+            if bsec:
+                parts.append(bsec)
+                parts.append("")
+        except Exception as e:
+            print(f"[digest] 창구 요약 실패: {e}")
     return "\n".join(parts).strip(), day
 
 
@@ -11746,7 +11794,8 @@ def broker_split_endpoint(code: str):
 # 🏦 창구(증권사)별 매매 — PC(키움 opt10038) 중계 (2026-10-30)
 #   사이트가 요청 → 서버에 줄 세움 → PC(broker_pc.py)가 3초마다 가져가서 키움으로 조회 → 결과를 올림
 # ══════════════════════════════════════════════════════════════════════════
-_bpc = {"queue": [], "results": {}, "alive_at": 0.0, "tracked": {}, "samples": {}}
+_bpc = {"queue": [], "results": {}, "alive_at": 0.0, "tracked": {}, "samples": {}, "tasks": []}
+_pc_task_results: dict = {}  # 🧪 시험·🌅 NXT 결과 (kind → 결과)
 # 💰 창구 평균단가(추정) — 같은 종목 창구 데이터를 2분마다 다시 받아, 늘어난 수량 × 그때 가격으로 평균을 냄 (2026-10-30)
 #   tracked: 사이트에서 본 종목(1시간 동안 장중 자동 추적) · samples: {code: {"day", "list": [(시각, 가격, {창구: (매수, 매도)})]}}
 _bpc_lock = threading.Lock()
@@ -11774,6 +11823,8 @@ def broker_pc_next():
         pass
     with _bpc_lock:
         _bpc["alive_at"] = time.time()  # PC가 물어보러 옴 = 살아있음
+        if _bpc["tasks"]:
+            return {"task": _bpc["tasks"].pop(0)}  # 🧪 시험·🌅 NXT 먼저
         if _bpc["queue"]:
             return {"code": _bpc["queue"].pop(0)}
     return {}
@@ -11849,6 +11900,96 @@ def _run_broker_pc_daily():
         print(f"[broker_pc] 관심종목 {len(codes)}개 창구 기록 요청")
     except Exception as e:
         print(f"[broker_pc] 자동 기록 실패: {e}")
+
+
+@app.post("/api/pc-task/result")
+def pc_task_result(payload: dict):
+    kind = payload.get("kind") or "unknown"
+    _pc_task_results[kind] = {**payload, "got": time.time()}
+    return {"ok": True}
+
+
+@app.get("/api/pc-probe")
+def pc_probe(code: str = "005930"):
+    """🧪 키움 '거래원 매물대 분석'(opt10043) 시험 — PC가 받아서 해보고 결과를 /api/pc-task-result?kind=probe_vp 에 올림"""
+    with _bpc_lock:
+        _bpc["tasks"].append({"kind": "probe_vp", "code": code})
+    return {"ok": True, "queued": True, "pc_alive": time.time() - _bpc["alive_at"] < 20,
+            "next": "10~20초 뒤 /api/pc-task-result?kind=probe_vp 열어보기"}
+
+
+@app.get("/api/pc-task-result")
+def pc_task_result_get(kind: str):
+    r = _pc_task_results.get(kind)
+    return r or {"ok": False, "error": "아직 결과 없음 (PC가 켜져 있는지 확인)"}
+
+
+# 🌅 NXT 프리마켓 (08:00~08:50) — PC가 키움으로 '종목코드_NX' 시세를 받아옴 (2026-10-30)
+def _nxt_candidates() -> list:
+    codes = []
+    try:
+        codes += [r["code"] for r in (supabase.table("watchlist").select("code").limit(60).execute().data or []) if r.get("code")]
+    except Exception:
+        pass
+    d = _crab_pc.get("data") or {}
+    for k in ("crab", "small", "big"):
+        codes += [x["code"] for x in d.get(k, []) or []]
+    try:
+        r = supabase.table("brief_cache").select("data").eq("key", "new_highs").limit(1).execute().data
+        if r:
+            codes += [x.get("code") for x in (r[0]["data"].get("rows") or r[0]["data"].get("items") or []) if x.get("code")]
+    except Exception:
+        pass
+    seen, out = set(), []
+    for c in codes:
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out[:120]
+
+
+def _run_nxt_premarket():
+    now = now_kst()
+    if now.weekday() >= 5:
+        return
+    hm = (now.hour, now.minute)
+    day = now.strftime("%Y-%m-%d")
+    if (8, 5) <= hm < (8, 45) and time.time() - _bpc["alive_at"] < 20:
+        slot = "a" if hm < (8, 25) else "b"
+        if not _brief_already_sent(f"job_nxt_{slot}", day):
+            with _bpc_lock:
+                _bpc["tasks"].append({"kind": "nxt", "codes": _nxt_candidates()})
+            _mark_brief_sent(f"job_nxt_{slot}", day)
+    if (8, 45) <= hm <= (8, 58) and not _brief_already_sent("nxt_premarket", day):
+        r = _pc_task_results.get("nxt")
+        if not r or time.time() - r.get("got", 0) > 1800:
+            return
+        rows = [x for x in r.get("rows", []) if x.get("price") and x.get("pct") is not None and x.get("volume")]
+        if not rows:
+            print("[nxt] 시세가 비어 있음 — 키움이 _NX 시세를 안 주는 듯")
+            _mark_brief_sent("nxt_premarket", day)
+            return
+        up = sorted(rows, key=lambda x: -x["pct"])[:8]
+        dn = sorted(rows, key=lambda x: x["pct"])[:3]
+        link = lambda c: f"https://jm-tracker.vercel.app/stock-analysis?code={c}"
+        lines = [f"🌅 NXT 프리마켓 ({r.get('at', '')[:5]} 기준 · {len(rows)}종목)", "▲ 강한 종목"]
+        lines += [f"· {x.get('name') or x['code']} {x['pct']:+.2f}% · {x['price']:,}원 · {x['volume']:,}주\n  🔗 {link(x['code'])}" for x in up if x["pct"] > 0]
+        weak = [x for x in dn if x["pct"] < 0]
+        if weak:
+            lines.append("▼ 약한 종목")
+            lines += [f"· {x.get('name') or x['code']} {x['pct']:+.2f}%" for x in weak]
+        lines.append("※ 관심종목·꽃게·52주 신고가 후보만 본 거예요 (NXT 프리마켓은 거래가 적어 방향 참고용)")
+        if send_telegram("\n".join(lines)):
+            _mark_brief_sent("nxt_premarket", day)
+
+
+@app.get("/api/nxt-premarket")
+def nxt_premarket_endpoint(run: bool = False):
+    if run:
+        with _bpc_lock:
+            _bpc["tasks"].append({"kind": "nxt", "codes": _nxt_candidates()})
+        return {"ok": True, "queued": True, "next": "30초~1분 뒤 run 없이 다시 열기"}
+    return _pc_task_results.get("nxt") or {"ok": False, "error": "아직 결과 없음"}
 
 
 @app.get("/api/broker-pc")
