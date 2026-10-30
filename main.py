@@ -5959,6 +5959,9 @@ def _second_thursday(y: int, m: int) -> datetime:
 
 # 🌏 해외 중앙은행 (⚠️ 매년 1월 갱신 — 정비 알림에 포함). 결과 발표는 한국 시각 기준
 BOJ_DECISION_DATES = ["2026-01-23", "2026-03-19", "2026-04-28", "2026-06-16", "2026-07-31", "2026-09-18", "2026-10-30", "2026-12-18"]
+# 📅 MSCI 분기 리뷰 (MSCI 공식 발표, 2026-10-30 확인) — 발표는 런던 시간이라 한국은 다음 날 아침에 확인
+#   (발표일, 적용 기준 장 마감일 = 효력일 전 거래일). 다음 8개 일정은 매 리뷰 때 MSCI가 새로 알려줌 → 1월 2일 정비 때 갱신
+MSCI_REVIEW_DATES = [("2026-11-11", "2026-11-30"), ("2027-02-09", "2027-02-26")]
 ECB_DECISION_DATES = ["2026-02-05", "2026-03-19", "2026-04-30", "2026-06-11", "2026-07-23", "2026-09-10", "2026-10-29", "2026-12-17"]
 # 🇰🇷 날짜가 매번 다른 국내 지표 (한국은행 공표일정 기준, ⚠️ 매년 갱신)
 KR_GDP_DATES = {"2026-10-27": "3분기 실질 GDP 속보", "2027-01-26": "4분기 실질 GDP 속보"}
@@ -5992,6 +5995,14 @@ def _fetch_global_cb(start: str, end: str) -> list:
             summer = 3 < int(d[5:7]) < 10 or (d[5:7] == "10" and int(d[8:]) < 25) or (d[5:7] == "03" and int(d[8:]) > 28)
             out.append({"date": d, "time": "21:15" if summer else "22:15", "title": "유로존) 유럽중앙은행(ECB) 금리 결정", "major": True,
                         "note": "유로화·달러·유럽 증시에 영향", "kind": "us_macro"})
+    for ann, eff in MSCI_REVIEW_DATES:
+        nxt = (datetime.strptime(ann, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+        if start <= nxt <= end:
+            out.append({"date": nxt, "time": "아침", "title": "MSCI 분기 리뷰 발표 (편입·편출 종목)", "major": True,
+                        "note": "외국인 패시브 자금 — 편입 종목 미리 움직임 · 골드만·모건스탠리 창구 주목", "kind": "us_macro"})
+        if start <= eff <= end:
+            out.append({"date": eff, "time": "장 마감 동시호가", "title": "MSCI 리밸런싱 적용일", "major": True,
+                        "note": "종가에 외국인 대량 매매 → 편입·편출 종목 종가 급변 주의", "kind": "us_macro"})
     return out
 
 
@@ -9808,7 +9819,7 @@ MAINTENANCE_REMINDERS = [
              "· 한국투자증권 앱키 (실시간 체결·수급·랭킹 — 핵심)\n"
              "· KRX 데이터 비밀번호를 바꿨다면 Render의 KRX_PW도 변경"),
     ((1, 2), "📅 [정비] 새해 일정 갱신 — 올해 FOMC·금통위 날짜를 Claude에게 알려주고 서버에 반영하세요 "
-             "(main.py의 FOMC_DECISION_DATES / BOK_MPC_DATES / BOJ_DECISION_DATES / ECB_DECISION_DATES / KR_GDP_DATES)"),
+             "(main.py의 FOMC_DECISION_DATES / BOK_MPC_DATES / BOJ_DECISION_DATES / ECB_DECISION_DATES / KR_GDP_DATES / MSCI_REVIEW_DATES)"),
 ]
 
 
