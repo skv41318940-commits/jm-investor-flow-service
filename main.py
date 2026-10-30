@@ -11539,7 +11539,8 @@ def crab_pc_get():
         out["alive"] = alive
         return out
     import concurrent.futures as cf
-    codes = {x["code"] for k in ("small", "big", "small_removed", "big_removed") for x in d.get(k, [])}
+    KEYS = ("crab", "small", "big")  # 꽃게 · 작은 꽃게 · 큰 꽃게 (2026-10-30)
+    codes = {x["code"] for k in KEYS for kk in (k, f"{k}_removed") for x in d.get(kk, [])}
 
     def q(code):
         try:
@@ -11561,9 +11562,10 @@ def crab_pc_get():
         return sorted(out, key=lambda r: -r["value_eok"])
 
     out = {"ok": True, "source": "pc", "at": str(d.get("at", ""))[11:16], "alive": alive,
-           "small": rows(d.get("small", [])), "big": rows(d.get("big", [])),
-           "small_removed": rows(d.get("small_removed", []), True), "big_removed": rows(d.get("big_removed", []), True),
-           "note": "🖥 HTS 조건검색 그대로 (PC 프로그램)"}
+           "note": "🖥 HTS 조건검색 그대로 (PC 프로그램) · 서버는 KRX를 건드리지 않음"}
+    for k in KEYS:
+        out[k] = rows(d.get(k, []))
+        out[f"{k}_removed"] = rows(d.get(f"{k}_removed", []), True)
     v.update({"at": time.time(), "data": out})
     return out
 
