@@ -3930,7 +3930,7 @@ def sync_broker_flow_endpoint(code: str):
 def fetch_investor_flow(code: str, days: int = 20):
     today = now_kst()
     fromdate = (today - timedelta(days=days * 2)).strftime("%Y%m%d")  # 주말 감안 여유있게
-    todate = today.strftime("%Y%m%d")
+    todate = _weekday_end(today.strftime("%Y%m%d"))
 
     df = _krx_df(stock.get_market_trading_value_by_date, fromdate, todate, code, detail=True)
 
@@ -4153,6 +4153,14 @@ def sync_market_flow_endpoint(days: int = 40):
     """
     days = max(1, min(days, 120))
     return {"ok": True, "result": sync_market_flow(days)}
+
+
+def _weekday_end(ymd: str) -> str:
+    """주말이면 금요일로 당김 (KRX는 끝 날짜가 토·일이면 빈 값·오류를 줄 때가 있음 — 토요일 0시 넘으면 안 나오던 문제, 2026-10-31)"""
+    d = datetime.strptime(ymd, "%Y%m%d")
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d.strftime("%Y%m%d")
 
 
 def _latest_trading_day() -> str:
@@ -4447,7 +4455,7 @@ INST_TYPE_COLUMNS = ["금융투자", "보험", "투신", "사모", "은행", "�
 def fetch_institution_type_flow(code: str, days: int = 60):
     today = now_kst()
     fromdate = (today - timedelta(days=days * 2)).strftime("%Y%m%d")  # 주말 감안 여유있게
-    todate = today.strftime("%Y%m%d")
+    todate = _weekday_end(today.strftime("%Y%m%d"))
 
     df = _krx_df(stock.get_market_trading_value_by_date, fromdate, todate, code, detail=True)
     print(f"[institution_type_flow] code={code} rows={len(df)} columns={list(df.columns)}")
@@ -12268,7 +12276,7 @@ def stock_ohlcv_endpoint(code: str, start: str, end: str):
         return kis_fallback("pykrx를 사용할 수 없습니다")
     try:
         start_ymd = start.replace("-", "")
-        end_ymd = end.replace("-", "")
+        end_ymd = _weekday_end(end.replace("-", ""))
         df = _krx_df(stock.get_market_ohlcv_by_date, start_ymd, end_ymd, code, retries=1)
         if df is None or df.empty:
             return kis_fallback(f"{code} 종목의 {start}~{end} 구간 일봉 데이터가 없습니다.")
