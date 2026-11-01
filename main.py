@@ -11656,7 +11656,7 @@ def _crab_big_alert(payload: dict):
             qs = dict(zip(cur, ex.map(q, list(cur)[:40])))
         top = sorted(cur, key=lambda c: -(qs.get(c, {}).get("value_eok") or 0))[:5]
         weak, txt = _market_weak()
-        lines = [f"🦀 큰 꽃게 장 초반 거래대금 TOP 5 ({now.strftime('%H:%M')} · 전체 {len(cur)}종목)", f"시장: {txt}{' 🔵 약함' if weak else ''}"]
+        lines = [f"🐻 곰발 장 초반 거래대금 TOP 5 ({now.strftime('%H:%M')} · 전체 {len(cur)}종목)", f"시장: {txt}{' 🔵 약함' if weak else ''}"]
         for i, c in enumerate(top, 1):
             v = qs.get(c, {})
             lines.append(f"{i}. {cur[c].get('name') or c} {int(v.get('price') or 0):,}원 ({(v.get('pct') or 0):+.2f}%) · {(v.get('value_eok') or 0):,.0f}억\n   {link(c)}")
@@ -11683,7 +11683,7 @@ def _crab_big_alert(payload: dict):
         v = q(c)
         val = v.get("value_eok") or 0
         if val >= th:
-            send_telegram(f"🦀 큰 꽃게 편입 {x.get('since', now.strftime('%H:%M'))} · 거래대금 {val:,.0f}억 (기준 {th}억{' · 약한 장' if weak else ''})\n"
+            send_telegram(f"🐻 곰발 편입 {x.get('since', now.strftime('%H:%M'))} · 거래대금 {val:,.0f}억 (기준 {th}억{' · 약한 장' if weak else ''})\n"
                           f"{x.get('name') or c} {int(v.get('price') or 0):,}원 ({(v.get('pct') or 0):+.2f}%)\n{link(c)}")
             st["pending"].pop(c, None)
             sent += 1
