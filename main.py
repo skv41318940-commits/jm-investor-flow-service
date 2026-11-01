@@ -6023,11 +6023,43 @@ def fetch_kr_ipo_listings() -> list:
     return data
 
 
+def _ipo_read(x: dict) -> str:
+    """🆕 공모 지표 한 줄 해석 (2026-11-02 JM) — 기관경쟁률 = 관심, 의무보유확약 = 첫날 나올 물량"""
+    def num(v):
+        m = re.search(r"[\d,.]+", str(v or ""))
+        try:
+            return float(m.group(0).replace(",", "")) if m else None
+        except ValueError:
+            return None
+    comp, lock = num(x.get("comp")), num(x.get("lockup"))
+    if comp is None and lock is None:
+        return ""
+    c_txt = (None if comp is None else "🔴 관심 아주 높음" if comp >= 1000 else "🔴 관심 높음" if comp >= 500
+             else "⚪ 관심 보통" if comp >= 100 else "🔵 관심 낮음")
+    l_txt = (None if lock is None else "🔴 첫날 물량 적음" if lock >= 30 else "⚪ 첫날 물량 보통" if lock >= 10
+             else "🔵 첫날 물량 많음" if lock >= 5 else "🔵 첫날 물량 아주 많음")
+    hot, tight = (comp or 0) >= 500, (lock or 0) >= 15
+    if comp is not None and lock is not None:
+        if hot and tight:
+            sumtxt = "→ 관심↑·물량↓: 첫날 강세 기대"
+        elif hot and not tight:
+            sumtxt = "→ 관심↑·물량↑: 시초 뒤 기관 매도로 변동성 큼, 3분봉 눌림 확인"
+        elif not hot and tight:
+            sumtxt = "→ 관심 보통·물량↓: 흐름 보며"
+        else:
+            sumtxt = "→ 관심↓·물량↑: 약세 주의"
+    else:
+        sumtxt = ""
+    return "   " + " · ".join(t for t in (c_txt, l_txt) if t) + (f" {sumtxt}" if sumtxt else "")
+
+
 def _ipo_line(x: dict) -> str:
     bits = [f"공모가 {x['offer']:,.0f}원" if x.get("offer") else None,
             f"기관경쟁률 {x['comp']}" if x.get("comp") else None,
             f"의무보유확약 {x['lockup']}" if x.get("lockup") else None]
-    return f"· {x['name']} — " + " · ".join(b for b in bits if b) if any(bits) else f"· {x['name']}"
+    line = f"· {x['name']} — " + " · ".join(b for b in bits if b) if any(bits) else f"· {x['name']}"
+    rd = _ipo_read(x)
+    return line + (f"\n{rd}" if rd else "")
 
 
 def _fetch_kr_listing(start: str, end: str) -> list:
@@ -11283,8 +11315,9 @@ def _run_new_listing_job():
         lo, hi = (now - timedelta(days=10)).strftime("%Y-%m-%d"), (now + timedelta(days=7)).strftime("%Y-%m-%d")
         for x in fetch_kr_ipo_listings():
             if lo <= x["date"] <= hi:
-                hits = _lookup_stock_code(x["name"])
-                exact = [h for h in hits if h["name"].replace(" ", "") == x["name"].replace(" ", "")] or hits[:1]
+                nm = re.sub(r"\(.*?\)", "", x["name"]).strip() or x["name"]  # '영광(구.영광공작소)' → '영광' (2026-11-02)
+                hits = _lookup_stock_code(nm)
+                exact = [h for h in hits if h["name"].replace(" ", "") == nm.replace(" ", "")] or hits[:1]
                 _add_to_search(exact)
                 time.sleep(0.2)
         _mark_brief_sent("job_new_listing", key)
