@@ -2779,6 +2779,7 @@ async def _daily_jobs_worker():
         ("pc_off_alert", _run_pc_off_alert, ()),
         ("nxt_premarket", _run_nxt_premarket, ()),
         ("swing_after_close", _run_swing_after_close, ()),
+        ("theme_index", _run_theme_index_job, ()),
         ("weekly_review", _run_weekly_review, ()),
         ("krx_map", _run_krx_map_job, ()),
         ("new_listing", _run_new_listing_job, ()),
@@ -11809,11 +11810,19 @@ def swing_screeners(name: str = ""):
                     v = _kis_quote(x["code"])
                 except Exception:
                     v = {}
+                # 🔴 빨간선 자동 추천 (관심종목과 같은 기준) — 퇴근 후 칸 나누기용 (2026-11-01)
+                try:
+                    rl = _redline_classify(x["code"])
+                except Exception:
+                    rl = {}
+                pos = (f"{rl['suggest']} · {rl['gap']:+.0f}%" if rl.get("suggest") else
+                       (f"돌파 전 · {rl['gap']:+.0f}%" if rl.get("gap") is not None else "—"))
                 return {"code": x["code"], "name": x.get("name") or x["code"], "price": v.get("price") or 0,
-                        "pct": round(v.get("pct") or 0, 2), "value_eok": round(v.get("value_eok") or 0, 1), "volume": int(v.get("volume") or 0)}
+                        "pct": round(v.get("pct") or 0, 2), "value_eok": round(v.get("value_eok") or 0, 1), "volume": int(v.get("volume") or 0),
+                        "position": pos, "why": rl.get("why"), "suggest": rl.get("suggest")}
 
             with cf.ThreadPoolExecutor(max_workers=4) as ex:
-                _swing_view[key] = sorted(ex.map(q, codes), key=lambda r: -r["value_eok"])
+                _swing_view[key] = sorted(ex.map(q, codes[:80]), key=lambda r: -r["value_eok"])
         out["rows"] = _swing_view[key]
         out["name"] = name
     return out
@@ -11880,6 +11889,106 @@ def _redline_classify(code: str) -> dict:
     return res
 
 
+# ── ⭐ 관심종목 칸 정보: 흑자/적자 · 컨센서스 · 업종 · 테마 (2026-11-01) ──
+_jmw_info_cache: dict = {}  # code → (day, info)
+_theme_index = {"day": "", "map": {}}
+
+
+def _build_theme_index():
+    """종목 → 테마 이름 (네이버 테마 전체를 하루 한 번 훑어서 거꾸로 묶음, KRX 안 씀)"""
+    day = now_kst().strftime("%Y-%m-%d")
+    if _theme_index["day"] == day and _theme_index["map"]:
+        return _theme_index["map"]
+    try:
+        r = supabase.table("brief_cache").select("data").eq("key", "theme_index").limit(1).execute().data
+        if r and r[0]["data"].get("day") == day:
+            _theme_index.update(r[0]["data"])
+            return _theme_index["map"]
+    except Exception:
+        pass
+    mp = {}
+    try:
+        for t in fetch_naver_theme_list(limit=300):
+            try:
+                stocks, _ = fetch_naver_theme_detail(t["theme_no"], limit=60)
+            except Exception:
+                continue
+            for x in stocks:
+                mp.setdefault(x["stock_code"], []).append(t["theme_name"])
+            time.sleep(0.15)
+    except Exception as e:
+        print(f"[theme_index] 실패: {e}")
+    if mp:
+        _theme_index.update({"day": day, "map": mp})
+        try:
+            supabase.table("brief_cache").upsert({"key": "theme_index", "data": {"day": day, "map": mp},
+                                                  "updated_at": now_kst().isoformat()}).execute()
+        except Exception:
+            pass
+    return mp
+
+
+def _run_theme_index_job():
+    now = now_kst()
+    if now.weekday() < 5 and (7, 20) <= (now.hour, now.minute) <= (8, 30) and _theme_index["day"] != now.strftime("%Y-%m-%d"):
+        _build_theme_index()
+
+
+def _naver_consensus(code: str) -> dict:
+    """네이버 증권 종합 정보에서 목표주가·투자의견 (있으면 컨센서스 있음)"""
+    j = requests.get(f"https://m.stock.naver.com/api/stock/{code}/integration",
+                     headers={"User-Agent": "Mozilla/5.0", "Referer": "https://m.stock.naver.com/"}, timeout=8).json()
+
+    def deep(o, test, d=0):
+        if not isinstance(o, (dict, list)) or d > 6:
+            return None
+        items = o.items() if isinstance(o, dict) else enumerate(o)
+        for k, v in items:
+            if isinstance(k, str) and test(k) and v not in (None, "") and not isinstance(v, (dict, list)):
+                return v
+        for _, v in (o.items() if isinstance(o, dict) else enumerate(o)):
+            f = deep(v, test, d + 1)
+            if f is not None:
+                return f
+        return None
+
+    tp = deep(j, lambda k: k.lower() in ("pricetargetmean", "targetprice", "goalprice", "targetpricemean"))
+    op = deep(j, lambda k: k.lower() in ("recommmean", "opinion", "recommendmean", "investopinion"))
+    try:
+        tpv = float(str(tp).replace(",", "")) if tp is not None else None
+    except ValueError:
+        tpv = None
+    return {"has": bool(tpv), "target": tpv, "opinion": op}
+
+
+def _jmw_info(code: str) -> dict:
+    day = now_kst().strftime("%Y-%m-%d")
+    c = _jmw_info_cache.get(code)
+    if c and c[0] == day:
+        return c[1]
+    info = {"profit": None, "consensus": None, "sector": None, "themes": []}
+    try:
+        info["profit"] = fetch_dart_quarterly(code).get("latest_status")
+    except Exception:
+        pass
+    try:
+        info["consensus"] = _naver_consensus(code)
+    except Exception:
+        info["consensus"] = {"has": False}
+    try:
+        r = supabase.table("sector_stocks").select("sector_name").eq("code", code).limit(1).execute().data
+        info["sector"] = r[0]["sector_name"] if r else None
+    except Exception:
+        pass
+    if not _theme_index["map"] and not _theme_index.get("building"):
+        _theme_index["building"] = True  # 테마 목록이 아직 없으면 뒤에서 한 번 만들기 (몇 분 걸림, 다음 조회부터 보임)
+        threading.Thread(target=lambda: (_build_theme_index(), _theme_index.update({"building": False})), daemon=True).start()
+    info["themes"] = (_theme_index["map"] or {}).get(code, [])[:3]
+    if info["themes"] or _theme_index["map"]:
+        _jmw_info_cache[code] = (day, info)  # 테마가 아직 없으면 저장 안 함 → 다음 조회 때 다시
+    return info
+
+
 @app.get("/api/jmw")
 def jmw_list(cat: str = "", with_redline: bool = True):
     try:
@@ -11906,8 +12015,12 @@ def jmw_list(cat: str = "", with_redline: bool = True):
                     rl = _redline_classify(it["code"])
                 except Exception:
                     rl = {}
+            try:
+                info = _jmw_info(it["code"])
+            except Exception:
+                info = {}
             return {**it, "price": v.get("price") or 0, "pct": round(v.get("pct") or 0, 2),
-                    "value_eok": round(v.get("value_eok") or 0, 1), "volume": int(v.get("volume") or 0), "redline": rl}
+                    "value_eok": round(v.get("value_eok") or 0, 1), "volume": int(v.get("volume") or 0), "redline": rl, "info": info}
 
         with cf.ThreadPoolExecutor(max_workers=4) as ex:
             items = list(ex.map(enrich, items))
