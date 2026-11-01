@@ -12026,7 +12026,8 @@ def jmw_list(cat: str = "", with_redline: bool = True):
                 try:
                     a = _force_avg_line(it["code"], it["category"], it.get("start_at"), it.get("end_at"))
                     if a:
-                        fl = {"avg": round(a["avg"]), "gap": round((a["last"]["close"] / a["avg"] - 1) * 100, 2), "tf": a["tf"], "start": a["start"]}
+                        fl = {"avg": round(a["avg"]), "gap": round((a["last"]["close"] / a["avg"] - 1) * 100, 2), "tf": a["tf"], "start": a["start"],
+                              "nu": bool(it.get("start_at"))}
                 except Exception:
                     fl = None
             return {**it, "price": v.get("price") or 0, "pct": round(v.get("pct") or 0, 2),
@@ -12070,6 +12071,13 @@ def jmw_move(payload: dict):
     return {"ok": True}
 
 
+@app.post("/api/jmw/remove")
+def jmw_remove(payload: dict):
+    """종목코드+칸으로 빼기 (🦀 ★ 다시 누를 때)"""
+    supabase.table("jm_watchlist").delete().eq("code", payload.get("code")).eq("category", payload.get("category") or "당일 눌림").execute()
+    return {"ok": True}
+
+
 @app.post("/api/jmw/delete")
 def jmw_delete(payload: dict):
     supabase.table("jm_watchlist").delete().eq("id", payload.get("id")).execute()
@@ -12079,8 +12087,9 @@ def jmw_delete(payload: dict):
 @app.post("/api/jmw/zone")
 def jmw_zone(payload: dict):
     """당일 JM: 세력평단 시작·종료 (예: '10-28 13:36', 비우면 오늘 09:00 / 고점까지)"""
+    # 🆕 뉴기준봉: 시작 한 점만 (종료 없음) — 그 봉부터 새 세력평단선 (2026-11-01 JM)
     supabase.table("jm_watchlist").update({"start_at": (payload.get("start") or "").strip() or None,
-                                           "end_at": (payload.get("end") or "").strip() or None}).eq("id", payload.get("id")).execute()
+                                           "end_at": None}).eq("id", payload.get("id")).execute()
     _touch_state.pop(str(payload.get("code") or ""), None)
     return {"ok": True}
 
@@ -12217,7 +12226,8 @@ def _daytrade_touch_check():
             gap = (px / avg - 1) * 100
             from_peak = (px / a["peak"] - 1) * 100
             how = "5분봉 ⛰ JM 방식" if r["category"] == "당일 JM" else "3분봉 기존 방식 (눌림)"
-            msg = (f"🎯 [{r['category']}] 세력평단 터치 ({now.strftime('%H:%M')}) · {st['count']}번째\n"
+            label = "🆕 뉴기준 터치" if r.get("start_at") else "🎯 세력평단 터치"  # 뉴기준봉을 찍어두면 그 선 기준 (2026-11-01)
+            msg = (f"{label} [{r['category']}] ({now.strftime('%H:%M')}) · {st['count']}번째\n"
                    f"{r.get('name') or code} {px:,.0f}원 · 세력평단 {avg:,.0f} ({gap:+.1f}%)\n"
                    f"고점 {a['peak']:,.0f}에서 {from_peak:.1f}% · {how} · 시작 {a['start'][5:]}\n"
                    f"🔗 https://jm-tracker.vercel.app/stock-analysis?code={code}")
