@@ -3951,7 +3951,7 @@ def sync_broker_flow_endpoint(code: str):
 def fetch_investor_flow(code: str, days: int = 20):
     today = now_kst()
     fromdate = (today - timedelta(days=days * 2)).strftime("%Y%m%d")  # 주말 감안 여유있게
-    todate = _weekday_end(today.strftime("%Y%m%d"))
+    todate = _krx_ready_end(today.strftime("%Y%m%d"), 16)
 
     df = _krx_df(stock.get_market_trading_value_by_date, fromdate, todate, code, detail=True)
 
@@ -4182,6 +4182,19 @@ def _weekday_end(ymd: str) -> str:
     while d.weekday() >= 5:
         d -= timedelta(days=1)
     return d.strftime("%Y%m%d")
+
+
+def _krx_ready_end(ymd: str, ready_hour: int = 16) -> str:
+    """KRX 끝 날짜 정하기 (2026-11-02): 주말이면 금요일, 평일이라도 오늘 데이터가 아직 안 나온 시간이면(장 전·장중)
+    전 거래일로. 예전엔 월요일 새벽에 '오늘(월)'을 끝 날짜로 넣어서 KRX가 빈 값을 줬음 (HLB 통합수급 오류)"""
+    end = _weekday_end(ymd)
+    now = now_kst()
+    if end == now.strftime("%Y%m%d") and now.hour < ready_hour:
+        d = now - timedelta(days=1)
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        end = d.strftime("%Y%m%d")
+    return end
 
 
 def _latest_trading_day() -> str:
@@ -4476,7 +4489,7 @@ INST_TYPE_COLUMNS = ["금융투자", "보험", "투신", "사모", "은행", "�
 def fetch_institution_type_flow(code: str, days: int = 60):
     today = now_kst()
     fromdate = (today - timedelta(days=days * 2)).strftime("%Y%m%d")  # 주말 감안 여유있게
-    todate = _weekday_end(today.strftime("%Y%m%d"))
+    todate = _krx_ready_end(today.strftime("%Y%m%d"), 16)
 
     df = _krx_df(stock.get_market_trading_value_by_date, fromdate, todate, code, detail=True)
     print(f"[institution_type_flow] code={code} rows={len(df)} columns={list(df.columns)}")
@@ -12925,7 +12938,7 @@ def stock_ohlcv_endpoint(code: str, start: str, end: str):
         return kis_fallback("pykrx를 사용할 수 없습니다")
     try:
         start_ymd = start.replace("-", "")
-        end_ymd = _weekday_end(end.replace("-", ""))
+        end_ymd = _krx_ready_end(end.replace("-", ""), 9)  # 장 시작 전엔 오늘 일봉이 없어서 전 거래일까지
         df = _krx_df(stock.get_market_ohlcv_by_date, start_ymd, end_ymd, code, retries=1)
         if df is None or df.empty:
             return kis_fallback(f"{code} 종목의 {start}~{end} 구간 일봉 데이터가 없습니다.")
