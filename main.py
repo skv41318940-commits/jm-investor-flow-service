@@ -132,7 +132,7 @@ app = FastAPI(title="JM Investor Flow Cloud Service")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # 필요하면 본인 vercel 도메인만 허용하도록 좁혀도 됨
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],  # ⭐ 관심종목 넣기·옮기기(POST)가 막혀서 "서버 연결 실패"가 났음 (2026-11-01)
     allow_headers=["*"],
 )
 
