@@ -12268,6 +12268,67 @@ def daytrade_touch_preview():
     return {"ok": True, "items": out}
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 📋 매매일지 게시판 스냅샷 (2026-11-01 JM) — 일지를 등록할 때 그날 그 종목 정보를 한 번에 모아 같이 저장
+#   그날 시세(일봉) · 종목 투자자별 순매수(한투) · 창구(그날이 오늘이면 PC·키움 + 한투) · 빨간선 · 흑자/적자 · 컨센서스 · 업종·테마
+# ══════════════════════════════════════════════════════════════════════════
+@app.get("/api/journal-snapshot")
+def journal_snapshot(code: str, date: str = ""):
+    code = (code or "").strip().upper()
+    today = now_kst().strftime("%Y-%m-%d")
+    d = (date or today)[:10]
+    snap = {"code": code, "date": d, "at": now_kst().strftime("%Y-%m-%d %H:%M")}
+    # 그날 시세
+    try:
+        start = (datetime.strptime(d, "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d")
+        cs = _kis_daily_candles(code, start, d)
+        if cs:
+            day = cs[-1]
+            prev = cs[-2]["close"] if len(cs) >= 2 else None
+            snap["day"] = {**day, "pct": round((day["close"] / prev - 1) * 100, 2) if prev else None,
+                           "value_eok": round(day.get("amount", 0) / 1e8, 1)}
+    except Exception as e:
+        snap["day_error"] = str(e)
+    # 그 종목 투자자별 순매수 (한투 — 최근 30일 안이면)
+    try:
+        j = kis_get("/uapi/domestic-stock/v1/quotations/inquire-investor", "FHKST01010900",
+                    {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code})
+        ymd = d.replace("-", "")
+        row = next((x for x in (j.get("output") or []) if x.get("stck_bsop_date") == ymd), None)
+        if row:
+            f = lambda k: float(str(row.get(k) or 0).replace(",", "") or 0)
+            snap["investor"] = {"개인": round(f("prsn_ntby_tr_pbmn") / 100, 1), "외국인": round(f("frgn_ntby_tr_pbmn") / 100, 1),
+                                "기관": round(f("orgn_ntby_tr_pbmn") / 100, 1), "unit": "억원"}
+    except Exception as e:
+        snap["investor_error"] = str(e)
+    # 창구 (오늘이면 PC·키움 전체 + 한투 외국계 합계)
+    if d == today:
+        try:
+            b = broker_pc_get(code)
+            if b.get("ok"):
+                snap["broker_pc"] = {"at": b.get("at"), "foreign_net": b.get("foreign_net"),
+                                     "foreign": [{k: x.get(k) for k in ("name", "net", "avg_buy", "avg20", "hold20")} for x in b.get("foreign", [])[:6]],
+                                     "domestic_buy": [{k: x.get(k) for k in ("name", "net", "avg_buy")} for x in b.get("domestic_buy", []) if x.get("net", 0) > 0][:5],
+                                     "domestic_sell": [{k: x.get(k) for k in ("name", "net")} for x in b.get("domestic_sell", []) if x.get("net", 0) < 0][:5]}
+        except Exception:
+            pass
+        try:
+            bs = broker_split_endpoint(code)
+            if bs.get("ok"):
+                snap["broker_kis"] = {"glob": bs.get("glob"), "buy": bs.get("buy"), "sell": bs.get("sell")}
+        except Exception:
+            pass
+    try:
+        snap["redline"] = _redline_classify(code)
+    except Exception:
+        pass
+    try:
+        snap["info"] = _jmw_info(code)
+    except Exception:
+        pass
+    return {"ok": True, "snapshot": snap}
+
+
 @app.post("/api/watchlist-add")
 def watchlist_add_endpoint(payload: dict):
     """☆ 별표 → 관심종목 추가 (이미 있으면 그대로)"""
