@@ -11721,6 +11721,10 @@ def crab_pc_get():
             pass
     if not d:
         return {"ok": False, "alive": False, "error": "PC 프로그램에서 아직 결과가 안 왔어요 (세력트래커를 켜주세요)"}
+    # 예전 이름(꽃게 시리즈)으로 보낸 결과나 오늘 것이 아닌 결과는 안 보여줌 (2026-11-02) — 새 PC 파일로 다시 켜면 바로 바뀜
+    if not d.get("names") or str(d.get("at", ""))[:10] != now_kst().strftime("%Y-%m-%d"):
+        return {"ok": False, "alive": time.time() - at < 150,
+                "error": "오늘 PC 결과가 아직 없어요 — 새 crab_pc.py로 세력트래커를 다시 켜주세요"}
     alive = time.time() - at < 150
     v = _crab_pc_view
     if v["data"] and time.time() - v["at"] < 30:
@@ -11750,7 +11754,7 @@ def crab_pc_get():
                         "gone": gone})
         return sorted(out, key=lambda r: -r["value_eok"])
 
-    out = {"ok": True, "source": "pc", "at": str(d.get("at", ""))[11:16], "alive": alive,
+    out = {"ok": True, "source": "pc", "at": str(d.get("at", ""))[11:16], "alive": alive, "names": d.get("names") or {},
            "note": "🖥 HTS 조건검색 그대로 (PC 프로그램) · 서버는 KRX를 건드리지 않음"}
     for k in KEYS:
         out[k] = rows(d.get(k, []))
