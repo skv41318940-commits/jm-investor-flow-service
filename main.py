@@ -138,6 +138,24 @@ app.add_middleware(
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# 🔒 결사대 공유 사이트 잠금 (2026-11-01 JM) — 공유 사이트(SHARE_SITE_ORIGIN)에서 오는 요청은
+#    세력평단·패턴·관심종목·검색기·창구 평단·매매일지 주소를 못 쓰게 막음 (시장분석·매크로·통합수급만 허용)
+SHARE_SITE_ORIGIN = (os.environ.get("SHARE_SITE_ORIGIN") or "").rstrip("/").lower()
+_PRIVATE_PATHS = ("/api/stock-ohlcv", "/api/stock-minute", "/api/minute", "/api/tick-avg", "/api/query-avg", "/api/pattern",
+                  "/api/jmw", "/api/crab", "/api/swing", "/api/broker-pc", "/api/pc-", "/api/journal", "/api/daytrade",
+                  "/api/nxt", "/api/watchlist", "/api/vp", "/api/minute-calib")
+
+
+@app.middleware("http")
+async def _share_site_lock(request, call_next):
+    if SHARE_SITE_ORIGIN:
+        origin = (request.headers.get("origin") or request.headers.get("referer") or "").lower()
+        if origin.startswith(SHARE_SITE_ORIGIN) and request.url.path.startswith(_PRIVATE_PATHS):
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"ok": False, "error": "공유 사이트에서는 볼 수 없는 기능이에요"}, status_code=403,
+                                headers={"Access-Control-Allow-Origin": "*"})
+    return await call_next(request)
+
 # ── KIS 접근 토큰 캐시 (하루 1회 발급이 원칙이라 메모리에 캐싱해서 재사용) ──
 _kis_token_cache = {"token": None, "expires_at": 0}
 
@@ -12327,6 +12345,36 @@ def journal_snapshot(code: str, date: str = ""):
     except Exception:
         pass
     return {"ok": True, "snapshot": snap}
+
+
+# 🟢 해외 종목 → 네이버페이 증권 (2026-11-01 JM) — 네이버는 '티커.거래소'(예: NVDA.O 나스닥) 코드라
+#   후보를 차례로 확인해서 실제로 있는 화면으로 보내줌 (한 번 찾으면 기억)
+_naver_world_cache: dict = {}
+
+
+@app.get("/api/naver-world")
+def naver_world_redirect(symbol: str):
+    from fastapi.responses import RedirectResponse
+    sym = (symbol or "").strip().upper()
+    code = _naver_world_cache.get(sym)
+    if not code:
+        base = sym.split(".")[0].replace("-", ".")
+        cands = [sym] if "." in sym else []
+        cands += [f"{base}.O", f"{base}.N", f"{base}.K", f"{base}.A", base]
+        for c in cands:
+            try:
+                r = requests.get(f"https://api.stock.naver.com/stock/{c}/basic", headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+                if r.ok and (r.json() or {}).get("stockName"):
+                    code = c
+                    break
+            except Exception:
+                continue
+        if code:
+            _naver_world_cache[sym] = code
+    if code:
+        return RedirectResponse(f"https://stock.naver.com/worldstock/stock/{code}/finance/overview")
+    # 못 찾으면 네이버 증권 검색으로
+    return RedirectResponse(f"https://stock.naver.com/search?q={requests.utils.quote(sym)}")
 
 
 @app.post("/api/watchlist-add")
