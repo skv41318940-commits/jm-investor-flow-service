@@ -2805,6 +2805,7 @@ async def _start_ws_worker():
         print("[startup] JOBS_ENABLED=0 → 실시간 체결·알림·자동 작업 꺼짐 (화면용 주소만 작동)")
         return
     asyncio.create_task(_ws_worker())
+    threading.Thread(target=_daytrade_touch_loop, daemon=True).start()  # 🎯 당일매매 세력평단 터치 (1분마다)
     # 해외주식 실시간 체결 수집은 사용 안 함 (2026-10-08 사용자 요청) — 한투가 appkey당 실시간 연결을
     # 1개만 허용해서, 해외 연결이 켜져 있으면 국내 실시간 체결이 "ALREADY IN USE appkey"로 막힘.
     # 다시 쓰려면 Render 환경변수 OVERSEAS_WS_ENABLED=1 을 추가하면 됨 (국내장 시간엔 자동으로 양보함).
@@ -11831,7 +11832,8 @@ def swing_screeners(name: str = ""):
 # ══════════════════════════════════════════════════════════════════════════
 # ⭐ 관심종목 리뉴얼 (2026-10-31 JM) — 당일매매 + 차트의 정석 + 파동 12칸 · 빨간선(볼린저 300, 2 상단) 자동 추천
 # ══════════════════════════════════════════════════════════════════════════
-JMW_CATS = ["당일매매", "1번", "2번", "3번", "3-1번", "3-2번", "상승1파", "하락2파", "상승3파", "하락4파", "상승5파", "하락abc"]
+DAYTRADE_CATS = ["당일 JM", "당일 눌림"]  # 🎯 당일매매 두 가지 (2026-11-01 JM)
+JMW_CATS = ["당일 JM", "당일 눌림", "1번", "2번", "3번", "3-1번", "3-2번", "상승1파", "하락2파", "상승3파", "하락4파", "상승5파", "하락abc"]
 _redline_cache: dict = {}  # code → (day, 결과)
 
 
@@ -12019,8 +12021,16 @@ def jmw_list(cat: str = "", with_redline: bool = True):
                 info = _jmw_info(it["code"])
             except Exception:
                 info = {}
+            fl = None
+            if it["category"] in DAYTRADE_CATS:  # 🎯 당일매매: 세력평단선과 지금 거리
+                try:
+                    a = _force_avg_line(it["code"], it["category"], it.get("start_at"), it.get("end_at"))
+                    if a:
+                        fl = {"avg": round(a["avg"]), "gap": round((a["last"]["close"] / a["avg"] - 1) * 100, 2), "tf": a["tf"], "start": a["start"]}
+                except Exception:
+                    fl = None
             return {**it, "price": v.get("price") or 0, "pct": round(v.get("pct") or 0, 2),
-                    "value_eok": round(v.get("value_eok") or 0, 1), "volume": int(v.get("volume") or 0), "redline": rl, "info": info}
+                    "value_eok": round(v.get("value_eok") or 0, 1), "volume": int(v.get("volume") or 0), "redline": rl, "info": info, "fline": fl}
 
         with cf.ThreadPoolExecutor(max_workers=4) as ex:
             items = list(ex.map(enrich, items))
@@ -12029,13 +12039,13 @@ def jmw_list(cat: str = "", with_redline: bool = True):
 
 @app.post("/api/jmw/add")
 def jmw_add(payload: dict):
-    code, cat = (payload.get("code") or "").strip(), payload.get("category") or "당일매매"
+    code, cat = (payload.get("code") or "").strip(), payload.get("category") or "당일 눌림"
     if not code or cat not in JMW_CATS:
         return {"ok": False, "error": "종목코드·칸 확인"}
-    if cat == "당일매매":
-        n = len(supabase.table("jm_watchlist").select("id").eq("category", "당일매매").execute().data or [])
+    if cat in DAYTRADE_CATS:
+        n = len(supabase.table("jm_watchlist").select("id").eq("category", cat).execute().data or [])
         if n >= 10:
-            return {"ok": False, "error": "당일매매는 최대 10종목이에요 (창구 평단 추적 한도)"}
+            return {"ok": False, "error": f"{cat}은 최대 10종목이에요"}
     supabase.table("jm_watchlist").upsert({"code": code, "name": payload.get("name") or code, "category": cat,
                                            "memo": payload.get("memo")}, on_conflict="code,category").execute()
     return {"ok": True}
@@ -12050,10 +12060,10 @@ def jmw_move(payload: dict):
     row = (supabase.table("jm_watchlist").select("*").eq("id", rid).limit(1).execute().data or [None])[0]
     if not row:
         return {"ok": False, "error": "없는 종목"}
-    if cat == "당일매매":
-        n = len(supabase.table("jm_watchlist").select("id").eq("category", "당일매매").execute().data or [])
+    if cat in DAYTRADE_CATS:
+        n = len(supabase.table("jm_watchlist").select("id").eq("category", cat).execute().data or [])
         if n >= 10:
-            return {"ok": False, "error": "당일매매는 최대 10종목이에요"}
+            return {"ok": False, "error": f"{cat}은 최대 10종목이에요"}
     supabase.table("jm_watchlist").upsert({"code": row["code"], "name": row["name"], "category": cat, "memo": row.get("memo")},
                                            on_conflict="code,category").execute()
     supabase.table("jm_watchlist").delete().eq("id", rid).execute()
@@ -12066,10 +12076,186 @@ def jmw_delete(payload: dict):
     return {"ok": True}
 
 
+@app.post("/api/jmw/zone")
+def jmw_zone(payload: dict):
+    """당일 JM: 세력평단 시작·종료 (예: '10-28 13:36', 비우면 오늘 09:00 / 고점까지)"""
+    supabase.table("jm_watchlist").update({"start_at": (payload.get("start") or "").strip() or None,
+                                           "end_at": (payload.get("end") or "").strip() or None}).eq("id", payload.get("id")).execute()
+    _touch_state.pop(str(payload.get("code") or ""), None)
+    return {"ok": True}
+
+
 @app.post("/api/jmw/memo")
 def jmw_memo(payload: dict):
     supabase.table("jm_watchlist").update({"memo": payload.get("memo")}).eq("id", payload.get("id")).execute()
     return {"ok": True}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 🎯 당일매매 세력평단 터치 알림 (2026-11-01 JM) — ⭐ 관심종목 '당일매매' 종목
+#   3분봉 ⛰ JM 방식(09:00 ~ 오늘 고점까지 평단, 고점 뒤는 수평) 세력평단선에
+#   가격이 위에서 내려와 닿으면 → 당일매매 전용 텔레그램 봇(TELEGRAM_BOT_TOKEN_DAYTRADE)
+#   · 1분마다 확인 · 한 번 닿으면 다시 +2% 위로 올라갔다 내려와야 다음 알림 · 종목당 하루 최대 3번
+# ══════════════════════════════════════════════════════════════════════════
+_touch_state: dict = {}  # code → {"day", "armed", "count", "last"}
+
+
+def _parse_dt(txt: str, today: str):
+    """'10-28 13:36' · '2026-10-28 13:36' · '13:36' → ('YYYY-MM-DD', 'HH:MM')"""
+    t = (txt or "").strip()
+    m = re.search(r"(?:(\d{4})-)?(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})", t)
+    if m:
+        y = m.group(1) or today[:4]
+        return f"{y}-{int(m.group(2)):02d}-{int(m.group(3)):02d}", f"{int(m.group(4)):02d}:{m.group(5)}"
+    m = re.search(r"(\d{1,2}):(\d{2})", t)
+    if m:
+        return today, f"{int(m.group(1)):02d}:{m.group(2)}"
+    return None
+
+
+def _force_avg_line(code: str, mode: str, start: str = None, end: str = None):
+    """🎯 당일매매 세력평단
+    · 당일 눌림 (기존 방식·사부님 방식): 3분봉 · 오늘 09:00(또는 시작)부터 지금까지 쭉 누적
+    · 당일 JM (JM 방식): 5분봉 · 시작(비우면 오늘 09:00, 여러 날 가능) ~ 종료(비우면 고점)까지, 그 뒤 수평"""
+    today = now_kst().strftime("%Y-%m-%d")
+    tf = 3 if mode == "당일 눌림" else 5
+    st = _parse_dt(start, today) or (today, "09:00")
+    en = _parse_dt(end, today) if end else None
+    days = [today]
+    if mode == "당일 JM" and st[0] < today:
+        d = datetime.strptime(st[0], "%Y-%m-%d")
+        days = []
+        while d.strftime("%Y-%m-%d") <= today and len(days) < 12:
+            if d.weekday() < 5:
+                days.append(d.strftime("%Y-%m-%d"))
+            d += timedelta(days=1)
+    raw = []
+    for dd in days:
+        if dd == today:
+            cs, *_ = fetch_minute_candles_paginated(code, "J", "09:00")
+        else:
+            cs = (_minute_day_cached(code, dd) or {}).get("candles") or []
+        for c in cs:
+            raw.append((dd, c))
+    bars, order = {}, []
+    for dd, c in raw:
+        hh, mm = int(c["time"][:2]), int(c["time"][3:5])
+        if (hh, mm) < (9, 0) or (hh, mm) > (15, 30):
+            continue
+        k = (dd, hh * 60 + (mm // tf) * tf)
+        b = bars.get(k)
+        if not b:
+            bars[k] = {"key": f"{dd} {k[1] // 60:02d}:{k[1] % 60:02d}", "open": c["open"], "high": c["high"], "low": c["low"],
+                       "close": c["close"], "volume": c.get("volume", 0)}
+            order.append(k)
+        else:
+            b["high"] = max(b["high"], c["high"])
+            b["low"] = min(b["low"], c["low"])
+            b["close"] = c["close"]
+            b["volume"] += c.get("volume", 0)
+    seq = [bars[k] for k in sorted(order)]
+    s_key = f"{st[0]} {st[1]}"
+    fr = next((i for i, b in enumerate(seq) if b["key"] >= s_key), None)
+    if fr is None or len(seq) - fr < 2:
+        return None
+    to = len(seq) - 1
+    if mode == "당일 JM":
+        if en:
+            e_key = f"{en[0]} {en[1]}"
+            to = max(fr, max((i for i, b in enumerate(seq) if b["key"] <= e_key), default=to))
+        else:
+            to = max(range(fr, len(seq)), key=lambda i: seq[i]["high"])  # ⛰ 고점까지
+    bv = bq = 0.0
+    for b in seq[fr:to + 1]:
+        p, o, v = b["close"], b["open"] or b["close"], b["volume"] or 0
+        if p > 0 and v > 0:
+            ratio = min(abs(p - o) / o * 5, 0.45)
+            net = int(v * ratio) if p >= o else -int(v * ratio)
+            q = max(0, (v + net) // 2)
+            if q > 0:
+                bv += p * q
+                bq += q
+    if bq <= 0:
+        return None
+    peak = max(b["high"] for b in seq[fr:])
+    return {"avg": bv / bq, "peak": peak, "last": seq[-1], "tf": tf, "start": s_key, "n": len(seq) - fr}
+
+
+def _daytrade_touch_check():
+    now = now_kst()
+    if now.weekday() >= 5 or not ((9, 6) <= (now.hour, now.minute) <= (15, 20)):
+        return
+    try:
+        # 🎯 터치 알림은 '당일 눌림'(3분봉 기존 방식)만 — 당일 JM은 알림 없이 화면에서만 (2026-11-01 JM)
+        rows = supabase.table("jm_watchlist").select("code,name,category,start_at,end_at").eq("category", "당일 눌림").limit(10).execute().data or []
+    except Exception:
+        return
+    tok, chat = bot("daytrade")
+    day = now.strftime("%Y-%m-%d")
+    for r in rows:
+        code = r["code"]
+        st = _touch_state.get(code)
+        if not st or st["day"] != day:
+            st = {"day": day, "armed": False, "count": 0, "last": 0.0}
+            _touch_state[code] = st
+        if st["count"] >= 3:
+            continue
+        try:
+            a = _force_avg_line(code, r["category"], r.get("start_at"), r.get("end_at"))
+        except Exception:
+            continue
+        if not a:
+            continue
+        avg, last = a["avg"], a["last"]
+        px = last["close"]
+        if px >= avg * 1.02:
+            st["armed"] = True  # 평단보다 충분히 위 → 다음에 내려와 닿으면 알림
+            continue
+        touched = st["armed"] and last["low"] <= avg * 1.003 and px >= avg * 0.985
+        if touched and time.time() - st["last"] > 600:
+            st.update({"armed": False, "count": st["count"] + 1, "last": time.time()})
+            gap = (px / avg - 1) * 100
+            from_peak = (px / a["peak"] - 1) * 100
+            how = "5분봉 ⛰ JM 방식" if r["category"] == "당일 JM" else "3분봉 기존 방식 (눌림)"
+            msg = (f"🎯 [{r['category']}] 세력평단 터치 ({now.strftime('%H:%M')}) · {st['count']}번째\n"
+                   f"{r.get('name') or code} {px:,.0f}원 · 세력평단 {avg:,.0f} ({gap:+.1f}%)\n"
+                   f"고점 {a['peak']:,.0f}에서 {from_peak:.1f}% · {how} · 시작 {a['start'][5:]}\n"
+                   f"🔗 https://jm-tracker.vercel.app/stock-analysis?code={code}")
+            send_telegram(msg, tok, chat)
+        time.sleep(0.2)
+
+
+def _daytrade_touch_loop():
+    time.sleep(60)
+    while True:
+        try:
+            _daytrade_touch_check()
+        except Exception as e:
+            print(f"[daytrade_touch] 실패: {e}")
+        time.sleep(60)
+
+
+@app.get("/api/daytrade-touch")
+def daytrade_touch_preview():
+    """지금 당일매매 종목들의 3분봉 세력평단·거리 미리 보기 (알림은 안 보냄)"""
+    out = []
+    try:
+        rows = supabase.table("jm_watchlist").select("code,name,category,start_at,end_at").in_("category", DAYTRADE_CATS).limit(20).execute().data or []
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    for r in rows:
+        try:
+            a = _force_avg_line(r["code"], r["category"], r.get("start_at"), r.get("end_at"))
+        except Exception as e:
+            a = None
+        if a:
+            px = a["last"]["close"]
+            out.append({"code": r["code"], "name": r.get("name"), "category": r["category"], "tf": a["tf"], "start": a["start"],
+                        "price": px, "avg": round(a["avg"]), "gap": round((px / a["avg"] - 1) * 100, 2),
+                        "peak": a["peak"], "state": _touch_state.get(r["code"])})
+        else:
+            out.append({"code": r["code"], "name": r.get("name"), "error": "오늘 분봉 없음"})
+    return {"ok": True, "items": out}
 
 
 @app.post("/api/watchlist-add")
@@ -12226,7 +12412,7 @@ def _run_broker_pc_track():
     _bpc["track_at"] = time.time()
     # ⭐ 관심종목 '당일매매' 칸은 열어보지 않아도 장 내내 자동 추적 (2026-10-31)
     try:
-        for r in supabase.table("jm_watchlist").select("code").eq("category", "당일매매").limit(10).execute().data or []:
+        for r in supabase.table("jm_watchlist").select("code").in_("category", DAYTRADE_CATS).limit(20).execute().data or []:
             _bpc["tracked"][r["code"]] = time.time()
     except Exception:
         pass
