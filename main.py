@@ -12607,8 +12607,14 @@ def pc_task_result_get(kind: str):
 
 
 # 🌅 NXT 프리마켓 (08:00~08:50) — PC가 키움으로 '종목코드_NX' 시세를 받아옴 (2026-10-30)
+# 🌅 NXT 프리마켓에 항상 넣는 대형주 30 (시장이 어느 쪽으로 열릴지 읽기용, 2026-11-02)
+NXT_BIG_CAPS = ["005930", "000660", "373220", "207940", "005380", "000270", "068270", "105560", "055550", "035420",
+                "012450", "329180", "028260", "006400", "051910", "042660", "012330", "035720", "086790", "009540",
+                "034020", "010140", "267260", "402340", "009150", "196170", "247540", "086520", "028300", "042700"]
+
+
 def _nxt_candidates() -> list:
-    codes = []
+    codes = list(NXT_BIG_CAPS)
     try:
         codes += [r["code"] for r in (supabase.table("watchlist").select("code").limit(60).execute().data or []) if r.get("code")]
     except Exception:
@@ -12651,16 +12657,23 @@ def _run_nxt_premarket():
             print("[nxt] 시세가 비어 있음 — 키움이 _NX 시세를 안 주는 듯")
             _mark_brief_sent("nxt_premarket", day)
             return
+        big = [x for x in rows if x["code"] in NXT_BIG_CAPS]
+        mood = ""
+        if big:
+            avg = sum(x["pct"] for x in big) / len(big)
+            ups = sum(1 for x in big if x["pct"] > 0)
+            mood = f"대형주 {len(big)}개 평균 {avg:+.2f}% · 상승 {ups} / 하락 {len(big) - ups} → " + \
+                   ("🔴 강하게 열릴 듯" if avg >= 0.7 else "🔵 약하게 열릴 듯" if avg <= -0.7 else "⚪ 보합 출발 예상")
         up = sorted(rows, key=lambda x: -x["pct"])[:8]
         dn = sorted(rows, key=lambda x: x["pct"])[:3]
         link = lambda c: f"https://jm-tracker.vercel.app/stock-analysis?code={c}"
-        lines = [f"🌅 NXT 프리마켓 ({r.get('at', '')[:5]} 기준 · {len(rows)}종목)", "▲ 강한 종목"]
+        lines = [f"🌅 NXT 프리마켓 ({r.get('at', '')[:5]} 기준 · {len(rows)}종목)"] + ([f"📊 {mood}"] if mood else []) + ["▲ 강한 종목"]
         lines += [f"· {x.get('name') or x['code']} {x['pct']:+.2f}% · {x['price']:,}원 · {x['volume']:,}주\n  🔗 {link(x['code'])}" for x in up if x["pct"] > 0]
         weak = [x for x in dn if x["pct"] < 0]
         if weak:
             lines.append("▼ 약한 종목")
             lines += [f"· {x.get('name') or x['code']} {x['pct']:+.2f}%" for x in weak]
-        lines.append("※ 관심종목·꽃게·52주 신고가 후보만 본 거예요 (NXT 프리마켓은 거래가 적어 방향 참고용)")
+        lines.append("※ 대형주 30 + 관심종목·검색기·52주 신고가 후보 (NXT 프리마켓은 거래가 적어 방향 참고용 — 매매는 KRX 정규장)")
         if send_telegram("\n".join(lines)):
             _mark_brief_sent("nxt_premarket", day)
 
