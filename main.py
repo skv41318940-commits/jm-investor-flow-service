@@ -2778,6 +2778,7 @@ async def _daily_jobs_worker():
         ("broker_pc_track", _run_broker_pc_track, ()),
         ("pc_off_alert", _run_pc_off_alert, ()),
         ("nxt_premarket", _run_nxt_premarket, ()),
+        ("swing_after_close", _run_swing_after_close, ()),
         ("weekly_review", _run_weekly_review, ()),
         ("krx_map", _run_krx_map_job, ()),
         ("new_listing", _run_new_listing_job, ()),
@@ -11738,6 +11739,226 @@ def crab_pc_get():
     return out
 
 
+# 🌙 스윙 검색기 (2026-10-31 JM) — 정규장 마감 후 PC가 조건식 8개를 한 번씩 검색해서 올림
+SWING_NAMES = ["양산w", "거래대금 기준봉", "황금맥", "기준v", "노랑등대", "이제가나", "역배정초", "꽃열매"]
+_swing = {"data": None, "at": 0.0}
+_swing_view: dict = {}
+
+
+@app.post("/api/swing-pc")
+def swing_pc_post(payload: dict):
+    _swing.update({"data": payload, "at": time.time()})
+    _swing_view.clear()
+    try:
+        supabase.table("brief_cache").upsert({"key": "swing_pc", "data": payload, "updated_at": now_kst().isoformat()}).execute()
+    except Exception:
+        pass
+    return {"ok": True}
+
+
+@app.post("/api/swing-run")
+def swing_run():
+    """사이트의 '🔄 다시 조회' — PC에 스윙 검색기 조회를 맡김"""
+    with _bpc_lock:
+        _bpc["tasks"].append({"kind": "swing"})
+    return {"ok": True, "pc_alive": time.time() - _bpc["alive_at"] < 20}
+
+
+def _run_swing_after_close():
+    now = now_kst()
+    if now.weekday() >= 5 or not ((15, 45) <= (now.hour, now.minute) <= (17, 0)):
+        return
+    day = now.strftime("%Y-%m-%d")
+    if _brief_already_sent("job_swing", day) or time.time() - _bpc["alive_at"] > 20:
+        return
+    with _bpc_lock:
+        _bpc["tasks"].append({"kind": "swing"})
+    _mark_brief_sent("job_swing", day)
+
+
+@app.get("/api/swing-screeners")
+def swing_screeners(name: str = ""):
+    d = _swing["data"]
+    if not d:
+        try:
+            r = supabase.table("brief_cache").select("data").eq("key", "swing_pc").limit(1).execute().data
+            if r:
+                d = r[0]["data"]
+                _swing.update({"data": d, "at": time.time()})
+        except Exception:
+            pass
+    if not d:
+        return {"ok": False, "error": "아직 스윙 검색 결과가 없어요 (정규장 마감 후 PC가 켜져 있으면 자동, 또는 🔄 다시 조회)"}
+    sc = d.get("screeners", {})
+    norm = lambda t: re.sub(r"\s", "", t or "")
+    summary = []
+    for nm in SWING_NAMES:
+        hit = next((v for k, v in sc.items() if norm(k) == norm(nm)), None)
+        summary.append({"name": nm, "count": len(hit["codes"]) if hit and not hit.get("missing") else 0,
+                        "missing": (hit or {}).get("missing", hit is None)})
+    out = {"ok": True, "at": d.get("at", ""), "screeners": summary}
+    if name:
+        hit = next((v for k, v in sc.items() if norm(k) == norm(name)), None)
+        codes = (hit or {}).get("codes", [])[:150]
+        key = (name, d.get("at"))
+        if key not in _swing_view:
+            import concurrent.futures as cf
+
+            def q(x):
+                try:
+                    v = _kis_quote(x["code"])
+                except Exception:
+                    v = {}
+                return {"code": x["code"], "name": x.get("name") or x["code"], "price": v.get("price") or 0,
+                        "pct": round(v.get("pct") or 0, 2), "value_eok": round(v.get("value_eok") or 0, 1), "volume": int(v.get("volume") or 0)}
+
+            with cf.ThreadPoolExecutor(max_workers=4) as ex:
+                _swing_view[key] = sorted(ex.map(q, codes), key=lambda r: -r["value_eok"])
+        out["rows"] = _swing_view[key]
+        out["name"] = name
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ⭐ 관심종목 리뉴얼 (2026-10-31 JM) — 당일매매 + 차트의 정석 + 파동 12칸 · 빨간선(볼린저 300, 2 상단) 자동 추천
+# ══════════════════════════════════════════════════════════════════════════
+JMW_CATS = ["당일매매", "1번", "2번", "3번", "3-1번", "3-2번", "상승1파", "하락2파", "상승3파", "하락4파", "상승5파", "하락abc"]
+_redline_cache: dict = {}  # code → (day, 결과)
+
+
+def _redline_classify(code: str) -> dict:
+    """🔴 빨간선(볼린저 300, 2 상단)으로 차트의 정석 위치 추천 — JM 기준
+    돌파: 돌파 전 빨간선 하락 = 1번 / 빨간선 완만 = 3번
+    이탈: 이탈 후 급락 = 2번 / 이탈 후 올랐다 내렸다 반복(매물소화·하방매집) = 3-1번"""
+    today = now_kst().strftime("%Y-%m-%d")
+    c = _redline_cache.get(code)
+    if c and c[0] == today:
+        return c[1]
+    end = now_kst().strftime("%Y-%m-%d")
+    start = (now_kst() - timedelta(days=560)).strftime("%Y-%m-%d")
+    cs = _kis_daily_candles(code, start, end)  # 한투 일봉 (KRX 부담 없음)
+    res = {"suggest": None, "why": "데이터 부족", "gap": None, "slope": None}
+    if len(cs) >= 320:
+        cl = [x["close"] for x in cs]
+        up = []
+        for i in range(len(cl)):
+            if i < 299:
+                up.append(None)
+                continue
+            w = cl[i - 299:i + 1]
+            m = sum(w) / 300
+            sd = (sum((v - m) ** 2 for v in w) / 300) ** 0.5
+            up.append(m + 2 * sd)
+        n = len(cl) - 1
+        gap = (cl[n] / up[n] - 1) * 100
+        slope = lambda a, b: (up[b] / up[a] - 1) * 100 if up[a] and up[b] else 0.0
+        above = [up[i] is not None and cl[i] > up[i] for i in range(len(cl))]
+        # 최근 돌파·이탈 시점 찾기 (최근 60봉)
+        cross_up = next((i for i in range(n, max(300, n - 60), -1) if above[i] and not above[i - 1]), None)
+        cross_dn = next((i for i in range(n, max(300, n - 60), -1) if not above[i] and above[i - 1]), None)
+        res.update({"gap": round(gap, 1), "slope": round(slope(n - 20, n), 2)})
+        if above[n]:
+            i0 = cross_up if cross_up is not None else n
+            before = slope(max(300, i0 - 30), i0)  # 돌파 전 30봉 동안 빨간선 기울기
+            if before < -0.3:
+                res.update({"suggest": "1번", "why": f"빨간선 돌파 · 돌파 전 빨간선 하락({before:+.1f}%)"})
+            else:
+                res.update({"suggest": "3번", "why": f"빨간선 돌파 · 빨간선 완만({before:+.1f}%)"})
+        elif cross_dn is not None:
+            seg = cl[cross_dn:n + 1]
+            low_gap = min((cl[i] / up[i] - 1) * 100 for i in range(cross_dn, n + 1))
+            swings = sum(1 for i in range(1, len(seg) - 1) if (seg[i] - seg[i - 1]) * (seg[i + 1] - seg[i]) < 0)
+            if low_gap <= -12 and len(seg) <= 15:
+                res.update({"suggest": "2번", "why": f"빨간선 이탈 후 급락(빨간선 대비 {low_gap:.0f}%)"})
+            elif low_gap > -12 and swings >= 3:
+                res.update({"suggest": "3-1번", "why": f"빨간선 이탈 후 오르내림 반복({swings}번) · 매물소화·하방매집"})
+            else:
+                res.update({"suggest": "2번", "why": f"빨간선 이탈 ({low_gap:.0f}%)"})
+        else:
+            res.update({"suggest": None, "why": f"빨간선 아래 ({gap:.0f}%) · 아직 돌파 전"})
+    _redline_cache[code] = (today, res)
+    return res
+
+
+@app.get("/api/jmw")
+def jmw_list(cat: str = "", with_redline: bool = True):
+    try:
+        q = supabase.table("jm_watchlist").select("*").order("added_at", desc=True)
+        if cat:
+            q = q.eq("category", cat)
+        items = q.limit(400).execute().data or []
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    counts = {c: 0 for c in JMW_CATS}
+    for it in items:
+        counts[it["category"]] = counts.get(it["category"], 0) + 1
+    if cat:
+        import concurrent.futures as cf
+
+        def enrich(it):
+            try:
+                v = _kis_quote(it["code"])
+            except Exception:
+                v = {}
+            rl = {}
+            if with_redline:
+                try:
+                    rl = _redline_classify(it["code"])
+                except Exception:
+                    rl = {}
+            return {**it, "price": v.get("price") or 0, "pct": round(v.get("pct") or 0, 2),
+                    "value_eok": round(v.get("value_eok") or 0, 1), "volume": int(v.get("volume") or 0), "redline": rl}
+
+        with cf.ThreadPoolExecutor(max_workers=4) as ex:
+            items = list(ex.map(enrich, items))
+    return {"ok": True, "cats": JMW_CATS, "counts": counts, "items": items}
+
+
+@app.post("/api/jmw/add")
+def jmw_add(payload: dict):
+    code, cat = (payload.get("code") or "").strip(), payload.get("category") or "당일매매"
+    if not code or cat not in JMW_CATS:
+        return {"ok": False, "error": "종목코드·칸 확인"}
+    if cat == "당일매매":
+        n = len(supabase.table("jm_watchlist").select("id").eq("category", "당일매매").execute().data or [])
+        if n >= 10:
+            return {"ok": False, "error": "당일매매는 최대 10종목이에요 (창구 평단 추적 한도)"}
+    supabase.table("jm_watchlist").upsert({"code": code, "name": payload.get("name") or code, "category": cat,
+                                           "memo": payload.get("memo")}, on_conflict="code,category").execute()
+    return {"ok": True}
+
+
+@app.post("/api/jmw/move")
+def jmw_move(payload: dict):
+    """칸 옮기기 (같은 종목이 새 칸에 이미 있으면 옛 칸만 지움)"""
+    rid, cat = payload.get("id"), payload.get("category")
+    if cat not in JMW_CATS:
+        return {"ok": False, "error": "칸 이름 확인"}
+    row = (supabase.table("jm_watchlist").select("*").eq("id", rid).limit(1).execute().data or [None])[0]
+    if not row:
+        return {"ok": False, "error": "없는 종목"}
+    if cat == "당일매매":
+        n = len(supabase.table("jm_watchlist").select("id").eq("category", "당일매매").execute().data or [])
+        if n >= 10:
+            return {"ok": False, "error": "당일매매는 최대 10종목이에요"}
+    supabase.table("jm_watchlist").upsert({"code": row["code"], "name": row["name"], "category": cat, "memo": row.get("memo")},
+                                           on_conflict="code,category").execute()
+    supabase.table("jm_watchlist").delete().eq("id", rid).execute()
+    return {"ok": True}
+
+
+@app.post("/api/jmw/delete")
+def jmw_delete(payload: dict):
+    supabase.table("jm_watchlist").delete().eq("id", payload.get("id")).execute()
+    return {"ok": True}
+
+
+@app.post("/api/jmw/memo")
+def jmw_memo(payload: dict):
+    supabase.table("jm_watchlist").update({"memo": payload.get("memo")}).eq("id", payload.get("id")).execute()
+    return {"ok": True}
+
+
 @app.post("/api/watchlist-add")
 def watchlist_add_endpoint(payload: dict):
     """☆ 별표 → 관심종목 추가 (이미 있으면 그대로)"""
@@ -11890,6 +12111,12 @@ def _run_broker_pc_track():
     if time.time() - _bpc.get("track_at", 0) < 115 or time.time() - _bpc["alive_at"] > 20:
         return
     _bpc["track_at"] = time.time()
+    # ⭐ 관심종목 '당일매매' 칸은 열어보지 않아도 장 내내 자동 추적 (2026-10-31)
+    try:
+        for r in supabase.table("jm_watchlist").select("code").eq("category", "당일매매").limit(10).execute().data or []:
+            _bpc["tracked"][r["code"]] = time.time()
+    except Exception:
+        pass
     with _bpc_lock:
         live = {c: t for c, t in _bpc["tracked"].items() if time.time() - t < 3600}
         _bpc["tracked"] = live
