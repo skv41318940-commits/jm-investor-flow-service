@@ -12421,6 +12421,7 @@ def _jmw_info(code: str) -> dict:
     return info
 
 
+_cons_cache: dict = {}      # code → (day, 컨센서스)
 _jmw_heavy: dict = {}       # (code, category, start_at) → {"rl", "info", "fl", "at"}
 _jmw_heavy_busy: dict = {}
 
@@ -12440,6 +12441,17 @@ def _jmw_fill_heavy(items, with_redline, cat):
                     info = _jmw_info(it["code"])
                 except Exception:
                     info = {}
+            else:
+                # 🎯 당일매매도 컨센서스만은 보이게 (2026-11-02 JM) — 네이버 한 번, 하루 보관
+                day = now_kst().strftime("%Y-%m-%d")
+                cc = _cons_cache.get(it["code"])
+                if not cc or cc[0] != day:
+                    try:
+                        cc = (day, _naver_consensus(it["code"]))
+                    except Exception:
+                        cc = (day, {"has": False})
+                    _cons_cache[it["code"]] = cc
+                info = {"consensus": cc[1]}
             if simple:
                 try:
                     a = _force_avg_line(it["code"], it["category"], it.get("start_at"), it.get("end_at"))
