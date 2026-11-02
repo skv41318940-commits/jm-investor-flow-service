@@ -12303,7 +12303,7 @@ def _daytrade_touch_check():
         if not st or st["day"] != day:
             st = {"day": day, "armed": False, "count": 0, "last": 0.0}
             _touch_state[code] = st
-        if st["count"] >= 3:
+        if st["count"] >= 1:  # 🎯 종목당 하루 한 번만 (2026-11-02 JM) — 뉴기준봉을 새로 찍으면 다시 한 번
             continue
         try:
             a = _force_avg_line(code, r["category"], r.get("start_at"), r.get("end_at"))
@@ -12323,7 +12323,7 @@ def _daytrade_touch_check():
             from_peak = (px / a["peak"] - 1) * 100
             how = "5분봉 ⛰ JM 방식" if r["category"] == "당일 JM" else "3분봉 기존 방식 (눌림)"
             label = "🆕 뉴기준 터치" if r.get("start_at") else "🎯 세력평단 터치"  # 뉴기준봉을 찍어두면 그 선 기준 (2026-11-01)
-            msg = (f"{label} [{r['category']}] ({now.strftime('%H:%M')}) · {st['count']}번째\n"
+            msg = (f"{label} [{r['category']}] ({now.strftime('%H:%M')})\n"
                    f"{r.get('name') or code} {px:,.0f}원 · 세력평단 {avg:,.0f} ({gap:+.1f}%)\n"
                    f"고점 {a['peak']:,.0f}에서 {from_peak:.1f}% · {how} · 시작 {a['start'][5:]}\n"
                    f"🔗 https://jm-tracker.vercel.app/stock-analysis?code={code}")
