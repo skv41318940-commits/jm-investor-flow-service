@@ -11958,7 +11958,8 @@ def _jm_signal_series(code: str) -> dict:
         if m5[t] is not None and m5[t - 1] is not None:
             a = any(C[j] / C[j - 1] >= 1.10 for j in range(max(1, t - 25), t + 1))
             bb = any(A[j] >= 5e9 for j in range(max(0, t - 4), t + 1))
-            if a and bb and C[t] > m5[t] and C[t - 1] <= m5[t - 1] and H[t - 1] < C[t] and C[t] > C[t - 1]:
+            V_ = b[t]["volume"]; Vp = b[t - 1]["volume"]
+            if a and bb and C[t] > m5[t] and C[t - 1] <= m5[t - 1] and H[t - 1] < C[t] and C[t] > C[t - 1] and V_ > Vp:  # F 거래량 증가 (11/2 확정)
                 g_dates.append(b[t]["date"])
         # ▲ 역배정초
         if t >= 305 and u300[t] is not None and u300[t - 2] is not None and m60[t] is not None and m20[t - 12] is not None:
@@ -11978,6 +11979,55 @@ def _jm_signal_series(code: str) -> dict:
 
 def _jm_signals_today(code: str) -> dict:
     return _jm_signal_series(code)["today"]
+
+
+@app.get("/api/gom-debug")
+def gom_debug(code: str, dates: str):
+    """🐻 곰발 연구용 (2026-11-02): 날짜마다 곰발 조건 A~F 통과 여부 + '숨은 조건' 후보 숫자를 나란히
+    예: /api/gom-debug?code=030530&dates=2026-08-10,2026-08-14,2026-09-02"""
+    code = (code or "").strip().upper()
+    want = [d.strip() for d in dates.split(",") if d.strip()]
+    end = now_kst().strftime("%Y-%m-%d")
+    start = (now_kst() - timedelta(days=760)).strftime("%Y-%m-%d")
+    b = _kis_daily_candles(code, start, end)
+    idx = {x["date"]: i for i, x in enumerate(b)}
+    C = [x["close"] for x in b]; O = [x["open"] for x in b]; H = [x["high"] for x in b]; V = [x["volume"] for x in b]
+    A = [(x.get("amount") or 0) or x["close"] * x["volume"] for x in b]
+    sma = lambda arr, k, i: (sum(arr[i - k + 1:i + 1]) / k) if i >= k - 1 else None
+    out = []
+    for d in want:
+        i = idx.get(d)
+        if i is None or i < 30:
+            out.append({"date": d, "error": "그날 일봉 없음(휴장일?)"})
+            continue
+        m5, m5p, m20, m60 = sma(C, 5, i), sma(C, 5, i - 1), sma(C, 20, i), sma(C, 60, i)
+        surge = [j for j in range(max(1, i - 25), i + 1) if C[j] / C[j - 1] >= 1.10]
+        conds = {
+            "A_26봉내_+10%": bool(surge),
+            "B_5봉내_거래대금50억": any(A[j] >= 5e9 for j in range(i - 4, i + 1)),
+            "C_종가5이평돌파": bool(C[i] > m5 and C[i - 1] <= m5p),
+            "D_전일고가돌파": H[i - 1] < C[i],
+            "E_전일보다상승": C[i] > C[i - 1],
+            "F_거래량증가": V[i] > V[i - 1],
+        }
+        hints = {
+            "당일등락률%": round((C[i] / C[i - 1] - 1) * 100, 2),
+            "양봉": C[i] > O[i],
+            "당일거래대금억": round(A[i] / 1e8, 1),
+            "거래량_전일대비배": round(V[i] / V[i - 1], 2) if V[i - 1] else None,
+            "어제도_거래량증가였나": V[i - 1] > V[i - 2],   # false면 CrossUp(V, V(1)) = '증가로 전환한 날'
+            "거래량_돌파전환(CrossUp)": V[i] > V[i - 1] and V[i - 1] <= V[i - 2],
+            "거래량_5일평균대비배": round(V[i] / (sum(V[i - 5:i]) / 5), 2) if sum(V[i - 5:i]) else None,
+            "5이평_상승중": m5 > m5p,
+            "종가>20이평": C[i] > m20 if m20 else None,
+            "5이평>20이평": m5 > m20 if m20 else None,
+            "20이평>60이평": (m20 > m60) if (m20 and m60) else None,
+            "급등일로부터_며칠": (i - surge[-1]) if surge else None,
+            "급등일": b[surge[-1]]["date"] if surge else None,
+            "26봉최고가대비%": round((C[i] / max(H[i - 25:i + 1]) - 1) * 100, 1),
+        }
+        out.append({"date": d, "곰발_전부통과": all(conds.values()), "조건": conds, "숨은조건_후보": hints})
+    return {"ok": True, "code": code, "rows": out}
 
 
 @app.get("/api/jm-signals")
