@@ -11752,6 +11752,68 @@ def crab_pc_post(payload: dict):
     return {"ok": True}
 
 
+# 🐻 곰발 · ▲ 역배정초 일봉 신호 (2026-11-02 JM) — 사이트 lib/jmSignals.ts와 같은 공식 (검색기에 '오늘 신호 있음/없음')
+_sig_cache: dict = {}   # code → (계산 시각, {"g": bool, "y": bool})
+_sig_busy = {"on": False}
+
+
+def _jm_signals_today(code: str) -> dict:
+    end = now_kst().strftime("%Y-%m-%d")
+    start = (now_kst() - timedelta(days=600)).strftime("%Y-%m-%d")
+    b = _kis_daily_candles(code, start, end)
+    n = len(b)
+    if n < 7:
+        return {"g": False, "y": False}
+    C = [x["close"] for x in b]; H = [x["high"] for x in b]
+    A = [x.get("amount") or x["close"] * x["volume"] for x in b]
+
+    def sma(arr, k, i):
+        return sum(arr[i - k + 1:i + 1]) / k if i >= k - 1 else None
+
+    def bbu(arr, k, i):
+        m = sma(arr, k, i)
+        if m is None:
+            return None
+        return m + 2 * (sum((v - m) ** 2 for v in arr[i - k + 1:i + 1]) / k) ** 0.5
+
+    i = n - 1
+    # 🐻 곰발
+    a = any(C[j] / C[j - 1] >= 1.10 for j in range(max(1, i - 25), i + 1))
+    bb = any(A[j] >= 5e9 for j in range(max(0, i - 4), i + 1))
+    m5, m5p = sma(C, 5, i), sma(C, 5, i - 1)
+    g = bool(a and bb and m5 and m5p and C[i] > m5 and C[i - 1] <= m5p and H[i - 1] < C[i] and C[i] > C[i - 1])
+    # ▲ 역배정초
+    y = False
+    if n >= 306:
+        u = [bbu(C, 300, i - k) for k in range(3)]
+        m20 = lambda k: sma(C, 20, i - k)
+        m60 = lambda k: sma(C, 60, i - k)
+        A1 = u[0] > u[1] > u[2]
+        A2 = m20(10) < m20(11) < m20(12)
+        tr = any(m20(t + 1) > m20(t) and m20(t - 1) > m20(t) for t in range(1, 6))
+
+        def cu(j, f):
+            x0, x1 = f(j), f(j + 1)
+            return x0 is not None and x1 is not None and H[i - j] > x0 and H[i - j - 1] <= x1
+
+        A8 = any(cu(j, lambda k: bbu(C, 20, i - k)) for j in range(5))
+        A11 = any(cu(j, m60) for j in range(5))
+        y = bool(A1 and A2 and tr and A8 and m20(0) < m60(0) and C[i] > m20(0) and A11 and sma(A, 5, i) >= 5e9)
+    return {"g": g, "y": y}
+
+
+def _sig_fill(codes):
+    try:
+        for c in codes:
+            try:
+                _sig_cache[c] = (time.time(), _jm_signals_today(c))
+            except Exception:
+                _sig_cache[c] = (time.time(), {"g": None, "y": None})
+            time.sleep(0.05)
+    finally:
+        _sig_busy["on"] = False
+
+
 @app.get("/api/crab-pc")
 def crab_pc_get():
     """PC 결과 + 현재가·등락률·거래대금·거래량(한투) · PC가 1분 넘게 소식 없으면 'PC 꺼짐'"""
@@ -11789,6 +11851,12 @@ def crab_pc_get():
 
     with cf.ThreadPoolExecutor(max_workers=4) as ex:
         quotes = dict(ex.map(q, list(codes)[:120]))
+    # 🐻▲ 오늘 신호: 장중엔 10분, 장 마감 후엔 하루 보관 — 없거나 오래된 건 뒤에서 계산
+    ttl = 600 if 9 <= now_kst().hour < 16 else 6 * 3600
+    stale = [c for c in codes if not _sig_cache.get(c) or time.time() - _sig_cache[c][0] > ttl]
+    if stale and not _sig_busy["on"]:
+        _sig_busy["on"] = True
+        threading.Thread(target=_sig_fill, args=(stale[:80],), daemon=True).start()
 
     def rows(lst, gone=False):
         out = []
@@ -11797,7 +11865,7 @@ def crab_pc_get():
             out.append({"code": x["code"], "name": x.get("name") or x["code"], "price": qq.get("price") or 0,
                         "pct": round(qq.get("pct") or 0, 2), "value_eok": round(qq.get("value_eok") or 0, 1), "volume": int(qq.get("volume") or 0),
                         "position": "—", "since": x.get("since"), "out": x.get("out") if gone else None,
-                        "gone": gone})
+                        "gone": gone, "sig": (_sig_cache.get(x["code"]) or (0, None))[1]})
         return sorted(out, key=lambda r: -r["value_eok"])
 
     out = {"ok": True, "source": "pc", "at": str(d.get("at", ""))[11:16], "alive": alive, "names": d.get("names") or {},
