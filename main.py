@@ -12059,6 +12059,38 @@ def _jmw_info(code: str) -> dict:
     return info
 
 
+_jmw_heavy: dict = {}       # (code, category, start_at) → {"rl", "info", "fl", "at"}
+_jmw_heavy_busy: dict = {}
+
+
+def _jmw_fill_heavy(items, with_redline, cat):
+    try:
+        for it in items:
+            rl, info, fl = {}, {}, None
+            simple = it["category"] in DAYTRADE_CATS  # 🎯 당일매매는 심플하게: 세력평단선만 (2026-11-02 JM)
+            if with_redline and not simple:
+                try:
+                    rl = _redline_classify(it["code"])
+                except Exception:
+                    rl = {}
+            if not simple:
+                try:
+                    info = _jmw_info(it["code"])
+                except Exception:
+                    info = {}
+            if simple:
+                try:
+                    a = _force_avg_line(it["code"], it["category"], it.get("start_at"), it.get("end_at"))
+                    if a:
+                        fl = {"avg": round(a["avg"]), "gap": round((a["last"]["close"] / a["avg"] - 1) * 100, 2), "tf": a["tf"],
+                              "start": a["start"], "nu": bool(it.get("start_at"))}
+                except Exception:
+                    fl = None
+            _jmw_heavy[(it["code"], it["category"], it.get("start_at"))] = {"rl": rl, "info": info, "fl": fl, "at": time.time()}
+    finally:
+        _jmw_heavy_busy[cat] = False
+
+
 @app.get("/api/jmw")
 def jmw_list(cat: str = "", with_redline: bool = True):
     try:
@@ -12072,37 +12104,33 @@ def jmw_list(cat: str = "", with_redline: bool = True):
     for it in items:
         counts[it["category"]] = counts.get(it["category"], 0) + 1
     if cat:
+        # ⚡ 화면은 바로 뜨게 (2026-11-02): 시세만 바로 받고, 무거운 것(빨간선·실적·컨센서스·세력평단선)은
+        #    보관해 둔 값을 쓰고 없거나 오래됐으면 뒤에서 새로 계산 → 다음 새로고침(1분)부터 채워짐
+        #    (예전엔 다 계산할 때까지 기다리다 '서버 연결 실패'가 떴음)
         import concurrent.futures as cf
+        now_t = time.time()
+        need = []
+        for it in items:
+            h = _jmw_heavy.get((it["code"], it["category"], it.get("start_at")))
+            ttl = 55 if it["category"] in DAYTRADE_CATS else 3600
+            if not h or now_t - h["at"] > ttl:
+                need.append(it)
+        if need and not _jmw_heavy_busy.get(cat):
+            _jmw_heavy_busy[cat] = True
+            threading.Thread(target=_jmw_fill_heavy, args=(need, with_redline, cat), daemon=True).start()
 
-        def enrich(it):
+        def quote(it):
             try:
                 v = _kis_quote(it["code"])
             except Exception:
                 v = {}
-            rl = {}
-            if with_redline:
-                try:
-                    rl = _redline_classify(it["code"])
-                except Exception:
-                    rl = {}
-            try:
-                info = _jmw_info(it["code"])
-            except Exception:
-                info = {}
-            fl = None
-            if it["category"] in DAYTRADE_CATS:  # 🎯 당일매매: 세력평단선과 지금 거리
-                try:
-                    a = _force_avg_line(it["code"], it["category"], it.get("start_at"), it.get("end_at"))
-                    if a:
-                        fl = {"avg": round(a["avg"]), "gap": round((a["last"]["close"] / a["avg"] - 1) * 100, 2), "tf": a["tf"], "start": a["start"],
-                              "nu": bool(it.get("start_at"))}
-                except Exception:
-                    fl = None
+            h = _jmw_heavy.get((it["code"], it["category"], it.get("start_at"))) or {}
             return {**it, "price": v.get("price") or 0, "pct": round(v.get("pct") or 0, 2),
-                    "value_eok": round(v.get("value_eok") or 0, 1), "volume": int(v.get("volume") or 0), "redline": rl, "info": info, "fline": fl}
+                    "value_eok": round(v.get("value_eok") or 0, 1), "volume": int(v.get("volume") or 0),
+                    "redline": h.get("rl") or {}, "info": h.get("info") or {}, "fline": h.get("fl"), "loading": not h}
 
-        with cf.ThreadPoolExecutor(max_workers=4) as ex:
-            items = list(ex.map(enrich, items))
+        with cf.ThreadPoolExecutor(max_workers=6) as ex:
+            items = list(ex.map(quote, items))
     return {"ok": True, "cats": JMW_CATS, "counts": counts, "items": items}
 
 
