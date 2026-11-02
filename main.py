@@ -2824,6 +2824,7 @@ async def _start_ws_worker():
         print("[startup] JOBS_ENABLED=0 → 실시간 체결·알림·자동 작업 꺼짐 (화면용 주소만 작동)")
         return
     asyncio.create_task(_ws_worker())
+    threading.Thread(target=_mq_loop, daemon=True).start()  # ⚡ 매크로 미리 받기
     threading.Thread(target=_daytrade_touch_loop, daemon=True).start()  # 🎯 당일매매 세력평단 터치 (1분마다)
     # 해외주식 실시간 체결 수집은 사용 안 함 (2026-10-08 사용자 요청) — 한투가 appkey당 실시간 연결을
     # 1개만 허용해서, 해외 연결이 켜져 있으면 국내 실시간 체결이 "ALREADY IN USE appkey"로 막힘.
@@ -11277,15 +11278,59 @@ def _macro_quote(sym: str) -> dict:
     return out
 
 
+# ⚡ 매크로 빠르게 (2026-11-02): 화면이 쓰는 종목 목록을 기억해 두고, 서버가 장중 1분(밤·주말 5분)마다
+#    한꺼번에(8개씩 동시에) 미리 받아둠 → 화면은 보관된 값을 바로 가져감. 숫자 계산은 예전과 똑같음
+_mq_symbols: set = set()
+_mq_fresh = {"at": 0.0}
+
+
+def _mq_refresh(syms):
+    import concurrent.futures as cf
+
+    def one(sym):
+        try:
+            _macro_quote(sym)  # 25초 지난 건 알아서 새로 받음 (실패해도 예전 값은 남겨둠)
+        except Exception:
+            pass
+
+    with cf.ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(one, list(syms)))
+    _mq_fresh["at"] = time.time()
+
+
+def _mq_loop():
+    time.sleep(20)
+    while True:
+        try:
+            now = now_kst()
+            busy = now.weekday() < 5 and ((8, 30) <= (now.hour, now.minute) <= (15, 40) or now.hour >= 21 or now.hour < 6)
+            if _mq_symbols:
+                _mq_refresh(set(_mq_symbols))
+            time.sleep(60 if busy else 300)
+        except Exception as e:
+            print(f"[macro] 미리 받기 실패: {e}")
+            time.sleep(60)
+
+
 @app.get("/api/macro-quotes")
 def macro_quotes_endpoint(symbols: str):
-    out = []
-    for sym in [x for x in symbols.split(",") if x][:60]:
+    import concurrent.futures as cf
+    syms = [x for x in symbols.split(",") if x][:60]
+    _mq_symbols.update(syms)
+
+    def one(sym):
+        c = _mq_cache.get(sym)
+        if c and time.time() - c[0] < 900:  # 미리 받아둔 값(15분 안)이면 바로
+            return c[1]
         try:
-            out.append(_macro_quote(sym))
+            return _macro_quote(sym)
         except Exception as e:
-            out.append({"symbol": sym, "ok": False, "error": str(e)})
-    return {"ok": True, "quotes": out}
+            return {"symbol": sym, "ok": False, "error": str(e)}
+
+    with cf.ThreadPoolExecutor(max_workers=8) as ex:  # 처음 보는 건 한꺼번에
+        out = list(ex.map(one, syms))
+    oldest = min((c[0] for sym in syms for c in [_mq_cache.get(sym)] if c), default=time.time())
+    return {"ok": True, "quotes": out, "as_of": int(oldest), "age": int(time.time() - oldest)}
 
 
 # ══════════════════════════════════════════════════════════════════════════
