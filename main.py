@@ -11921,7 +11921,9 @@ def _jm_signal_series(code: str) -> dict:
     if c and time.time() - c[0] < ttl:
         return c[1]
     end = now_kst().strftime("%Y-%m-%d")
-    start = (now_kst() - timedelta(days=760)).strftime("%Y-%m-%d")
+    # ▲ 역배정초는 볼린저 300이라 신호 날짜보다 300봉(약 15개월) 앞 데이터가 필요 → 약 4년치 받기
+    #    (예전 760일이면 2025년 12월은 300봉이 안 돼서 계산 자체가 안 됐음 — 한미반도체 12월 미표시 원인, 2026-11-02)
+    start = (now_kst() - timedelta(days=1460)).strftime("%Y-%m-%d")
     b = _kis_daily_candles(code, start, end)
     n = len(b)
     C = [x["close"] for x in b]; H = [x["high"] for x in b]
@@ -13411,7 +13413,7 @@ def _kis_daily_candles(code: str, start: str, end: str) -> list:
     """🛟 한투 일봉 (KRX가 막히거나 점검일 때 대신) — 100개씩 이어 받기 (2026-10-31)"""
     s_ymd, e_ymd = start.replace("-", ""), end.replace("-", "")
     out, cur = {}, e_ymd
-    for _ in range(12):
+    for _ in range(16):  # 100봉씩 최대 1,600봉 (역배정초 볼린저 300용 약 4년)
         j = kis_get("/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice", "FHKST03010100",
                     {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code, "FID_INPUT_DATE_1": s_ymd,
                      "FID_INPUT_DATE_2": cur, "FID_PERIOD_DIV_CODE": "D", "FID_ORG_ADJ_PRC": "0"})
