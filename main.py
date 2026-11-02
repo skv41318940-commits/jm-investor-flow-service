@@ -4553,7 +4553,8 @@ def fetch_institution_type_flow_kis(code: str, days: int = 60, since: str = None
             continue
         seen.add(d)
         for inst, prefixes in _KIS_INST_MAP.items():
-            k = next((f"{p}_ntby_tr_pbmn" for p in prefixes if f"{p}_ntby_tr_pbmn" in keys), None)
+            # 한투 칸 이름: 대부분 '_ntby_tr_pbmn', 외국인 등록/비등록만 '_ntby_pbmn' (11/2 확인)
+            k = next((f"{p}{suf}" for p in prefixes for suf in ("_ntby_tr_pbmn", "_ntby_pbmn") if f"{p}{suf}" in keys), None)
             if not k:
                 continue
             v = float(str(r.get(k) or 0).replace(",", "") or 0)
