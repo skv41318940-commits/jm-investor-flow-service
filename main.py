@@ -12455,6 +12455,89 @@ def naver_world_redirect(symbol: str):
     return RedirectResponse(f"https://stock.naver.com/search?q={requests.utils.quote(sym)}")
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 📊 지분 구조 (2026-11-02 JM) — 남은 보유비중이 누구인지
+#   외국인(한투, 매일) · 최대주주+특수관계인 / 자사주(DART 정기보고서) · 5% 이상 대량보유(DART)
+#   기관 보유비중은 공식 데이터가 없어서 → 5% 대량보유 중 운용사·연금으로 보여주고, 나머지 = 개인·기타(유통 물량)
+# ══════════════════════════════════════════════════════════════════════════
+_own_cache: dict = {}
+
+
+def _dart_json(api: str, params: dict):
+    r = requests.get(f"https://opendart.fss.or.kr/api/{api}.json", params={"crtfc_key": DART_API_KEY, **params}, timeout=10).json()
+    return r.get("list") or [] if r.get("status") == "000" else []
+
+
+def _pct(v):
+    try:
+        return float(str(v).replace(",", "").replace("%", "").strip())
+    except Exception:
+        return None
+
+
+@app.get("/api/ownership")
+def ownership(code: str):
+    code = (code or "").strip().upper()
+    c = _own_cache.get(code)
+    if c and time.time() - c[0] < 6 * 3600:
+        return c[1]
+    out = {"ok": True, "code": code, "foreign": None, "major": None, "major_names": [], "treasury": None, "big5": [], "report": None}
+    listed = None
+    try:  # 외국인 (한투 현재가: 상장주식수·외국인 소진율 — 한도 100%인 대부분 종목은 소진율 = 지분율)
+        j = kis_get("/uapi/domestic-stock/v1/quotations/inquire-price", "FHKST01010100", {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code})
+        o = j.get("output") or {}
+        listed = _pct(o.get("lstn_stcn"))
+        out["foreign"] = _pct(o.get("hts_frgn_ehrt"))
+    except Exception as e:
+        out["foreign_error"] = str(e)
+    corp = None
+    try:
+        corp = _dart_corp_code(code)
+    except Exception:
+        pass
+    if corp and DART_API_KEY:
+        y = now_kst().year
+        for yr, rc, nm in ((y, "11014", "3분기"), (y, "11012", "반기"), (y, "11013", "1분기"), (y - 1, "11011", "사업"), (y - 1, "11014", "3분기")):
+            rows = _dart_json("hyslrSttus", {"corp_code": corp, "bsns_year": str(yr), "reprt_code": rc})
+            if not rows:
+                continue
+            common = [r for r in rows if "보통" in (r.get("stock_knd") or "보통")]
+            tot = next((r for r in common if (r.get("nm") or "").strip() in ("계", "합계")), None)
+            if tot:
+                out["major"] = _pct(tot.get("trmend_posesn_stock_qota_rt"))
+            else:
+                out["major"] = round(sum(_pct(r.get("trmend_posesn_stock_qota_rt")) or 0 for r in common), 2)
+            out["major_names"] = [r.get("nm") for r in common if (r.get("nm") or "").strip() not in ("계", "합계")][:4]
+            out["report"] = f"{yr} {nm}보고서"
+            try:  # 자사주 (같은 보고서)
+                tr = _dart_json("tesstkAcqsDspsSttus", {"corp_code": corp, "bsns_year": str(yr), "reprt_code": rc})
+                tt = next((r for r in tr if "총계" in (r.get("acqs_mth1") or "") or "총계" in (r.get("acqs_mth2") or "")), None) or (tr[-1] if tr else None)
+                q = _pct((tt or {}).get("trmend_qy"))
+                if q and listed:
+                    out["treasury"] = round(q / listed * 100, 2)
+            except Exception:
+                pass
+            break
+        try:  # 5% 이상 대량보유 — 보고자별 가장 최근 것
+            rows = _dart_json("majorstock", {"corp_code": corp})
+            latest = {}
+            for r in rows:
+                nm = (r.get("repror") or "").strip()
+                if nm and (nm not in latest or (r.get("rcept_dt") or "") > (latest[nm].get("rcept_dt") or "")):
+                    latest[nm] = r
+            majors = set(out["major_names"])
+            big = [{"name": nm, "ratio": _pct(r.get("stkrt")), "date": r.get("rcept_dt")} for nm, r in latest.items()
+                   if nm not in majors and (_pct(r.get("stkrt")) or 0) >= 5]
+            out["big5"] = sorted(big, key=lambda x: -(x["ratio"] or 0))[:5]
+        except Exception:
+            pass
+    known = sum(v for v in (out["major"], out["foreign"], out["treasury"]) if v) + sum(b["ratio"] or 0 for b in out["big5"])
+    out["rest"] = round(max(0.0, 100 - known), 2) if known else None
+    out["note"] = "외국인=한투(매일) · 최대주주·자사주=DART 정기보고서 · 5%↑=DART 대량보유(최근 보고) · 기관 보유비중은 공식 데이터가 없어 5%↑ 운용사·연금으로 대신"
+    _own_cache[code] = (time.time(), out)
+    return out
+
+
 @app.post("/api/watchlist-add")
 def watchlist_add_endpoint(payload: dict):
     """☆ 별표 → 관심종목 추가 (이미 있으면 그대로)"""
