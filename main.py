@@ -12023,6 +12023,11 @@ def gom_debug(code: str, dates: str):
             "5이평>20이평": m5 > m20 if m20 else None,
             "20이평>60이평": (m20 > m60) if (m20 and m60) else None,
             "A1봉전_오늘빼고_26봉내+10%": any(C[j] / C[j - 1] >= 1.10 for j in range(max(1, i - 26), i)),
+            "A고가기준_26봉내+10%": any(H[j] / C[j - 1] >= 1.10 for j in range(max(1, i - 25), i + 1)),
+            "A종가+8%_26봉내": any(C[j] / C[j - 1] >= 1.08 for j in range(max(1, i - 25), i + 1)),
+            "B26봉내_거래대금50억": any(A[j] >= 5e9 for j in range(max(0, i - 25), i + 1)),
+            "26봉내_최대등락%": round(max((C[j] / C[j - 1] - 1) * 100 for j in range(max(1, i - 25), i + 1)), 1),
+            "26봉내_최대고가등락%": round(max((H[j] / C[j - 1] - 1) * 100 for j in range(max(1, i - 25), i + 1)), 1),
             "종가>5이평(돌파아니어도)": C[i] > m5,
             "급등일로부터_며칠": (i - surge[-1]) if surge else None,
             "급등일": b[surge[-1]]["date"] if surge else None,
@@ -12061,6 +12066,8 @@ def gom_debug_multi(codes: str, date: str = ""):
                 "등락%": h["당일등락률%"], "대금억": h["당일거래대금억"], "거래량5일배": h["거래량_5일평균대비배"],
                 "5이평↑": yn(h["5이평_상승중"]), "종가>20": yn(h["종가>20이평"]), "20>60": yn(h["20이평>60이평"]),
                 "급등후일": h["급등일로부터_며칠"], "최고가대비%": h["26봉최고가대비%"],
+                "A고가+10%": yn(h["A고가기준_26봉내+10%"]), "A종가+8%": yn(h["A종가+8%_26봉내"]), "B26봉50억": yn(h["B26봉내_거래대금50억"]),
+                "26봉최대등락%": h["26봉내_최대등락%"], "26봉최대고가등락%": h["26봉내_최대고가등락%"],
             })
         except Exception as e:
             rows.append({"종목": names.get(c, c), "오류": str(e)})
