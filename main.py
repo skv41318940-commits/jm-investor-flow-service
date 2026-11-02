@@ -11971,8 +11971,11 @@ def _jm_signal_series(code: str) -> dict:
             if A1 and A2 and tr and A8 and m20[t] < m60[t] and C[t] > m20[t] and A11 and (a5[t] or 0) >= 5e9:
                 y_dates.append(b[t]["date"])
     last = b[-1]["date"] if b else ""
+    # 🦀 검색기 '일봉 신호' = 사부님 점 구조 (11/2 마감 16종목 비교로 확인): 종가 > 5이평 · 전일보다 상승 마감 · 양봉
+    t = n - 1
+    core = bool(n >= 6 and m5[t] is not None and C[t] > m5[t] and C[t] > C[t - 1] and C[t] > b[t]["open"])
     res = {"ok": True, "code": code, "bars": n, "g": g_dates, "y": y_dates,
-           "today": {"g": bool(g_dates and g_dates[-1] == last), "y": bool(y_dates and y_dates[-1] == last)}, "last": last}
+           "today": {"g": core, "y": bool(y_dates and y_dates[-1] == last)}, "last": last}
     _sig_series_cache[code] = (time.time(), res)
     return res
 
