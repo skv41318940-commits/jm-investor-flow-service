@@ -12032,6 +12032,42 @@ def gom_debug(code: str, dates: str):
     return {"ok": True, "code": code, "rows": out}
 
 
+@app.get("/api/gom-debug-multi")
+def gom_debug_multi(codes: str, date: str = ""):
+    """🐻 곰발 연구 — 여러 종목 한 번에 (한 줄씩 요약). 예: /api/gom-debug-multi?date=2026-11-02&codes=008930,302550"""
+    d = (date or now_kst().strftime("%Y-%m-%d"))[:10]
+    lst = [c.strip().upper() for c in codes.split(",") if c.strip()][:30]
+    names = {}
+    try:
+        for r in supabase.table("stock_fundamentals").select("code,name").in_("code", lst).execute().data or []:
+            names[r["code"]] = r["name"]
+    except Exception:
+        pass
+    rows = []
+    for c in lst:
+        try:
+            r = gom_debug(c, d)["rows"][0]
+            if r.get("error"):
+                rows.append({"종목": names.get(c, c), "오류": r["error"]})
+                continue
+            k, h = r["조건"], r["숨은조건_후보"]
+            yn = lambda v: "O" if v else "X"
+            rows.append({
+                "종목": names.get(c, c),
+                "A0봉전+10%": yn(k["A_26봉내_+10%"]), "A1봉전(오늘빼고)": yn(h["A1봉전_오늘빼고_26봉내+10%"]),
+                "B대금50억": yn(k["B_5봉내_거래대금50억"]), "C돌파": yn(k["C_종가5이평돌파"]), "C위": yn(h["종가>5이평(돌파아니어도)"]),
+                "D고가돌파": yn(k["D_전일고가돌파"]), "E상승마감": yn(k["E_전일보다상승"]), "F거래량증가": yn(k["F_거래량증가"]),
+                "F돌파전환": yn(h["거래량_돌파전환(CrossUp)"]), "양봉": yn(h["양봉"]),
+                "등락%": h["당일등락률%"], "대금억": h["당일거래대금억"], "거래량5일배": h["거래량_5일평균대비배"],
+                "5이평↑": yn(h["5이평_상승중"]), "종가>20": yn(h["종가>20이평"]), "20>60": yn(h["20이평>60이평"]),
+                "급등후일": h["급등일로부터_며칠"], "최고가대비%": h["26봉최고가대비%"],
+            })
+        except Exception as e:
+            rows.append({"종목": names.get(c, c), "오류": str(e)})
+        time.sleep(0.1)
+    return {"ok": True, "date": d, "rows": rows}
+
+
 @app.get("/api/jm-signals")
 def jm_signals(code: str):
     """🐻 곰발 · ▲ 역배정초 날짜 목록 (차트에 점 찍기용)"""
