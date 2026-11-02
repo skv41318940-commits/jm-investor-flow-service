@@ -2798,6 +2798,7 @@ async def _daily_jobs_worker():
         ("nxt_premarket", _run_nxt_premarket, ()),
         ("swing_after_close", _run_swing_after_close, ()),
         ("theme_index", _run_theme_index_job, ()),
+        ("inst_prefetch", _run_inst_prefetch, ()),
         ("weekly_review", _run_weekly_review, ()),
         ("krx_map", _run_krx_map_job, ()),
         ("new_listing", _run_new_listing_job, ()),
@@ -4486,9 +4487,11 @@ def sync_market_volume_endpoint():
 INST_TYPE_COLUMNS = ["금융투자", "보험", "투신", "사모", "은행", "기타금융", "연기금", "기타법인", "외국인", "기타외국인", "개인"]
 
 
-def fetch_institution_type_flow(code: str, days: int = 60):
+def fetch_institution_type_flow(code: str, days: int = 60, since: str = None):
     today = now_kst()
     fromdate = (today - timedelta(days=days * 2)).strftime("%Y%m%d")  # 주말 감안 여유있게
+    if since:  # ⚡ 이어받기: 이미 저장된 날 이후만 (요청이 작아서 빠름)
+        fromdate = since
     todate = _krx_ready_end(today.strftime("%Y%m%d"), 16)
 
     df = _krx_df(stock.get_market_trading_value_by_date, fromdate, todate, code, detail=True)
@@ -4514,6 +4517,62 @@ def fetch_institution_type_flow(code: str, days: int = 60):
     return rows
 
 
+# ⚡ 기관 유형별을 KRX 대신 한투로 (2026-11-02 JM: KRX가 너무 느려서 응답이 안 오는 것처럼 보임)
+#   한투 '종목별 투자자매매동향(일별)' — 미국 서버에서도 빠름. 칸 이름이 다르면 KRX로 자동 대체
+_KIS_INST_MAP = {"금융투자": ["scrt"], "보험": ["insu"], "투신": ["ivtr"], "사모": ["pe_fund"], "은행": ["bank"],
+                 "기타금융": ["mrbn", "etc_fin"], "연기금": ["fund"], "기타법인": ["etc_corp", "etc_orgt"],
+                 "외국인": ["frgn_reg", "frgn"], "기타외국인": ["frgn_nreg"], "개인": ["prsn"]}
+
+
+def _kis_inst_rows(code: str, end: str):
+    j = kis_get("/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily", "FHPTJ04160001",
+                {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code, "FID_INPUT_DATE_1": end,
+                 "FID_ORG_ADJ_PRC": "", "FID_ETC_CLS_CODE": ""})
+    return [r for r in (j.get("output2") or j.get("output") or []) if isinstance(r, dict) and r.get("stck_bsop_date")]
+
+
+def fetch_institution_type_flow_kis(code: str, days: int = 60, since: str = None):
+    end = _krx_ready_end(now_kst().strftime("%Y%m%d"), 16)
+    raw, cur = [], end
+    for _ in range(3):
+        rs = _kis_inst_rows(code, cur)
+        if not rs:
+            break
+        raw += rs
+        oldest = min(r["stck_bsop_date"] for r in rs)
+        if len(raw) >= days or (since and oldest <= since):
+            break
+        cur = (datetime.strptime(oldest, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+    if not raw:
+        raise ValueError("한투 기관 유형별 응답 없음")
+    keys = set(raw[0].keys())
+    rows, seen = [], set()
+    for r in sorted(raw, key=lambda x: x["stck_bsop_date"]):
+        d = r["stck_bsop_date"]
+        if d in seen or d > end or (since and d < since):
+            continue
+        seen.add(d)
+        for inst, prefixes in _KIS_INST_MAP.items():
+            k = next((f"{p}_ntby_tr_pbmn" for p in prefixes if f"{p}_ntby_tr_pbmn" in keys), None)
+            if not k:
+                continue
+            v = float(str(r.get(k) or 0).replace(",", "") or 0)
+            rows.append({"stock_code": code, "trade_date": f"{d[:4]}-{d[4:6]}-{d[6:]}", "inst_type": inst, "amount": round(v / 100, 2)})  # 백만원 → 억원
+    if not any(x["inst_type"] in ("투신", "연기금") for x in rows):
+        raise ValueError(f"한투 칸 이름이 달라요: {sorted(keys)[:30]}")
+    return rows[-days * len(_KIS_INST_MAP):]
+
+
+@app.get("/api/kis-inst-type-debug")
+def kis_inst_type_debug(code: str = "005930"):
+    """한투 기관 유형별 원본 칸 이름 확인용"""
+    try:
+        rs = _kis_inst_rows(code, _krx_ready_end(now_kst().strftime("%Y%m%d"), 16))
+        return {"ok": True, "count": len(rs), "keys": sorted(rs[0].keys()) if rs else [], "first": rs[0] if rs else None}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/sync-institution-type")
 def sync_institution_type_endpoint(code: str):
     """
@@ -4521,12 +4580,61 @@ def sync_institution_type_endpoint(code: str):
     최근 60영업일 순매수를 institution_type_flow 테이블에 저장합니다.
     (외국계 창구별 데이터는 pykrx로 얻을 수 없어 이 엔드포인트에 포함되지 않음)
     """
+    # ⚡ KRX 빠르게 (2026-11-02): ① 이미 최신까지 저장돼 있으면 KRX 안 부르고 바로 ② 며칠 밀렸으면 그 뒤만 이어받기
     try:
-        rows = fetch_institution_type_flow(code)
+        want = _krx_ready_end(now_kst().strftime("%Y%m%d"), 16)
+        want_d = f"{want[:4]}-{want[4:6]}-{want[6:]}"
+        last = supabase.table("institution_type_flow").select("trade_date").eq("stock_code", code).order("trade_date", desc=True).limit(1).execute().data
+        last_d = str(last[0]["trade_date"])[:10] if last else None
+        if last_d and last_d >= want_d:
+            return {"ok": True, "synced": 0, "cached": True}
+        since = None
+        if last_d and (datetime.strptime(want_d, "%Y-%m-%d") - datetime.strptime(last_d, "%Y-%m-%d")).days <= 20:
+            since = (datetime.strptime(last_d, "%Y-%m-%d") - timedelta(days=3)).strftime("%Y%m%d")
+        src = "kis"
+        try:
+            rows = fetch_institution_type_flow_kis(code, since=since)
+        except Exception as e:
+            print(f"[inst] 한투 실패 → KRX로: {e}")
+            src = "krx"
+            rows = fetch_institution_type_flow(code, since=since)
         supabase.table("institution_type_flow").upsert(rows).execute()
-        return {"ok": True, "synced": len(rows)}
+        return {"ok": True, "synced": len(rows), "incremental": bool(since), "source": src}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+def _run_inst_prefetch():
+    """⚡ 장 마감 뒤(16:20~17:30) 관심종목·장기투자·곰발 종목의 기관 유형별을 미리 받아둠 → 종목분석 열면 바로"""
+    now = now_kst()
+    if now.weekday() >= 5 or not ((16, 20) <= (now.hour, now.minute) <= (17, 30)):
+        return
+    day = now.strftime("%Y-%m-%d")
+    if _brief_already_sent("job_inst_prefetch", day):
+        return
+    _mark_brief_sent("job_inst_prefetch", day)
+    codes = []
+    try:
+        codes += [r["code"] for r in supabase.table("jm_watchlist").select("code").limit(200).execute().data or []]
+        codes += [r["code"] for r in supabase.table("watchlist").select("code").limit(200).execute().data or []]
+    except Exception:
+        pass
+    d = _crab_pc.get("data") or {}
+    for k in ("crab", "small", "big"):
+        codes += [x["code"] for x in d.get(k, []) or []]
+    todo = list(dict.fromkeys(codes))[:120]
+
+    def work():  # 뒤에서 (다른 작업·화면을 막지 않게)
+        done = 0
+        for c in todo:
+            try:
+                sync_institution_type_endpoint(c)
+                done += 1
+            except Exception:
+                pass
+        print(f"[inst_prefetch] {done}종목 기관 유형별 미리 받음")
+
+    threading.Thread(target=work, daemon=True).start()
 
 
 @app.get("/api/sync-fundamentals")
