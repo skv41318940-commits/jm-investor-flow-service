@@ -12022,6 +12022,8 @@ def gom_debug(code: str, dates: str):
             "종가>20이평": C[i] > m20 if m20 else None,
             "5이평>20이평": m5 > m20 if m20 else None,
             "20이평>60이평": (m20 > m60) if (m20 and m60) else None,
+            "A1봉전_오늘빼고_26봉내+10%": any(C[j] / C[j - 1] >= 1.10 for j in range(max(1, i - 26), i)),
+            "종가>5이평(돌파아니어도)": C[i] > m5,
             "급등일로부터_며칠": (i - surge[-1]) if surge else None,
             "급등일": b[surge[-1]]["date"] if surge else None,
             "26봉최고가대비%": round((C[i] / max(H[i - 25:i + 1]) - 1) * 100, 1),
