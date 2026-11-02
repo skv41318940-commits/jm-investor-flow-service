@@ -11757,49 +11757,82 @@ _sig_cache: dict = {}   # code → (계산 시각, {"g": bool, "y": bool})
 _sig_busy = {"on": False}
 
 
-def _jm_signals_today(code: str) -> dict:
+_sig_series_cache: dict = {}  # code → (시각, 결과)
+
+
+def _jm_signal_series(code: str) -> dict:
+    """일봉 전체에서 🐻 곰발 · ▲ 역배정초가 뜬 날짜들 (차트 표시 + 검색기 '오늘 신호'에 같이 씀)"""
+    c = _sig_series_cache.get(code)
+    ttl = 600 if 9 <= now_kst().hour < 16 else 6 * 3600
+    if c and time.time() - c[0] < ttl:
+        return c[1]
     end = now_kst().strftime("%Y-%m-%d")
-    start = (now_kst() - timedelta(days=600)).strftime("%Y-%m-%d")
+    start = (now_kst() - timedelta(days=760)).strftime("%Y-%m-%d")
     b = _kis_daily_candles(code, start, end)
     n = len(b)
-    if n < 7:
-        return {"g": False, "y": False}
     C = [x["close"] for x in b]; H = [x["high"] for x in b]
-    A = [x.get("amount") or x["close"] * x["volume"] for x in b]
+    A = [(x.get("amount") or 0) or x["close"] * x["volume"] for x in b]
 
-    def sma(arr, k, i):
-        return sum(arr[i - k + 1:i + 1]) / k if i >= k - 1 else None
+    def sma_arr(arr, k):
+        out, s_ = [None] * len(arr), 0.0
+        for t in range(len(arr)):
+            s_ += arr[t]
+            if t >= k:
+                s_ -= arr[t - k]
+            if t >= k - 1:
+                out[t] = s_ / k
+        return out
 
-    def bbu(arr, k, i):
-        m = sma(arr, k, i)
-        if m is None:
-            return None
-        return m + 2 * (sum((v - m) ** 2 for v in arr[i - k + 1:i + 1]) / k) ** 0.5
+    def bbu_arr(arr, k):
+        m = sma_arr(arr, k)
+        out = [None] * len(arr)
+        for t in range(k - 1, len(arr)):
+            w = arr[t - k + 1:t + 1]
+            out[t] = m[t] + 2 * (sum((v - m[t]) ** 2 for v in w) / k) ** 0.5
+        return out
 
-    i = n - 1
-    # 🐻 곰발
-    a = any(C[j] / C[j - 1] >= 1.10 for j in range(max(1, i - 25), i + 1))
-    bb = any(A[j] >= 5e9 for j in range(max(0, i - 4), i + 1))
-    m5, m5p = sma(C, 5, i), sma(C, 5, i - 1)
-    g = bool(a and bb and m5 and m5p and C[i] > m5 and C[i - 1] <= m5p and H[i - 1] < C[i] and C[i] > C[i - 1])
-    # ▲ 역배정초
-    y = False
-    if n >= 306:
-        u = [bbu(C, 300, i - k) for k in range(3)]
-        m20 = lambda k: sma(C, 20, i - k)
-        m60 = lambda k: sma(C, 60, i - k)
-        A1 = u[0] > u[1] > u[2]
-        A2 = m20(10) < m20(11) < m20(12)
-        tr = any(m20(t + 1) > m20(t) and m20(t - 1) > m20(t) for t in range(1, 6))
+    m5, m20, m60, a5 = sma_arr(C, 5), sma_arr(C, 20), sma_arr(C, 60), sma_arr(A, 5)
+    u20 = bbu_arr(C, 20)
+    u300 = bbu_arr(C, 300) if n >= 300 else [None] * n
+    g_dates, y_dates = [], []
 
-        def cu(j, f):
-            x0, x1 = f(j), f(j + 1)
-            return x0 is not None and x1 is not None and H[i - j] > x0 and H[i - j - 1] <= x1
+    def cu(t, line):
+        return line[t] is not None and line[t - 1] is not None and H[t] > line[t] and H[t - 1] <= line[t - 1]
 
-        A8 = any(cu(j, lambda k: bbu(C, 20, i - k)) for j in range(5))
-        A11 = any(cu(j, m60) for j in range(5))
-        y = bool(A1 and A2 and tr and A8 and m20(0) < m60(0) and C[i] > m20(0) and A11 and sma(A, 5, i) >= 5e9)
-    return {"g": g, "y": y}
+    for t in range(6, n):
+        # 🐻 곰발
+        if m5[t] is not None and m5[t - 1] is not None:
+            a = any(C[j] / C[j - 1] >= 1.10 for j in range(max(1, t - 25), t + 1))
+            bb = any(A[j] >= 5e9 for j in range(max(0, t - 4), t + 1))
+            if a and bb and C[t] > m5[t] and C[t - 1] <= m5[t - 1] and H[t - 1] < C[t] and C[t] > C[t - 1]:
+                g_dates.append(b[t]["date"])
+        # ▲ 역배정초
+        if t >= 305 and u300[t] is not None and u300[t - 2] is not None and m60[t] is not None and m20[t - 12] is not None:
+            A1 = u300[t] > u300[t - 1] > u300[t - 2]
+            A2 = m20[t - 10] < m20[t - 11] < m20[t - 12]
+            tr = any(m20[t - k - 1] > m20[t - k] and m20[t - k + 1] > m20[t - k] for k in range(1, 6))
+            A8 = any(cu(t - k, u20) for k in range(5))
+            A11 = any(cu(t - k, m60) for k in range(5))
+            if A1 and A2 and tr and A8 and m20[t] < m60[t] and C[t] > m20[t] and A11 and (a5[t] or 0) >= 5e9:
+                y_dates.append(b[t]["date"])
+    last = b[-1]["date"] if b else ""
+    res = {"ok": True, "code": code, "bars": n, "g": g_dates, "y": y_dates,
+           "today": {"g": bool(g_dates and g_dates[-1] == last), "y": bool(y_dates and y_dates[-1] == last)}, "last": last}
+    _sig_series_cache[code] = (time.time(), res)
+    return res
+
+
+def _jm_signals_today(code: str) -> dict:
+    return _jm_signal_series(code)["today"]
+
+
+@app.get("/api/jm-signals")
+def jm_signals(code: str):
+    """🐻 곰발 · ▲ 역배정초 날짜 목록 (차트에 점 찍기용)"""
+    try:
+        return _jm_signal_series((code or "").strip().upper())
+    except Exception as e:
+        return {"ok": False, "error": str(e), "g": [], "y": []}
 
 
 def _sig_fill(codes):
@@ -11854,6 +11887,13 @@ def crab_pc_get():
     # 🐻▲ 오늘 신호: 장중엔 10분, 장 마감 후엔 하루 보관 — 없거나 오래된 건 뒤에서 계산
     ttl = 600 if 9 <= now_kst().hour < 16 else 6 * 3600
     stale = [c for c in codes if not _sig_cache.get(c) or time.time() - _sig_cache[c][0] > ttl]
+    for c0 in [c for c in stale if not _sig_cache.get(c)][:6]:  # 처음 보는 종목 몇 개는 바로 계산 (계속 '…'로 안 남게)
+        try:
+            _sig_cache[c0] = (time.time(), _jm_signals_today(c0))
+        except Exception as e:
+            print(f"[sig] {c0} 실패: {e}")
+            _sig_cache[c0] = (time.time(), {"g": None, "y": None})
+    stale = [c for c in stale if c not in _sig_cache or time.time() - _sig_cache[c][0] > ttl]
     if stale and not _sig_busy["on"]:
         _sig_busy["on"] = True
         threading.Thread(target=_sig_fill, args=(stale[:80],), daemon=True).start()
