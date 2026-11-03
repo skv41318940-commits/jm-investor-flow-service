@@ -12043,10 +12043,32 @@ def gom_debug(code: str, dates: str):
 
 
 @app.get("/api/gom-debug-multi")
-def gom_debug_multi(codes: str, date: str = ""):
-    """🐻 곰발 연구 — 여러 종목 한 번에 (한 줄씩 요약). 예: /api/gom-debug-multi?date=2026-11-02&codes=008930,302550"""
+def gom_debug_multi(codes: str = "", date: str = "", names: str = ""):
+    """🐻 곰발 연구 — 여러 종목 한 번에 (한 줄씩 요약).
+    예: /api/gom-debug-multi?date=2026-11-02&codes=008930,302550
+        /api/gom-debug-multi?date=2026-11-03&names=현대건설,리메드   ← 종목명으로도 (2026-11-03)"""
     d = (date or now_kst().strftime("%Y-%m-%d"))[:10]
-    lst = [c.strip().upper() for c in codes.split(",") if c.strip()][:30]
+    lst = [c.strip().upper() for c in codes.split(",") if c.strip()]
+    unresolved = []
+    for nm in [x.strip() for x in names.split(",") if x.strip()]:
+        code = None
+        try:
+            r = supabase.table("stock_fundamentals").select("code,name").eq("name", nm).limit(1).execute().data
+            code = r[0]["code"] if r else None
+        except Exception:
+            pass
+        if not code:
+            try:
+                hits = _lookup_stock_code(nm)
+                ex = [h for h in hits if h["name"].replace(" ", "") == nm.replace(" ", "")] or hits[:1]
+                code = ex[0]["code"] if ex else None
+            except Exception:
+                code = None
+        if code:
+            lst.append(code)
+        else:
+            unresolved.append(nm)
+    lst = list(dict.fromkeys(lst))[:40]
     names = {}
     try:
         for r in supabase.table("stock_fundamentals").select("code,name").in_("code", lst).execute().data or []:
@@ -12077,7 +12099,7 @@ def gom_debug_multi(codes: str, date: str = ""):
         except Exception as e:
             rows.append({"종목": names.get(c, c), "오류": str(e)})
         time.sleep(0.1)
-    return {"ok": True, "date": d, "rows": rows}
+    return {"ok": True, "date": d, "rows": rows, "못찾은종목": unresolved}
 
 
 @app.get("/api/jm-signals")
@@ -13166,9 +13188,21 @@ def _run_nxt_premarket():
             with _bpc_lock:
                 _bpc["tasks"].append({"kind": "nxt", "codes": _nxt_candidates()})
             _mark_brief_sent(f"job_nxt_{slot}", day)
-    if (8, 45) <= hm <= (8, 58) and not _brief_already_sent("nxt_premarket", day):
+    if (8, 40) <= hm <= (8, 59) and not _brief_already_sent("nxt_premarket", day):
         r = _pc_task_results.get("nxt")
-        if not r or time.time() - r.get("got", 0) > 1800:
+        fresh = r and time.time() - r.get("got", 0) <= 1200
+        if not fresh:
+            # 🔁 PC가 중간에 꺼졌다 켜져서 08:25 조회를 놓쳤으면 → 지금 다시 맡기고 다음 확인(몇 분 뒤)에 보냄 (2026-11-03)
+            if time.time() - _bpc["alive_at"] < 20 and time.time() - _bpc.get("nxt_retry_at", 0) > 240:
+                _bpc["nxt_retry_at"] = time.time()
+                with _bpc_lock:
+                    _bpc["tasks"].append({"kind": "nxt", "codes": _nxt_candidates()})
+                print("[nxt] 최근 결과가 없어서 다시 조회 맡김")
+                return
+            if hm >= (8, 55):
+                # 끝까지 못 받았으면 조용히 넘어가지 말고 한 번 알려줌
+                _mark_brief_sent("nxt_premarket", day)
+                send_telegram("🌅 NXT 프리마켓 — 오늘은 PC(세력트래커)에서 NXT 시세를 못 받았어요 (중간에 꺼졌거나 오류). 세력트래커 상태만 확인해 주세요.")
             return
         rows = [x for x in r.get("rows", []) if x.get("price") and x.get("pct") is not None and x.get("volume")]
         if not rows:
