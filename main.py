@@ -12102,6 +12102,119 @@ def gom_debug_multi(codes: str = "", date: str = "", names: str = ""):
     return {"ok": True, "date": d, "rows": rows, "못찾은종목": unresolved}
 
 
+def _gom_minute_features(code: str, d: str) -> dict:
+    """🐻 분봉 연구 (2026-11-03): 그날 3분봉·5분봉에서 사부님 '1번·3번 자리' 후보 신호가 났는지, 몇 시에 났는지"""
+    # 그날 + 앞 2~3거래일 1분봉 (볼린저 300을 3분봉으로 계산하려면 약 900분 = 2.5일치 필요)
+    days, dt = [], datetime.strptime(d, "%Y-%m-%d")
+    while len(days) < 4:
+        if dt.weekday() < 5:
+            days.append(dt.strftime("%Y-%m-%d"))
+        dt -= timedelta(days=1)
+    days = days[::-1]
+    raw = []
+    for dd in days:
+        try:
+            cs = (_minute_day_cached(code, dd) or {}).get("candles") or []
+        except Exception:
+            cs = []
+        raw += [(dd, c) for c in cs]
+
+    def agg(tf):
+        bars, order = {}, []
+        for dd, c in raw:
+            hh, mm = int(c["time"][:2]), int(c["time"][3:5])
+            if (hh, mm) < (9, 0) or (hh, mm) > (15, 30):
+                continue
+            k = (dd, hh * 60 + (mm // tf) * tf)
+            b = bars.get(k)
+            if not b:
+                bars[k] = {"day": dd, "t": f"{k[1] // 60:02d}:{k[1] % 60:02d}", "o": c["open"], "h": c["high"], "l": c["low"], "c": c["close"], "v": c.get("volume", 0)}
+                order.append(k)
+            else:
+                b["h"] = max(b["h"], c["high"]); b["l"] = min(b["l"], c["low"]); b["c"] = c["close"]; b["v"] += c.get("volume", 0)
+        return [bars[k] for k in sorted(order)]
+
+    def bbu(arr, n, i):
+        if i < n - 1:
+            return None
+        w = arr[i - n + 1:i + 1]
+        m = sum(w) / n
+        return m + 2 * (sum((x - m) ** 2 for x in w) / n) ** 0.5
+
+    out = {}
+    for tf in (3, 5):
+        bs = agg(tf)
+        C = [b["c"] for b in bs]; V = [b["v"] for b in bs]
+        idx = [i for i, b in enumerate(bs) if b["day"] == d]
+        cross, near, vol_brk = [], [], []
+        for i in idx:
+            u, up = bbu(C, 300, i), bbu(C, 300, i - 1)
+            if u and up:
+                if C[i] > u and C[i - 1] <= up:
+                    u30 = bbu(C, 300, i - 30)
+                    slope = round((up / u30 - 1) * 100, 2) if u30 else None
+                    cross.append({"시각": bs[i]["t"], "빨간선_30봉기울기%": slope, "자리": ("1번(하락 후 돌파)" if slope is not None and slope < -0.3 else "3번(완만한 돌파)")})
+                elif bs[i]["h"] >= u * 0.995 and C[i] < u:
+                    near.append(bs[i]["t"])
+            prevmax = max(V[max(0, i - 20):i]) if i > 0 else 0
+            hi20 = max(b["h"] for b in bs[max(0, i - 20):i]) if i > 0 else 0
+            if prevmax and V[i] > prevmax * 1.5 and C[i] > hi20:
+                vol_brk.append(bs[i]["t"])
+        out[f"{tf}분봉"] = {
+            "빨간선_돌파": cross[:5], "빨간선_돌파있음": bool(cross),
+            "빨간선_근접_시도": near[:5],
+            "거래량+고점돌파": vol_brk[:5], "거래량돌파있음": bool(vol_brk),
+            "봉수": len(idx),
+        }
+    return out
+
+
+@app.get("/api/gom-minute-multi")
+def gom_minute_multi(date: str = "", names: str = "", codes: str = ""):
+    """🐻 분봉 연구 — 여러 종목 한 번에. 예: /api/gom-minute-multi?date=2026-11-03&names=매드업,펩트론"""
+    d = (date or now_kst().strftime("%Y-%m-%d"))[:10]
+    lst = [c.strip().upper() for c in codes.split(",") if c.strip()]
+    unresolved = []
+    for nm in [x.strip() for x in names.split(",") if x.strip()]:
+        code = None
+        try:
+            r = supabase.table("stock_fundamentals").select("code").eq("name", nm).limit(1).execute().data
+            code = r[0]["code"] if r else None
+        except Exception:
+            pass
+        if not code:
+            try:
+                hits = _lookup_stock_code(nm)
+                ex = [h for h in hits if h["name"].replace(" ", "") == nm.replace(" ", "")] or hits[:1]
+                code = ex[0]["code"] if ex else None
+            except Exception:
+                code = None
+        (lst.append(code) if code else unresolved.append(nm))
+    nmap = {}
+    try:
+        for r in supabase.table("stock_fundamentals").select("code,name").in_("code", lst).execute().data or []:
+            nmap[r["code"]] = r["name"]
+    except Exception:
+        pass
+    rows = []
+    for c in list(dict.fromkeys(lst))[:20]:
+        try:
+            f = _gom_minute_features(c, d)
+            yn = lambda v: "O" if v else "X"
+            rows.append({
+                "종목": nmap.get(c, c),
+                "3분_빨간선돌파": yn(f["3분봉"]["빨간선_돌파있음"]), "3분_돌파시각·자리": f["3분봉"]["빨간선_돌파"],
+                "3분_근접시도": f["3분봉"]["빨간선_근접_시도"],
+                "5분_빨간선돌파": yn(f["5분봉"]["빨간선_돌파있음"]), "5분_돌파시각·자리": f["5분봉"]["빨간선_돌파"],
+                "5분_거래량+고점돌파": yn(f["5분봉"]["거래량돌파있음"]), "5분_거래량돌파시각": f["5분봉"]["거래량+고점돌파"],
+                "3분_거래량+고점돌파": yn(f["3분봉"]["거래량돌파있음"]),
+                "분봉수(3분)": f["3분봉"]["봉수"],
+            })
+        except Exception as e:
+            rows.append({"종목": nmap.get(c, c), "오류": str(e)})
+    return {"ok": True, "date": d, "rows": rows, "못찾은종목": unresolved}
+
+
 @app.get("/api/jm-signals")
 def jm_signals(code: str):
     """🐻 곰발 · ▲ 역배정초 날짜 목록 (차트에 점 찍기용)"""
