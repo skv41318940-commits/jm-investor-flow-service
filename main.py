@@ -12034,6 +12034,8 @@ def gom_debug(code: str, dates: str):
             "26봉내_최대등락%": round(max((C[j] / C[j - 1] - 1) * 100 for j in range(max(1, i - 25), i + 1)), 1),
             "26봉내_최대고가등락%": round(max((H[j] / C[j - 1] - 1) * 100 for j in range(max(1, i - 25), i + 1)), 1),
             "종가>5이평(돌파아니어도)": C[i] > m5,
+            "5이평터치(저가≤5이평≤고가)": (b[i]["low"] <= m5 <= H[i]),   # 일봉 = 5이평 '터치' (11/3 JM 발견)
+            "고가≥5이평": H[i] >= m5,
             "급등일로부터_며칠": (i - surge[-1]) if surge else None,
             "급등일": b[surge[-1]]["date"] if surge else None,
             "26봉최고가대비%": round((C[i] / max(H[i - 25:i + 1]) - 1) * 100, 1),
@@ -12093,6 +12095,7 @@ def gom_debug_multi(codes: str = "", date: str = "", names: str = ""):
                 "등락%": h["당일등락률%"], "대금억": h["당일거래대금억"], "거래량5일배": h["거래량_5일평균대비배"],
                 "5이평↑": yn(h["5이평_상승중"]), "종가>20": yn(h["종가>20이평"]), "20>60": yn(h["20이평>60이평"]),
                 "급등후일": h["급등일로부터_며칠"], "최고가대비%": h["26봉최고가대비%"],
+                "5이평터치": yn(h["5이평터치(저가≤5이평≤고가)"]), "고가≥5이평": yn(h["고가≥5이평"]),
                 "A고가+10%": yn(h["A고가기준_26봉내+10%"]), "A종가+8%": yn(h["A종가+8%_26봉내"]), "B26봉50억": yn(h["B26봉내_거래대금50억"]),
                 "26봉최대등락%": h["26봉내_최대등락%"], "26봉최대고가등락%": h["26봉내_최대고가등락%"],
             })
@@ -12153,7 +12156,13 @@ def _gom_minute_features(code: str, d: str) -> dict:
                 if C[i] > u and C[i - 1] <= up:
                     u30 = bbu(C, 300, i - 30)
                     slope = round((up / u30 - 1) * 100, 2) if u30 else None
-                    cross.append({"시각": bs[i]["t"], "빨간선_30봉기울기%": slope, "자리": ("1번(하락 후 돌파)" if slope is not None and slope < -0.3 else "3번(완만한 돌파)")})
+                    day_idx = [j for j in idx if j <= i]
+                    cum_amt = sum(C[j] * V[j] for j in day_idx) / 1e8
+                    avg20v = (sum(V[max(0, i - 20):i]) / 20) if i >= 1 else 0
+                    cross.append({"시각": bs[i]["t"], "빨간선_30봉기울기%": slope,
+                                  "자리": ("1번(하락 후 돌파)" if slope is not None and slope < -0.3 else "3번(완만한 돌파)"),
+                                  "돌파봉_거래량": int(V[i]), "돌파봉_거래량_20봉평균배": round(V[i] / avg20v, 2) if avg20v else None,
+                                  "돌파봉_거래대금억": round(C[i] * V[i] / 1e8, 1), "돌파시점_누적거래대금억": round(cum_amt, 1)})
                 elif bs[i]["h"] >= u * 0.995 and C[i] < u:
                     near.append(bs[i]["t"])
             prevmax = max(V[max(0, i - 20):i]) if i > 0 else 0
