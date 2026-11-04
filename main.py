@@ -12037,6 +12037,16 @@ def gom_debug(code: str, dates: str):
             "5이평터치(저가≤5이평≤고가)": (b[i]["low"] <= m5 <= H[i]),   # 일봉 = 5이평 '터치' (11/3 JM 발견)
             "고가≥5이평": H[i] >= m5,
             "연속상승일수(오늘까지)": next((k for k in range(0, 15) if not (C[i - k] > C[i - k - 1])), 15),
+            # 🐻 JM 가설 (11/4, 대원전선): 하락 2봉 → 5이평 접근 → 전일 몸통 상단(양봉=종가, 음봉=시가) 돌파
+            "하락2봉(어제·그제 하락)": C[i - 1] < C[i - 2] < C[i - 3],
+            "5이평하락추세(어제<그제)": (sma(C, 5, i - 1) or 0) < (sma(C, 5, i - 2) or 0),
+            "5이평이격도%": round(C[i] / m5 * 100, 1),
+            "고가이격도%": round(H[i] / m5 * 100, 1),
+            "5이평하락_연속일(어제까지)": next((k for k in range(0, 30) if not ((sma(C, 5, i - 1 - k) or 0) < (sma(C, 5, i - 2 - k) or 0))), 30),
+            "전일몸통상단": max(O[i - 1], C[i - 1]),
+            "고가>전일몸통상단": H[i] > max(O[i - 1], C[i - 1]),
+            "종가>전일몸통상단": C[i] > max(O[i - 1], C[i - 1]),
+            "5이평근접(±2%)": abs(C[i] / m5 - 1) <= 0.02 or (b[i]["low"] <= m5 <= H[i]),
             # 🐻 JM (11/3): 일봉 '하락하다가 5이평 터치 → 상승 추세 몇 회'
             "5이평_연속상승일수": next((k for k in range(0, 15) if not ((sma(C, 5, i - k) or 0) > (sma(C, 5, i - k - 1) or 0))), 15),
             "터치_전_하락중(직전5일 5이평 하락)": sum(1 for k in range(1, 6) if (sma(C, 5, i - k) or 0) < (sma(C, 5, i - k - 1) or 0)) >= 3,
@@ -12104,6 +12114,9 @@ def gom_debug_multi(codes: str = "", date: str = "", names: str = ""):
                 "급등후일": h["급등일로부터_며칠"], "최고가대비%": h["26봉최고가대비%"],
                 "5이평터치": yn(h["5이평터치(저가≤5이평≤고가)"]), "고가≥5이평": yn(h["고가≥5이평"]),
                 "연속상승일": h["연속상승일수(오늘까지)"],
+                "하락2봉": yn(h["하락2봉(어제·그제 하락)"]), "5이평하락추세": yn(h["5이평하락추세(어제<그제)"]),
+                "이격도%": h["5이평이격도%"], "고가이격도%": h["고가이격도%"], "5이평하락연속일": h["5이평하락_연속일(어제까지)"], "고가>전일몸통상단": yn(h["고가>전일몸통상단"]),
+                "종가>전일몸통상단": yn(h["종가>전일몸통상단"]), "5이평근접": yn(h["5이평근접(±2%)"]),
                 "5이평연속상승일": h["5이평_연속상승일수"], "터치전하락중": yn(h["터치_전_하락중(직전5일 5이평 하락)"]),
                 "터치후며칠": h["최근터치일로부터_며칠"], "터치후상승마감수": h["터치후_상승마감_횟수"],
                 "A고가+10%": yn(h["A고가기준_26봉내+10%"]), "A종가+8%": yn(h["A종가+8%_26봉내"]), "B26봉50억": yn(h["B26봉내_거래대금50억"]),
@@ -12159,11 +12172,13 @@ def _gom_minute_features(code: str, d: str) -> dict:
         bs = agg(tf)
         C = [b["c"] for b in bs]; V = [b["v"] for b in bs]
         idx = [i for i, b in enumerate(bs) if b["day"] == d]
-        cross, near, vol_brk, touch300 = [], [], [], []
+        cross, near, vol_brk, touch300, body300 = [], [], [], [], []
         for i in idx:
             u, up = bbu(C, 300, i), bbu(C, 300, i - 1)
             if u and bs[i]["h"] >= u:  # 🐻 빨간선 '터치'만 해도 1번 (11/3 사부님 대화) — 고가가 빨간선에 닿음
                 touch300.append(bs[i]["t"])
+            if u and max(bs[i]["o"], C[i]) >= u:  # ☆ 11/4 JM: 근접은 '몸통'이 터치해야 (꼬리는 페이크)
+                body300.append(bs[i]["t"])
             if u and up:
                 if C[i] > u and C[i - 1] <= up:
                     u30 = bbu(C, 300, i - 30)
@@ -12174,6 +12189,7 @@ def _gom_minute_features(code: str, d: str) -> dict:
                     cross.append({"시각": bs[i]["t"], "빨간선_30봉기울기%": slope,
                                   "자리": ("1번(하락 후 돌파)" if slope is not None and slope < -0.3 else "3번(완만한 돌파)"),
                                   "돌파봉_거래량": int(V[i]), "돌파봉_거래량_20봉평균배": round(V[i] / avg20v, 2) if avg20v else None,
+                                  "직전봉보다_거래량↑": V[i] > V[i - 1],
                                   "돌파봉_거래대금억": round(C[i] * V[i] / 1e8, 1), "돌파시점_누적거래대금억": round(cum_amt, 1)})
                 elif bs[i]["h"] >= u * 0.995 and C[i] < u:
                     near.append(bs[i]["t"])
@@ -12212,7 +12228,12 @@ def _gom_minute_features(code: str, d: str) -> dict:
                             three = j
                             break
                 dip = round((low / peak - 1) * 100, 2) if pulled else None
+            prevday = [b for b in bs if b["day"] == (prev[-1]["day"] if prev else None)]
+            body_top = max(prevday[0]["o"], prevday[-1]["c"]) if prevday else None
+            bt = next((j for j in idx if body_top and bs[j]["h"] > body_top), None)
             extra = {
+                "전일몸통상단": body_top,
+                "전일몸통상단_첫돌파": bs[bt]["t"] if bt is not None else None,
                 "전일종가": pc,
                 "5이평첫터치": bs[touch]["t"] if touch is not None else None,
                 "터치후_최대연속상승봉": streak_best, "연속상승_최대시각": streak_time,
@@ -12221,6 +12242,7 @@ def _gom_minute_features(code: str, d: str) -> dict:
                 "3번_1번고점재돌파": ({"시각": bs[three]["t"], "누적거래대금억": cumv(three), "거래량20봉배": vmul(three)} if three is not None else None),
             }
         out[f"{tf}분봉"] = {**extra, "빨간선_터치있음": bool(touch300), "빨간선_첫터치": touch300[0] if touch300 else None,
+                           "빨간선_몸통터치있음": bool(body300), "빨간선_몸통첫터치": body300[0] if body300 else None,
             "빨간선_돌파": cross[:5], "빨간선_돌파있음": bool(cross),
             "빨간선_근접_시도": near[:5],
             "거래량+고점돌파": vol_brk[:5], "거래량돌파있음": bool(vol_brk),
@@ -12263,12 +12285,14 @@ def gom_minute_multi(date: str = "", names: str = "", codes: str = ""):
             yn = lambda v: "O" if v else "X"
             rows.append({
                 "종목": nmap.get(c, c),
-                "3분_빨간선터치": yn(f["3분봉"]["빨간선_터치있음"]), "3분_첫터치": f["3분봉"]["빨간선_첫터치"],
+                "3분_몸통터치": yn(f["3분봉"]["빨간선_몸통터치있음"]), "3분_몸통첫터치": f["3분봉"]["빨간선_몸통첫터치"],
+                "3분_빨간선터치(꼬리포함)": yn(f["3분봉"]["빨간선_터치있음"]), "3분_첫터치": f["3분봉"]["빨간선_첫터치"],
                 "3분_빨간선돌파": yn(f["3분봉"]["빨간선_돌파있음"]), "3분_돌파시각·자리": f["3분봉"]["빨간선_돌파"],
                 "3분_근접시도": f["3분봉"]["빨간선_근접_시도"],
                 "5분_빨간선돌파": yn(f["5분봉"]["빨간선_돌파있음"]), "5분_돌파시각·자리": f["5분봉"]["빨간선_돌파"],
                 "5분_거래량+고점돌파": yn(f["5분봉"]["거래량돌파있음"]), "5분_거래량돌파시각": f["5분봉"]["거래량+고점돌파"],
                 "3분_거래량+고점돌파": yn(f["3분봉"]["거래량돌파있음"]),
+                "전일몸통상단": f["3분봉"].get("전일몸통상단"), "몸통상단_첫돌파": f["3분봉"].get("전일몸통상단_첫돌파"),
                 "전일종가": f["3분봉"].get("전일종가"), "3분_5이평첫터치": f["3분봉"].get("5이평첫터치"),
                 "터치후_연속상승봉": f["3분봉"].get("터치후_최대연속상승봉"),
                 "1번(전일종가도달)": f["3분봉"].get("1번_전일종가첫도달"), "눌림%": f["3분봉"].get("눌림%"),
