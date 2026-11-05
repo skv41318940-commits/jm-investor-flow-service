@@ -11994,7 +11994,12 @@ def gom_debug(code: str, dates: str, market: str = "J"):
     want = [d.strip() for d in dates.split(",") if d.strip()]
     end = now_kst().strftime("%Y-%m-%d")
     start = (now_kst() - timedelta(days=760)).strftime("%Y-%m-%d")
-    b = _kis_daily_candles(code, start, end, market)  # J=KRX 정규장 · UN=통합(KRX+NXT, 장 전·장 후 포함)
+    if market == "KW":  # 🟢 키움 통합 일봉 (PC)
+        b = (_kw_daily.get(code) or (0, []))[1] or _kiwoom_daily_al([code]).get(code, [])
+        if not b:
+            return {"ok": True, "code": code, "rows": [{"date": d, "error": "키움 통합 일봉 없음 (PC 꺼짐?)"} for d in dates.split(",")]}
+    else:
+        b = _kis_daily_candles(code, start, end, market)  # J=KRX 정규장 · UN=통합(KRX+NXT, 장 전·장 후 포함)
     idx = {x["date"]: i for i, x in enumerate(b)}
     C = [x["close"] for x in b]; O = [x["open"] for x in b]; H = [x["high"] for x in b]; V = [x["volume"] for x in b]
     A = [(x.get("amount") or 0) or x["close"] * x["volume"] for x in b]
@@ -12096,6 +12101,8 @@ def gom_debug_multi(codes: str = "", date: str = "", names: str = "", market: st
         else:
             unresolved.append(nm)
     lst = list(dict.fromkeys(lst))[:40]
+    if market == "KW":
+        _kiwoom_daily_al(lst)  # 한 번에 맡기기
     names = {}
     try:
         for r in supabase.table("stock_fundamentals").select("code,name").in_("code", lst).execute().data or []:
@@ -13333,10 +13340,35 @@ def _run_broker_pc_daily():
         print(f"[broker_pc] 자동 기록 실패: {e}")
 
 
+# 🟢 키움 통합 일봉 (PC 켜져 있을 때) — 사부님 곰발 ● 은 통합(KRX+NXT) 캔들 기준 (11/5 JM 발견)
+_kw_daily: dict = {}   # code → (받은 시각, [{date, open, high, low, close, volume, amount}])
+
+
+def _kiwoom_daily_al(codes: list, wait: int = 90) -> dict:
+    """PC(키움)에 통합 일봉을 맡기고 기다림. PC가 꺼져 있으면 빈 값 → 한투로 대체"""
+    need = [c for c in codes if not _kw_daily.get(c) or time.time() - _kw_daily[c][0] > 600]
+    if need:
+        if time.time() - _bpc["alive_at"] > 30:
+            return {}
+        asked = time.time()
+        with _bpc_lock:
+            _bpc["tasks"].append({"kind": "daily_al", "codes": need})
+        while time.time() - asked < wait:
+            r = _pc_task_results.get("daily_al")
+            if r and r.get("got", 0) > asked:
+                break
+            time.sleep(1)
+    return {c: _kw_daily[c][1] for c in codes if _kw_daily.get(c)}
+
+
 @app.post("/api/pc-task/result")
 def pc_task_result(payload: dict):
     kind = payload.get("kind") or "unknown"
     _pc_task_results[kind] = {**payload, "got": time.time()}
+    if kind == "daily_al":  # 🟢 키움 통합(KRX+NXT) 일봉 보관 (2026-11-05)
+        for code, rows in (payload.get("data") or {}).items():
+            if rows:
+                _kw_daily[code] = (time.time(), sorted(rows, key=lambda x: x["date"]))
     if kind == "vp20" and payload.get("code"):
         _vp20[payload["code"]] = {"day": now_kst().strftime("%Y-%m-%d"), "rows": payload.get("rows", []), "asked": time.time()}
     return {"ok": True}
