@@ -11987,14 +11987,14 @@ def _jm_signals_today(code: str) -> dict:
 
 
 @app.get("/api/gom-debug")
-def gom_debug(code: str, dates: str):
+def gom_debug(code: str, dates: str, market: str = "J"):
     """🐻 곰발 연구용 (2026-11-02): 날짜마다 곰발 조건 A~F 통과 여부 + '숨은 조건' 후보 숫자를 나란히
     예: /api/gom-debug?code=030530&dates=2026-08-10,2026-08-14,2026-09-02"""
     code = (code or "").strip().upper()
     want = [d.strip() for d in dates.split(",") if d.strip()]
     end = now_kst().strftime("%Y-%m-%d")
     start = (now_kst() - timedelta(days=760)).strftime("%Y-%m-%d")
-    b = _kis_daily_candles(code, start, end)
+    b = _kis_daily_candles(code, start, end, market)  # J=KRX 정규장 · UN=통합(KRX+NXT, 장 전·장 후 포함)
     idx = {x["date"]: i for i, x in enumerate(b)}
     C = [x["close"] for x in b]; O = [x["open"] for x in b]; H = [x["high"] for x in b]; V = [x["volume"] for x in b]
     A = [(x.get("amount") or 0) or x["close"] * x["volume"] for x in b]
@@ -12045,6 +12045,7 @@ def gom_debug(code: str, dates: str):
             "20봉내_최대연속양봉": max((sum(1 for _ in g) for k, g in __import__("itertools").groupby([C[j] > O[j] for j in range(i - 20, i)]) if k), default=0),
             "20봉내_5이평최대연속상승": max((sum(1 for _ in g) for k, g in __import__("itertools").groupby([(sma(C, 5, j) or 0) > (sma(C, 5, j - 1) or 0) for j in range(i - 20, i)]) if k), default=0),
             "20봉내_최대일거래대금억": round(max(A[i - 20:i]) / 1e8, 1),
+            "5봉내_최대일거래대금억(오늘포함)": round(max(A[i - 4:i + 1]) / 1e8, 1),
             "고가이격도%": round(H[i] / m5 * 100, 1),
             "5이평하락_연속일(어제까지)": next((k for k in range(0, 30) if not ((sma(C, 5, i - 1 - k) or 0) < (sma(C, 5, i - 2 - k) or 0))), 30),
             "전일몸통상단": max(O[i - 1], C[i - 1]),
@@ -12066,7 +12067,7 @@ def gom_debug(code: str, dates: str):
 
 
 @app.get("/api/gom-debug-multi")
-def gom_debug_multi(codes: str = "", date: str = "", names: str = ""):
+def gom_debug_multi(codes: str = "", date: str = "", names: str = "", market: str = "J"):
     """🐻 곰발 연구 — 여러 종목 한 번에 (한 줄씩 요약).
     예: /api/gom-debug-multi?date=2026-11-02&codes=008930,302550
         /api/gom-debug-multi?date=2026-11-03&names=현대건설,리메드   ← 종목명으로도 (2026-11-03)"""
@@ -12101,7 +12102,7 @@ def gom_debug_multi(codes: str = "", date: str = "", names: str = ""):
     rows = []
     for c in lst:
         try:
-            r = gom_debug(c, d)["rows"][0]
+            r = gom_debug(c, d, market)["rows"][0]
             if r.get("error"):
                 rows.append({"종목": names.get(c, c), "오류": r["error"]})
                 continue
@@ -12120,7 +12121,7 @@ def gom_debug_multi(codes: str = "", date: str = "", names: str = ""):
                 "연속상승일": h["연속상승일수(오늘까지)"],
                 "하락2봉": yn(h["하락2봉(어제·그제 하락)"]), "5이평하락추세": yn(h["5이평하락추세(어제<그제)"]),
                 "이격도%": h["5이평이격도%"], "20봉_최대연속양봉": h["20봉내_최대연속양봉"],
-                "20봉_5이평최대연속상승": h["20봉내_5이평최대연속상승"], "20봉_최대일거래대금억": h["20봉내_최대일거래대금억"], "고가이격도%": h["고가이격도%"], "5이평하락연속일": h["5이평하락_연속일(어제까지)"], "고가>전일몸통상단": yn(h["고가>전일몸통상단"]),
+                "20봉_5이평최대연속상승": h["20봉내_5이평최대연속상승"], "20봉_최대일거래대금억": h["20봉내_최대일거래대금억"], "5봉_최대일거래대금억": h["5봉내_최대일거래대금억(오늘포함)"], "고가이격도%": h["고가이격도%"], "5이평하락연속일": h["5이평하락_연속일(어제까지)"], "고가>전일몸통상단": yn(h["고가>전일몸통상단"]),
                 "종가>전일몸통상단": yn(h["종가>전일몸통상단"]), "5이평근접": yn(h["5이평근접(±2%)"]),
                 "5이평연속상승일": h["5이평_연속상승일수"], "터치전하락중": yn(h["터치_전_하락중(직전5일 5이평 하락)"]),
                 "터치후며칠": h["최근터치일로부터_며칠"], "터치후상승마감수": h["터치후_상승마감_횟수"],
@@ -12130,7 +12131,7 @@ def gom_debug_multi(codes: str = "", date: str = "", names: str = ""):
         except Exception as e:
             rows.append({"종목": names.get(c, c), "오류": str(e)})
         time.sleep(0.1)
-    return {"ok": True, "date": d, "rows": rows, "못찾은종목": unresolved}
+    return {"ok": True, "date": d, "market": market, "rows": rows, "못찾은종목": unresolved}
 
 
 def _gom_minute_features(code: str, d: str) -> dict:
@@ -13662,13 +13663,13 @@ def weekly_review_endpoint(send: bool = False):
 @app.get("/api/ping")
 def ping():
     return {"ok": True}
-def _kis_daily_candles(code: str, start: str, end: str) -> list:
+def _kis_daily_candles(code: str, start: str, end: str, market: str = "J") -> list:
     """🛟 한투 일봉 (KRX가 막히거나 점검일 때 대신) — 100개씩 이어 받기 (2026-10-31)"""
     s_ymd, e_ymd = start.replace("-", ""), end.replace("-", "")
     out, cur = {}, e_ymd
     for _ in range(16):  # 100봉씩 최대 1,600봉 (역배정초 볼린저 300용 약 4년)
         j = kis_get("/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice", "FHKST03010100",
-                    {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code, "FID_INPUT_DATE_1": s_ymd,
+                    {"FID_COND_MRKT_DIV_CODE": market, "FID_INPUT_ISCD": code, "FID_INPUT_DATE_1": s_ymd,
                      "FID_INPUT_DATE_2": cur, "FID_PERIOD_DIV_CODE": "D", "FID_ORG_ADJ_PRC": "0"})
         rows = [r for r in (j.get("output2") or []) if r.get("stck_bsop_date") and r.get("stck_clpr")]
         if not rows:
