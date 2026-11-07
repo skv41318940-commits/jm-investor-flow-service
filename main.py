@@ -11934,8 +11934,21 @@ def _jm_signal_series(code: str) -> dict:
     #    (예전 760일이면 2025년 12월은 300봉이 안 돼서 계산 자체가 안 됐음 — 한미반도체 12월 미표시 원인, 2026-11-02)
     start = (now_kst() - timedelta(days=1460)).strftime("%Y-%m-%d")
     b = _kis_daily_candles(code, start, end)
+    # 🟢 PC 켜져 있으면 키움 정규장 일봉으로 최근 구간 덮어쓰기 (한투 J는 밤에 애프터마켓 가격이 섞임) — 2026-11-07
+    try:
+        _kiwoom_daily_ask(code, "krx")
+        kk = _kk_daily.get(code)
+        if kk and kk[1]:
+            mg = {x["date"]: x for x in b}
+            for x in kk[1]:
+                if start <= x["date"] <= end:
+                    mg[x["date"]] = x
+            b = [mg[k] for k in sorted(mg)]
+    except Exception:
+        pass
     n = len(b)
     C = [x["close"] for x in b]; H = [x["high"] for x in b]
+    O = [x["open"] for x in b]
     A = [(x.get("amount") or 0) or x["close"] * x["volume"] for x in b]
 
     def sma_arr(arr, k):
@@ -11959,19 +11972,30 @@ def _jm_signal_series(code: str) -> dict:
     m5, m20, m60, a5 = sma_arr(C, 5), sma_arr(C, 20), sma_arr(C, 60), sma_arr(A, 5)
     u20 = bbu_arr(C, 20)
     u300 = bbu_arr(C, 300) if n >= 300 else [None] * n
-    g_dates, y_dates = [], []
+    g_dates, y_dates, gi_dates = [], [], []
+    CHG = [0.0] + [(C[j] / C[j - 1] - 1) * 100 if C[j - 1] else 0.0 for j in range(1, n)]
+    OCHG = [(C[j] / O[j] - 1) * 100 if O[j] else 0.0 for j in range(n)]
+
+    def gom_core(t):
+        """🐻 곰발 공통 (2026-11-07 확정 · HTS 곰발/곰발 통합과 같은 A~K)"""
+        if t < 40 or m5[t] is None:
+            return False
+        up8 = max(CHG[t - 25:t + 1]) >= 8
+        today = C[t - 1] < C[t - 6] and (C[t] > C[t - 1] or C[t] > O[t - 1]) and up8      # 1봉전 5이평 하락 ⇔ C(1) < C(6)
+        cont = C[t - 3] < C[t - 8] and (max(OCHG[t - 2:t + 1]) >= 3 or max(CHG[t - 2:t + 1]) >= 3) and up8  # 3봉전 5이평 하락
+        base = C[t] > m5[t] and max(A[t - 4:t + 1]) >= 5e9 and max(A[t - 39:t + 1]) >= 5e10
+        return (today or cont) and base
 
     def cu(t, line):
         return line[t] is not None and line[t - 1] is not None and H[t] > line[t] and H[t - 1] <= line[t - 1]
 
     for t in range(6, n):
-        # 🐻 곰발
-        if m5[t] is not None and m5[t - 1] is not None:
-            a = any(C[j] / C[j - 1] >= 1.10 for j in range(max(1, t - 25), t + 1))
-            bb = any(A[j] >= 5e9 for j in range(max(0, t - 4), t + 1))
-            V_ = b[t]["volume"]; Vp = b[t - 1]["volume"]
-            if a and bb and C[t] > m5[t] and C[t - 1] <= m5[t - 1] and H[t - 1] < C[t] and C[t] > C[t - 1] and V_ > Vp:  # F 거래량 증가 (11/2 확정)
+        # 🐻 곰발 (●: 종가 > 전일 고가 · 양봉) / 곰발 통합 (○: 고가가 3봉 중 신고가) — 2026-11-07 확정
+        if gom_core(t):
+            if C[t] > H[t - 1] and C[t] > O[t]:
                 g_dates.append(b[t]["date"])
+            if H[t] >= max(H[t - 2:t + 1]):
+                gi_dates.append(b[t]["date"])
         # ▲ 역배정초
         if t >= 305 and u300[t] is not None and u300[t - 2] is not None and m60[t] is not None and m20[t - 12] is not None:
             A1 = u300[t] > u300[t - 1] > u300[t - 2]
@@ -11983,10 +12007,10 @@ def _jm_signal_series(code: str) -> dict:
                 y_dates.append(b[t]["date"])
     last = b[-1]["date"] if b else ""
     # 🦀 검색기 '일봉 신호' = 사부님 점 구조 (11/2 마감 16종목 비교로 확인): 종가 > 5이평 · 전일보다 상승 마감 · 양봉
-    t = n - 1
-    core = bool(n >= 6 and m5[t] is not None and C[t] > m5[t] and C[t] > C[t - 1] and C[t] > b[t]["open"])
-    res = {"ok": True, "code": code, "bars": n, "g": g_dates, "y": y_dates,
-           "today": {"g": core, "y": bool(y_dates and y_dates[-1] == last)}, "last": last}
+    res = {"ok": True, "code": code, "bars": n, "g": g_dates, "gi": gi_dates, "y": y_dates,
+           "today": {"g": bool(g_dates and g_dates[-1] == last), "gi": bool(gi_dates and gi_dates[-1] == last),
+                     "y": bool(y_dates and y_dates[-1] == last)},
+           "last": last, "source": "키움" if _kk_daily.get(code) else "한투"}
     _sig_series_cache[code] = (time.time(), res)
     return res
 
