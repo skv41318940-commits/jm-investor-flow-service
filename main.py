@@ -9242,16 +9242,18 @@ def trade_context_endpoint(code: str, date: str):
 # 당일·전날 등 과거 날짜의 09:00~15:30 1분봉. 한 번에 120개씩 받아서 앞으로 이어붙임.
 # ══════════════════════════════════════════════════════════════════════════
 @app.get("/api/stock-minute-by-date")
-def stock_minute_by_date_endpoint(code: str, date: str):
+def stock_minute_by_date_endpoint(code: str, date: str, market: str = "J"):
     code = (code or "").strip().upper()
     ymd = date.replace("-", "")
-    rows, cursor, seen = [], "153000", set()
+    market = "UN" if market == "UN" else "J"  # 🔀 UN=🌙 통합 (08:00~20:00)
+    first_hm = "090000" if market == "J" else "080000"
+    rows, cursor, seen = [], ("153000" if market == "J" else "200000"), set()
     try:
-        for _ in range(6):
+        for _ in range(6 if market == "J" else 16):
             data = kis_get(
                 "/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice",
                 "FHKST03010230",
-                {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code, "FID_INPUT_HOUR_1": cursor,
+                {"FID_COND_MRKT_DIV_CODE": market, "FID_INPUT_ISCD": code, "FID_INPUT_HOUR_1": cursor,
                  "FID_INPUT_DATE_1": ymd, "FID_PW_DATA_INCU_YN": "Y", "FID_FAKE_TICK_INCU_YN": ""},
             )
             batch = [r for r in (data.get("output2") or []) if r.get("stck_bsop_date") == ymd]
@@ -9262,7 +9264,7 @@ def stock_minute_by_date_endpoint(code: str, date: str):
                 seen.add(r["stck_cntg_hour"])
                 rows.append(r)
             earliest = min(r["stck_cntg_hour"] for r in new)
-            if earliest <= "090000":
+            if earliest <= first_hm:
                 break
             t = datetime.strptime(earliest, "%H%M%S") - timedelta(minutes=1)
             cursor = t.strftime("%H%M%S")
@@ -10777,14 +10779,19 @@ def new_highs_endpoint(raw: bool = False):
 _minute_mem: dict = {}
 
 
-def _minute_day_cached(code: str, day: str) -> dict:
+def _minute_day_cached(code: str, day: str, market: str = "J") -> dict:
     """⚡ 지난 날짜 1분봉은 한 번 받으면 보관 (메모리 → DB → 한투 순서). 오늘은 장중에 바뀌니 짧게만 (2026-10-28)
     — 분봉 화면이 느리던 가장 큰 이유가 매번 날짜마다 한투에 여러 번씩 물어보던 것"""
-    key = (code, day)
+    key = (code, day) if market == "J" else (code, day, market)
     today = now_kst().strftime("%Y-%m-%d")
     hit = _minute_mem.get(key)
     if hit and (day < today or time.time() - hit[0] < 60):
         return hit[1]
+    if market != "J":  # 🌙 통합은 DB 보관 없이 메모리에만
+        out = stock_minute_by_date_endpoint(code, day, market)
+        if out.get("ok") and out.get("candles"):
+            _minute_mem[key] = (time.time(), out)
+        return out
     if day < today:
         try:
             r = supabase.table("minute_candles_cache").select("candles").eq("code", code).eq("day", day).limit(1).execute().data
@@ -10808,7 +10815,7 @@ def _minute_day_cached(code: str, day: str) -> dict:
 
 
 @app.get("/api/stock-minute-multi")
-def stock_minute_multi_endpoint(code: str, days: int = 5, end: str = "", start: str = ""):
+def stock_minute_multi_endpoint(code: str, days: int = 5, end: str = "", start: str = "", mode: str = "krx"):
     """여러 날 1분봉 — start~end(YYYY-MM-DD, end 비우면 오늘) 또는 end까지 최근 N거래일. 최대 10거래일 (2026-10-26)"""
     e = datetime.strptime(end, "%Y-%m-%d") if end else now_kst().replace(tzinfo=None)
     if start:
@@ -10829,12 +10836,14 @@ def stock_minute_multi_endpoint(code: str, days: int = 5, end: str = "", start: 
     import concurrent.futures as cf
     days = [d.strftime("%Y-%m-%d") for d in dates]
     with cf.ThreadPoolExecutor(max_workers=4) as ex:  # 날짜별로 동시에 (한투 초당 제한 안쪽)
-        results = list(ex.map(lambda dd: _minute_day_cached(code, dd), days))
+        mk = "UN" if mode == "al" else "J"  # 🔀 2026-11-07
+        results = list(ex.map(lambda dd: _minute_day_cached(code, dd, mk), days))
     out = []
     for dd, r in zip(days, results):
         if r.get("ok") and r.get("candles"):
             out.append({"date": dd, "candles": r["candles"]})
-    return {"ok": bool(out), "code": code, "days": out, "error": None if out else "분봉 데이터가 없어요 (휴장일이거나 너무 오래된 날짜)"}
+    return {"ok": bool(out), "code": code, "days": out, "mode": "al" if mode == "al" else "krx", "source": "한투",
+            "error": None if out else "분봉 데이터가 없어요 (휴장일이거나 너무 오래된 날짜)"}
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -13732,8 +13741,7 @@ def _kis_daily_candles(code: str, start: str, end: str, market: str = "J") -> li
     return [out[k] for k in sorted(out)]
 
 
-@app.get("/api/stock-ohlcv")
-def stock_ohlcv_endpoint(code: str, start: str, end: str):
+def _stock_ohlcv_base(code: str, start: str, end: str):
     """
     목표가 매핑(패턴분석) 캔들차트용 — 정밀 일봉 시가/고가/저가/종가/거래량.
     pykrx(KRX 공식 데이터)로 가져오므로 키움/한투 로그인과 무관하게 항상 정확함.
@@ -13775,6 +13783,84 @@ def stock_ohlcv_endpoint(code: str, start: str, end: str):
         return {"ok": True, "code": code, "candles": candles}
     except Exception as e:
         return kis_fallback(str(e))
+# ══════════════════════════════════════════════════════════════════════════
+# 🔀 데이터 원칙 (2026-11-07 JM): PC 켜짐 → 키움 · PC 꺼짐 → 한투/KRX
+#    모드: krx = 🕘 정규장만 (기본) · al = 🌙 통합 (KRX+NXT, 장 전·장 후 포함)
+# ══════════════════════════════════════════════════════════════════════════
+_kw_asked: dict = {}   # (code, mode) → 마지막으로 PC에 맡긴 시각 (같은 걸 계속 맡기지 않게)
+
+
+def _pc_alive() -> bool:
+    return time.time() - _bpc.get("alive_at", 0) < 30
+
+
+def _kw_daily_fresh_sec() -> int:
+    """키움 일봉을 얼마나 오래 써도 되나 — 장중엔 짧게(오늘 봉이 계속 바뀜), 장 끝나면 길게"""
+    n = now_kst()
+    hm = n.hour * 100 + n.minute
+    return 90 if (n.weekday() < 5 and 800 <= hm <= 2005) else 3600
+
+
+def _kiwoom_daily_ask(code: str, mode: str):
+    """PC에 일봉을 '맡기기만' 하고 기다리지 않음 (화면은 일단 한투/KRX로 바로 보여주고, 다음부터 키움)"""
+    k = (code, mode)
+    if time.time() - _kw_asked.get(k, 0) < 60 or not _pc_alive():
+        return
+    _kw_asked[k] = time.time()
+    with _bpc_lock:
+        _bpc["tasks"].append({"kind": "daily_al", "codes": [code], "suffix": "" if mode == "krx" else "_AL"})
+
+
+@app.get("/api/data-source")
+def data_source_status():
+    """지금 어디서 데이터를 받는지 — 화면 배지용 (🟢 키움 / ⚪ 한투)"""
+    return {"ok": True, "pc_alive": _pc_alive(), "source": "kiwoom" if _pc_alive() else "kis",
+            "label": "🟢 키움" if _pc_alive() else "⚪ 한투", "pc_seen_sec": round(time.time() - _bpc.get("alive_at", 0))}
+
+
+@app.get("/api/stock-ohlcv")
+def stock_ohlcv_endpoint(code: str, start: str, end: str, mode: str = "krx", wait: int = 0):
+    """
+    일봉 — mode=krx 🕘 정규장만 (기본) / mode=al 🌙 통합(KRX+NXT)
+    PC 켜짐 → 키움 일봉(최근 약 600봉)을 덮어씀 · 그보다 오래된 구간은 KRX/한투로 채움
+    PC 꺼짐 → krx: KRX(pykrx) → 한투 J / al: 한투 UN
+    wait=1이면 키움 일봉이 올 때까지 최대 40초 기다림 (연구·검증용)
+    """
+    mode = "al" if mode == "al" else "krx"
+    if mode == "krx":
+        base = _stock_ohlcv_base(code, start, end)
+    else:
+        try:
+            cs = _kis_daily_candles(code, start, end, "UN")
+            base = {"ok": bool(cs), "code": code, "candles": cs, "source": "KIS",
+                    **({} if cs else {"error": "통합 일봉을 못 받았어요"})}
+        except Exception as e:
+            base = {"ok": False, "error": str(e)}
+    store = _kk_daily if mode == "krx" else _kw_daily
+    hit = store.get(code)
+    if _pc_alive() and (not hit or time.time() - hit[0] > _kw_daily_fresh_sec()):
+        if wait:
+            _kiwoom_daily_al([code], wait=40, krx_only=(mode == "krx"))
+            hit = store.get(code)
+        else:
+            _kiwoom_daily_ask(code, mode)
+    src = base.get("source") or ("KRX" if base.get("ok") else "")
+    if hit and hit[1]:
+        merged = {c["date"]: c for c in (base.get("candles") or [])}
+        n_kw = 0
+        for c in hit[1]:
+            if start <= c["date"] <= end:
+                merged[c["date"]] = c
+                n_kw += 1
+        if n_kw:
+            return {"ok": True, "code": code, "candles": [merged[k] for k in sorted(merged)], "mode": mode,
+                    "source": "키움" if n_kw == len(merged) else f"키움+{src or '한투'}",
+                    "kiwoom_age_sec": round(time.time() - hit[0])}
+    base["mode"] = mode
+    base["source"] = src or "한투"
+    return base
+
+
 # ── 분봉 페이지네이션 ───────────────────────────────────────────────────────
 # 한투 "주식당일분봉조회"(FHKST03010200)는 한 번 호출에 최대 30개 분봉만 주고,
 # FID_INPUT_HOUR_1(HHMMSS) "이전" 시각의 분봉을 최신순으로 돌려줌. 그래서 응답에서
@@ -13896,7 +13982,7 @@ def fetch_minute_candles_paginated(code: str, market: str = "J", start_hhmm: str
 
 
 @app.get("/api/stock-minute-ohlcv")
-def stock_minute_ohlcv_endpoint(code: str, market: str = "J", start_time: str = ""):
+def stock_minute_ohlcv_endpoint(code: str, market: str = "J", start_time: str = "", mode: str = ""):
     """
     종목분석/패턴분석 분봉 캔들차트용 — 당일 분봉 시가/고가/저가/종가/거래량.
     한국투자증권 API(FHKST03010200) 기반, PC(키움) 없이 클라우드에서 바로 조회됨.
@@ -13909,6 +13995,8 @@ def stock_minute_ohlcv_endpoint(code: str, market: str = "J", start_time: str = 
     """
     if not KIS_APP_KEY or not KIS_APP_SECRET:
         return {"ok": False, "error": "KIS_APP_KEY / KIS_APP_SECRET 환경변수가 설정되어 있지 않습니다."}
+    if mode:  # 🔀 2026-11-07: mode=krx 🕘 정규장만 / al 🌙 통합
+        market = "UN" if mode == "al" else "J"
     if market not in ("J", "NX", "UN"):
         return {"ok": False, "error": "market은 J / NX / UN 중 하나여야 해요."}
     if start_time and not re.fullmatch(r"\d{2}:?\d{2}", start_time):
@@ -13921,6 +14009,8 @@ def stock_minute_ohlcv_endpoint(code: str, market: str = "J", start_time: str = 
             "ok": True,
             "code": code,
             "market": market,
+            "mode": "al" if market == "UN" else "krx",
+            "source": "한투",
             "date": latest_date,
             "count": len(candles),
             "pages": pages,
