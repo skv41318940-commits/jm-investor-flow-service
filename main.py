@@ -2778,33 +2778,31 @@ async def _daily_jobs_worker():
         ("overseas_ranking_HK_CN", _ensure_overseas_ranking_cached, ("HK_CN",)),
         ("fundamentals", _ensure_fundamentals_synced_today, ()),
         ("market_flow", _ensure_market_flow_synced_today, ()),
-        ("health_report", _ensure_health_report_sent_today, ()),
-        ("telegram_briefs", _run_telegram_briefs, ()),
+        # ⏰ 정해진 시각 알림들은 _alert_clock_loop(15초)로 옮김 (2026-11-07)
         ("sector_map", _ensure_sector_jobs, ()),
         ("futures_snap", _snap_futures, ()),
-        ("us_briefs", _run_us_briefs, ()),
+
         ("global_dict", _weekly_global_dictionary, ()),
         ("maintenance", _maintenance_reminders, ()),
-        ("world_news", _run_world_news_alerts, ()),
-        ("flash", _run_flash_alerts, ()),
+        # 🌍 세계 뉴스 07:10·18:10 → JM 뉴스 07·12·18시(브리핑)로 · 🚨 국내·해외 속보 끔 (2026-11-07 JM)
         ("theme_snap", _save_theme_snapshot, ()),
         ("new_highs", _save_new_highs_snapshot, ()),
-        ("report_digest", _run_report_digest, ()),
+
         ("fut_close", _save_futures_close, ()),
         ("theme_map", _run_theme_map_job, ()),
         ("broker_pc_daily", _run_broker_pc_daily, ()),
         ("broker_pc_track", _run_broker_pc_track, ()),
         ("pc_off_alert", _run_pc_off_alert, ()),
-        ("nxt_premarket", _run_nxt_premarket, ()),
+
         ("swing_after_close", _run_swing_after_close, ()),
         ("theme_index", _run_theme_index_job, ()),
         ("inst_prefetch", _run_inst_prefetch, ()),
-        ("weekly_review", _run_weekly_review, ()),
+        # ("weekly_review", _run_weekly_review, ()),  # 🛑 금요일 밤 주간 리포트도 끔 (2026-11-07 JM: 주말 리포트 필요 없음)
         ("krx_map", _run_krx_map_job, ()),
         ("new_listing", _run_new_listing_job, ()),
         # ("crab", _run_crab_job, ()),  # 🦀 꽃게 검색기 잠시 끔 (2026-10-30 JM — 검색기 다시 설계 예정, KRX 부담도 줄임)
         ("target_reach", _check_target_reach, ()),
-        ("earnings_disclosure", _check_earnings_disclosures, ()),
+        # 📢 실적 공시 실시간 → 11:00·17:00 공시 총정리로 (2026-11-07)
     ]
     await asyncio.sleep(30)  # 서버 막 켜졌을 때 다른 초기화가 먼저 끝나게 잠깐 대기
     while True:
@@ -2814,6 +2812,24 @@ async def _daily_jobs_worker():
             except Exception as e:
                 print(f"[daily_jobs] {name} 실패: {e}")
         await asyncio.sleep(300)
+
+
+def _alert_clock_loop():
+    """⏰ 알림 전용 시계 (2026-11-07 JM) — 15초마다. 무거운 작업 고리(5분)와 따로 돌아서 앞 작업이 길어도 정시에 감.
+    각 함수가 '이미 보냈나'를 DB 기록으로 확인하니까 서버가 재시작돼도 두 번 안 감"""
+    time.sleep(20)
+    fns = (("briefs", _run_telegram_briefs), ("us", _run_us_briefs), ("nxt", _run_nxt_premarket),
+           ("health", _ensure_health_report_sent_today), ("jm_report", _run_report_digest))
+    while True:
+        if now_kst().weekday() >= 5:  # 🛑 주말엔 알림 시계 쉼 (토요일 00:00 미국 개장·일요일 22:25 미국 장전 포함)
+            time.sleep(60)
+            continue
+        for name, fn in fns:
+            try:
+                fn()
+            except Exception as e:
+                print(f"[alert_clock] {name} 실패: {e}")
+        time.sleep(15)
 
 
 @app.on_event("startup")
@@ -2826,6 +2842,7 @@ async def _start_ws_worker():
     asyncio.create_task(_ws_worker())
     threading.Thread(target=_mq_loop, daemon=True).start()  # ⚡ 매크로 미리 받기
     threading.Thread(target=_daytrade_touch_loop, daemon=True).start()  # 🎯 당일매매 세력평단 터치 (1분마다)
+    threading.Thread(target=_alert_clock_loop, daemon=True).start()  # ⏰ 정시 알림 시계 (15초)
     # 해외주식 실시간 체결 수집은 사용 안 함 (2026-10-08 사용자 요청) — 한투가 appkey당 실시간 연결을
     # 1개만 허용해서, 해외 연결이 켜져 있으면 국내 실시간 체결이 "ALREADY IN USE appkey"로 막힘.
     # 다시 쓰려면 Render 환경변수 OVERSEAS_WS_ENABLED=1 을 추가하면 됨 (국내장 시간엔 자동으로 양보함).
@@ -4622,7 +4639,7 @@ def _run_inst_prefetch():
     except Exception:
         pass
     d = _crab_pc.get("data") or {}
-    for k in ("crab", "small", "big"):
+    for k in CRAB_KEYS:
         codes += [x["code"] for x in d.get(k, []) or []]
     todo = list(dict.fromkeys(codes))[:120]
 
@@ -5196,7 +5213,7 @@ def research_debug():
 # ══════════════════════════════════════════════════════════════════════════
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-HEALTH_REPORT_HOUR, HEALTH_REPORT_MINUTE = 18, 40
+HEALTH_REPORT_HOUR, HEALTH_REPORT_MINUTE = 18, 45  # 🩺 JM 데이터 점검 (2026-11-07)
 _health_sent = {"date": None}
 
 
@@ -5211,7 +5228,8 @@ _health_sent = {"date": None}
 #   Render 환경변수 TELEGRAM_BOT_TOKEN_NEWS / _FLASH / _SPORTS 를 넣으면 그 봇으로, 없으면 기존 봇으로 그대로 감
 #   (채팅방이 다르면 TELEGRAM_CHAT_ID_NEWS 등도 넣을 수 있음 — 보통은 같은 사람이라 안 넣어도 됨)
 # ══════════════════════════════════════════════════════════════════════════
-BRIEF_BOT = {"news_11": "news", "news_15": "news", "news_2020": "news", "ir_16": "flash", "ir_2010": "flash"}
+BRIEF_BOT = {"news_11": "news", "news_15": "news", "news_2020": "news", "ir_16": "flash", "ir_2010": "flash",
+             "jmnews_07": "news", "jmnews_12": "news", "jmnews_18": "news", "disc_am": "flash", "disc_pm": "flash"}
 
 
 def bot(channel: str = "main"):
@@ -5230,6 +5248,8 @@ BRIEF_STYLE = {
     "morning": ("🟫", "미국 마감"), "us_pre": ("🟫", "미국 장전"), "us_open30": ("🟫", "미국 개장"),
     "news_11": ("⬜", "세계 이슈"), "news_15": ("⬜", "세계 이슈"), "news_2020": ("⬜", "세계 이슈"),
     "ir_16": ("⬜", "IR 예고"), "ir_2010": ("⬜", "IR 예고"),
+    "jmnews_07": ("⬜", "JM 뉴스 시작"), "jmnews_12": ("⬜", "JM 뉴스 중간"), "jmnews_18": ("⬜", "JM 뉴스 마감"),
+    "disc_am": ("⬜", "오전 공시"), "disc_pm": ("⬜", "오후 공시"),
 }
 
 
@@ -5468,6 +5488,10 @@ def report_digest_endpoint(day: str = "", send: bool = False, rebuild: bool = Fa
 
 
 def send_telegram(text: str, token: str = None, chat_id: str = None) -> bool:
+    # 🛑 주말(토·일, 한국 시간)엔 알림 전부 OFF (2026-11-07 JM) — '보낸 걸로' 처리해서 같은 알림을 계속 다시 만들지 않게
+    if now_kst().weekday() >= 5:
+        print("[telegram] 주말 — 알림 끔 (보내지 않음)")
+        return True
     token = token or TELEGRAM_BOT_TOKEN
     chat_id = chat_id or TELEGRAM_CHAT_ID
     if not token or not chat_id:
@@ -6428,21 +6452,26 @@ def calendar_debug():
 # 보낸 기록은 Supabase telegram_sent_log에 남겨서, 서버가 재시작돼도 같은 알림을 두 번 안 보냄.
 # 수동 미리보기: /api/brief?kind=morning|targets|flow|theme  (&send=true 면 텔레그램으로도 보냄)
 # ══════════════════════════════════════════════════════════════════════════
+# ⏰ 2026-11-07 JM 알림 개편 — 정해진 시각에 '딱' (15초 시계 + 미리 만들어 두기) · 중복 없음
+#    없앤 것: 세계 증시 이슈(11·15·20:20) · 실적발표 예고/IR(16·20:10 → 공시 총정리에 합침) · 마감 리포트 초안(20:40)
 BRIEF_SCHEDULE = {
-    "morning": (6, 15),
-    "targets": (8, 0),  # 📋 장전 리포트 (목표가 + 오늘 일정 + 어제 수급)
-    "rally": (9, 25),  # 🚀 아침 상승 랭킹 — 만드는 데 몇 분 걸려서 09:25 시작 → 09:30 전후 도착 (2026-10-28)
-    "theme_am": (10, 0),  # 🌅 오전장 테마 이슈 (20:00 테마 이슈의 오전판 — 변동성 미리 보기)
-    "schedule": (14, 0),
-    "news_11": (11, 0),  # 🌍 세계 증시 이슈 (오전)
-    "news_15": (15, 0),  # 🌍 세계 증시 이슈 (오후)
-    "ir_16": (16, 0),  # 📢 실적발표 예고·IR (오전~16시 분)
-    "ir_2010": (20, 10),  # 📢 실적발표 예고·IR (16시 이후 분)
-    "news_2020": (20, 20),  # 🌍 세계 증시 이슈 (저녁)
-    "closing": (20, 40),  # 📝 오늘의 마감 리포트 초안 (피날레)
-    "flow": (16, 10),  # 다른 곳과 숫자 차이는 시간 문제가 아니라 KRX 단독 vs KRX+NXT 통합 차이로 보여 시간은 그대로
-    "theme": (20, 0),
+    "morning": (6, 15),    # 🇺🇸 미국 마감
+    "jmnews_07": (7, 0),   # 📰 JM 뉴스 — 시작
+    "targets": (7, 50),    # 📋 장전 리포트
+    "rally": (9, 30),      # 🚀 아침 상승 랭킹
+    "theme_am": (10, 0),   # 🌅 오전장 테마 이슈
+    "disc_am": (11, 0),    # 📢 오전 공시 총정리
+    "jmnews_12": (12, 0),  # 📰 JM 뉴스 — 중간
+    "schedule": (14, 0),   # 🗓 주요 일정
+    "flow": (16, 0),       # 💰 오늘의 수급
+    "disc_pm": (17, 0),    # 📢 오후 공시 총정리
+    "jmnews_18": (18, 0),  # 📰 JM 뉴스 — 마감
+    "theme": (20, 0),      # 🔥 오늘의 테마 이슈
 }
+# 만드는 데 오래 걸리는 브리핑은 이만큼(분) 먼저 만들어 두고 정각에 보냄
+BRIEF_LEAD = {"morning": 3, "jmnews_07": 3, "targets": 4, "rally": 5, "theme_am": 5, "disc_am": 3, "jmnews_12": 3,
+              "schedule": 6, "flow": 4, "disc_pm": 3, "jmnews_18": 3, "theme": 5}
+_prebuilt: dict = {}   # (kind, day) → (text, ref) / "building"
 
 
 def _brief_already_sent(kind: str, ref_date: str) -> bool:
@@ -6766,8 +6795,10 @@ def build_flow_brief():
                 f"{i} {h['name']} {h['pct']:+.2f}% · {_fmt_eok(h['value_eok'], signed=False)}" for i, h in enumerate(hs, 1)))
     except Exception as e:
         print(f"[brief:flow] 52주 신고가 실패: {e}")
-    # 사모 TOP5 (최근 2거래일)
+    # 사모 TOP5 — 뺌 (2026-11-07 JM)
     try:
+        if True:
+            raise StopIteration
         dates = (
             supabase.table("market_flow_trend").select("trade_date").eq("market", "ALL")
             .order("trade_date", desc=True).limit(2).execute().data
@@ -6781,6 +6812,8 @@ def build_flow_brief():
             for i, (code, rr) in enumerate(top.iterrows(), start=1):
                 nm = rr.get("종목명") if isinstance(rr.get("종목명"), str) else _safe_ticker_name(code)
                 lines.append(f"{i} {nm} {_fmt_eok(float(rr[col]) / 1e8, signed=False)}")
+    except StopIteration:
+        pass
     except Exception as e:
         print(f"[brief:flow] 사모 TOP5 실패: {e}")
     try:  # 🌏 아시아 마감 한 줄 (일본·중국·홍콩)
@@ -6849,9 +6882,12 @@ def build_theme_brief(top_n: int = 5, title: str = "🔥 오늘의 테마 이슈
     themes = fetch_naver_theme_list(limit=40)
     now = now_kst()
     scored = []
+    naver_order = True  # 🦀 2026-11-07 JM: 우리 시장분석(네이버 테마 순위) TOP 5 그대로 — 돈 점수로 다시 줄 세우지 않음
     for t in themes:
         if THEME_SKIP_NAMES.search(t["theme_name"]):
             continue
+        if naver_order and len(scored) >= top_n:
+            break
         try:
             stocks, _ = fetch_naver_theme_detail(t["theme_no"], limit=30)
         except Exception:
@@ -6862,16 +6898,17 @@ def build_theme_brief(top_n: int = 5, title: str = "🔥 오늘의 테마 이슈
         if not risers:
             continue
         leader = max(risers, key=lambda x: (x["eok"] >= 100, x["change_pct"] * min(x["eok"], 3000) ** 0.5))
-        if leader["eok"] < 100 or leader["change_pct"] < 3:
+        if not naver_order and (leader["eok"] < 100 or leader["change_pct"] < 3):
             continue
         money = sum(x["eok"] for x in risers)
         scored.append({"theme": t, "leader": leader, "stocks": sorted(risers, key=lambda x: -x["eok"])[:4],
                        "score": money ** 0.5 * (1 + leader["change_pct"] / 10), "money": money})
         time.sleep(0.05)
-    scored.sort(key=lambda x: -x["score"])
+    if not naver_order:
+        scored.sort(key=lambda x: -x["score"])
     picked, used = [], set()
     for sc in scored:
-        if sc["leader"]["stock_code"] in used:
+        if sc["leader"]["stock_code"] in used and not naver_order:
             continue
         used.add(sc["leader"]["stock_code"])
         picked.append(sc)
@@ -6882,9 +6919,12 @@ def build_theme_brief(top_n: int = 5, title: str = "🔥 오늘의 테마 이슈
         parts.append("오늘은 돈이 크게 몰린 테마가 없어요 (주도주 거래대금 100억·+3% 이상 기준).")
     for sc in picked:
         t, lead = sc["theme"], sc["leader"]
-        lines = [f"📌 {t['theme_name']} · 오른 종목 거래대금 {_fmt_eok(sc['money'], signed=False)}"]
+        rank = picked.index(sc) + 1
+        tp = t.get("change_pct")
+        lines = [f"📌 {rank}. {t['theme_name']}" + (f" {tp:+.2f}%" if isinstance(tp, (int, float)) else "")
+                 + f" · 오른 종목 거래대금 {_fmt_eok(sc['money'], signed=False)}"]
         for x in sc["stocks"]:
-            tags = (" 👑" if x is lead else "") + (" 🔥" if x["change_pct"] >= 29 else "")
+            tags = (" 🦀" if x is lead else "") + (" 🔥" if x["change_pct"] >= 29 else "")
             lines.append(f" {x['stock_name']} {x['change_pct']:+.2f}% · {_fmt_eok(x['eok'], signed=False)}{tags}")
         news = _theme_news([x["stock_name"] for x in sc["stocks"]], limit=2)
         if news:
@@ -6893,7 +6933,7 @@ def build_theme_brief(top_n: int = 5, title: str = "🔥 오늘의 테마 이슈
         else:
             lines.append("   ↳ 관련 뉴스 없음 — 수급·테마 순환 가능성")
         parts.append("\n".join(lines))
-    parts.append("※ 오른 종목 거래대금 기준 · 거래대금 10억 미만 종목 제외 · ↳는 관련 뉴스(원인이 아닐 수도)")
+    parts.append("※ 우리 시장분석(네이버 테마 순위) TOP 5 · 🦀 = 테마 1등 · 거래대금 10억 미만 종목 제외 · ↳는 관련 뉴스(원인이 아닐 수도)")
     return "\n\n".join(parts), now.strftime("%Y-%m-%d")
 
 
@@ -7049,9 +7089,10 @@ def _build_watch_candidates() -> str:
       ④ 전일 외국인 순매수 TOP5
     """
     lines = []
-    # 📰 오늘 볼 만한 기사 2~3개 (밤사이~아침 뉴스에서 골라 헤드라인 + 원문 + 테마 + 관련주)
+    # 📰 오늘 국내 볼 만한 기사 · 📊 최근 실적 공시 · 🌏 전일 외국인 순매수 TOP5 는 뺌 (2026-11-07 JM)
+    SKIP = True
     try:
-        arts = _morning_news_picks()
+        arts = [] if SKIP else _morning_news_picks()
         if arts:
             lines.append("📰 오늘 국내 볼 만한 기사 (밤사이~아침 · 추천 아님)\n" + "\n\n".join(arts))
     except Exception as e:
@@ -7083,8 +7124,8 @@ def _build_watch_candidates() -> str:
             lines.append("🔥 전일 강세 테마" + (f" ({snap.get('date')} 마감)" if snap else "") + "\n" + "\n".join(tl))
     except Exception as e:
         print(f"[brief:candidates] 테마 실패: {e}")
-    # ③ 전일 장 마감 후 ~ 오늘 아침 실적 공시
-    if DART_API_KEY:
+    # ③ 전일 장 마감 후 ~ 오늘 아침 실적 공시 — 뺌 (11:00 공시 총정리에서)
+    if DART_API_KEY and not SKIP:
         try:
             ltd = _latest_trading_day()
             rows = _dart_list(ltd, now_kst().strftime("%Y%m%d"), max_pages=3)
@@ -7100,8 +7141,10 @@ def _build_watch_candidates() -> str:
                     lines.append("📊 최근 실적 공시\n" + "\n".join(el))
         except Exception as e:
             print(f"[brief:candidates] 실적 공시 실패: {e}")
-    # ④ 전일 외국인 순매수 TOP5
+    # ④ 전일 외국인 순매수 TOP5 — 뺌
     try:
+        if SKIP:
+            raise StopIteration
         ltd = _latest_trading_day()
         df = _krx_df(stock.get_market_net_purchases_of_equities, ltd, ltd, "ALL", "외국인")
         if df is not None and not df.empty:
@@ -7112,6 +7155,8 @@ def _build_watch_candidates() -> str:
                 nm = rr.get("종목명") if isinstance(rr.get("종목명"), str) else _safe_ticker_name(code)
                 fl.append(f"· {nm} {_fmt_eok(float(rr[col]) / 1e8)} 🔗 {_stock_link(code)}")
             lines.append("🌏 전일 외국인 순매수 TOP5\n" + "\n".join(fl))
+    except StopIteration:
+        pass
     except Exception as e:
         print(f"[brief:candidates] 외국인 순매수 실패: {e}")
     return "\n\n".join(lines)
@@ -7121,8 +7166,9 @@ def build_premarket_brief():
     """📋 장전 리포트 = 어제 수급 한 줄 + 오늘 주요 일정 + 증권가 목표가"""
     now = now_kst()
     parts = [f"📋 장전 리포트 ({_kr_date(now.strftime('%Y-%m-%d'))})\n━━━━━━━━━━━━"]
-    # 💰 어제 수급 한 줄
+    # 💰 어제 수급 한 줄 — 뺌 (2026-11-07 JM: 전일 외국인 순매수 제외)
     try:
+        raise StopIteration
         rows = (
             supabase.table("market_flow_trend").select("*").eq("market", "KOSPI")
             .order("trade_date", desc=True).limit(1).execute().data
@@ -7136,6 +7182,8 @@ def build_premarket_brief():
                 f"외국인 {_fmt_eok(f)}" + (f" ⟨{st}거래일 연속 순{'매수' if f > 0 else '매도'}⟩" if st >= 2 else "")
                 + f" · 기관 {_fmt_eok(float(r.get('institution') or 0))} · 개인 {_fmt_eok(float(r.get('individual') or 0))}"
             )
+    except StopIteration:
+        pass
     except Exception as e:
         print(f"[brief:premarket] 수급 실패: {e}")
     # 🗓 오늘 일정
@@ -7165,11 +7213,8 @@ def build_premarket_brief():
         parts.append(_build_watch_candidates())
     except Exception as e:
         print(f"[brief:premarket] 후보 실패: {e}")
-    # 🎯 증권가 목표가
-    text, ref = build_targets_brief()
-    if text:
-        parts.append(text)
-    return "\n\n".join(parts), ref
+    # 🎯 증권가 목표가 — 뺌 (2026-11-07 JM)
+    return "\n\n".join(parts), now.strftime("%Y-%m-%d")
 
 
 # ── 🚀 아침 상승 랭킹 (09:00~10:00) ──
@@ -7308,12 +7353,36 @@ def build_rally_brief(top_n: int = 20, min_value_eok: float = 50):
             continue
         q.update({"code": code, "name": name, "from_open": (q["price"] / q["open"] - 1) * 100})
         rows.append(q)
-    rows = sorted([r for r in rows if r["from_open"] > 0], key=lambda r: -r["from_open"])[:top_n]
+    # 🏆 2026-11-07 JM: 등락률 TOP 12 + 거래대금 TOP 12 → 두 순위를 더해서 종합 순위 (한쪽에만 있으면 다른 쪽은 13위로)
+    rows = [r for r in rows if r["pct"] > 0]
+    N = 12
+    rp = {r["code"]: i for i, r in enumerate(sorted(rows, key=lambda r: -r["pct"])[:N], 1)}
+    rv = {r["code"]: i for i, r in enumerate(sorted(rows, key=lambda r: -r["value_eok"])[:N], 1)}
+    for r in rows:
+        r["rank_pct"], r["rank_val"] = rp.get(r["code"]), rv.get(r["code"])
+        r["score"] = (r["rank_pct"] or N + 1) + (r["rank_val"] or N + 1)
+    rows = sorted([r for r in rows if r["code"] in rp or r["code"] in rv], key=lambda r: (r["score"], -r["value_eok"]))[:N]
     if not rows:
         return None, None
+    # 🐻 곰발 겹침 표시: ● 곰발 · ○ 곰발 통합 · 🎯 둘 다 (PC 곰발 목록 + 서버 일봉 신호)
+    _pcd = _crab_pc.get("data") or {}
+    pc_gom = {x["code"] for x in (_pcd.get("big") or [])}
+    pc_gomt = {x["code"] for x in (_pcd.get("gomt") or [])}  # HTS 곰발 통합 (PC)
+
+    def gom_mark(code):
+        g = code in pc_gom
+        gi = code in pc_gomt
+        try:
+            t = _jm_signal_series(code).get("today") or {}
+            g = g or bool(t.get("g"))
+            gi = gi or bool(t.get("gi"))
+        except Exception:
+            pass
+        return " 🎯" if (g and gi) else " ●곰발" if g else " ○통합" if gi else ""
 
     lines = [f"🚀 아침 상승 랭킹 ({now.month}/{now.day} 09:00~{now.strftime('%H:%M')} 기준)\n━━━━━━━━━━━━",
-             "시가 대비 상승률 순 · 거래대금 50억 이상 · ETF·스팩·우선주 제외"]
+             "등락률 TOP 12 + 거래대금 TOP 12 종합 순위 (두 순위 합) · 거래대금 50억 이상 · ETF·스팩·우선주 제외",
+             "● 곰발 · ○ 곰발 통합 · 🎯 둘 다"]
     try:
         reasons = _rally_reasons(rows)
     except Exception as e:
@@ -7342,9 +7411,11 @@ def build_rally_brief(top_n: int = 20, min_value_eok: float = 50):
                 extra += f"\n   🆕 상장 첫날 · 공모가 {ipo['offer']:,.0f}원 대비 {(r['price'] / ipo['offer'] - 1) * 100:+.0f}%"
         except Exception:
             pass
+        rk = f"등락 {r['rank_pct']}위" if r["rank_pct"] else "등락 -"
+        rk += f" · 대금 {r['rank_val']}위" if r["rank_val"] else " · 대금 -"
         lines.append(
-            f"\n{i}. {r['name']} 시가대비 {r['from_open']:+.1f}% (전일비 {r['pct']:+.1f}%) · {_fmt_eok(r['value_eok'], signed=False)}"
-            f"{extra}"
+            f"\n{i}. {r['name']}{gom_mark(r['code'])} {r['pct']:+.1f}% · {_fmt_eok(r['value_eok'], signed=False)} ({rk})"
+            f"\n   시가대비 {r['from_open']:+.1f}%{extra}"
             + "".join(f"\n   {x}" for x in reasons.get(r["code"], []))
             + f"\n   🔗 {FRONTEND_URL}/stock-analysis?code={r['code']}"
         )
@@ -7601,7 +7672,29 @@ def build_closing_report():
     return "\n\n".join(P), day
 
 
+def _build_disclosure_batch(label: str):
+    """📢 JM 공시 총정리 (2026-11-07) — 실적 발표·예고·IR을 한 번에 모아서 (예전 10분마다 실시간 → 11:00·17:00 두 번)"""
+    if not DART_API_KEY:
+        return None, None
+    text, rows = build_earnings_digest(days=1, only_new=True, types=("result", "plan"), sent_kind="dart_earn")
+    if not text:
+        return None, None
+    for r in rows:
+        _mark_brief_sent("dart_earn", r["rcept_no"])
+    return text.replace("📊 실적 공시 알림", f"📢 {label} 공시 총정리"), now_kst().strftime("%Y-%m-%d")
+
+
+def _build_jm_news():
+    text, _ = build_world_news_digest()
+    return text, now_kst().strftime("%Y-%m-%d")
+
+
 BRIEF_BUILDERS = {
+    "jmnews_07": _build_jm_news,
+    "jmnews_12": _build_jm_news,
+    "jmnews_18": _build_jm_news,
+    "disc_am": lambda: _build_disclosure_batch("오전"),
+    "disc_pm": lambda: _build_disclosure_batch("오후"),
     "worldnews": lambda: build_world_news_digest(),
     "us_pre": lambda: build_us_pre_brief(),
     "us_open30": lambda: build_us_open30_brief(),
@@ -7656,9 +7749,35 @@ def _run_telegram_briefs():
         return
     now = now_kst()
     wd = now.weekday()  # 0=월 ... 6=일
+    today0 = now.strftime("%Y-%m-%d")
+    # 🔨 미리 만들기: 정각 몇 분 전에 뒤에서 만들어 둠 (정각엔 보내기만)
+    for kind, (h, m) in BRIEF_SCHEDULE.items():
+        lead = BRIEF_LEAD.get(kind, 0)
+        start_at = now.replace(hour=h, minute=m, second=0, microsecond=0) - timedelta(minutes=lead)
+        if not lead or now < start_at or (now.hour, now.minute) >= (h, m) or (kind, today0) in _prebuilt:
+            continue
+        if (kind != "morning" and wd >= 5) or (kind == "morning" and wd >= 5):
+            continue
+        if kind in ("theme_am", "rally") and not _is_trading_today():
+            continue
+        if _brief_already_sent(kind, today0) or _brief_already_sent(f"done:{kind}", today0):
+            continue
+        _prebuilt[(kind, today0)] = "building"
+
+        def _pre(k=kind, d=today0):
+            try:
+                _prebuilt[(k, d)] = BRIEF_BUILDERS[k]()
+                print(f"[brief] {k} 미리 만들어 둠")
+            except Exception as e:
+                _prebuilt.pop((k, d), None)
+                print(f"[brief] {k} 미리 만들기 실패: {e}")
+
+        threading.Thread(target=_pre, daemon=True).start()
     for kind, (h, m) in BRIEF_SCHEDULE.items():
         if (now.hour, now.minute) < (h, m) or now.hour >= 23:
             continue
+        if _prebuilt.get((kind, today0)) == "building" and (now.hour * 60 + now.minute) - (h * 60 + m) < 10:
+            continue  # 아직 만드는 중 — 15초 뒤 다시 (10분 넘게 안 끝나면 그냥 직접 만들기)
         if kind == "morning" and wd not in (0, 1, 2, 3, 4):  # 월~금 아침만 (주말 알림 없음 — 월요일 아침에 금요일 미국·유럽 마감을 받음, 2026-10-26)
             continue
         if kind == "morning" and (now.hour, now.minute) >= (9, 0):
@@ -7677,13 +7796,14 @@ def _run_telegram_briefs():
                 continue
         try:
             # 기준 날짜를 먼저 정해서 이미 보냈는지 확인 (모닝·목표가는 내용 날짜, 나머지는 오늘)
-            if kind in ("flow", "theme", "schedule", "theme_am", "rally", "news_11", "news_15", "news_2020", "ir_16", "ir_2010", "closing") and _brief_already_sent(kind, now.strftime("%Y-%m-%d")):
+            if kind != "morning" and _brief_already_sent(kind, now.strftime("%Y-%m-%d")):
                 continue
             today = now.strftime("%Y-%m-%d")
             if not _brief_claim(kind, today):
                 continue  # 다른 쪽에서 지금 만들고 있거나 이미 보냄
             try:
-                text, ref = BRIEF_BUILDERS[kind]()
+                pre = _prebuilt.pop((kind, today), None)
+                text, ref = pre if isinstance(pre, tuple) else BRIEF_BUILDERS[kind]()
             except Exception:
                 _brief_unclaim(kind, today)
                 raise
@@ -9743,15 +9863,14 @@ def _us_close_extras() -> str:
             r = by.get(sym)
             if r and abs(r["pct"]) >= 2:
                 links.append(f"· {r['name']} {r['pct']:+.1f}% → {kr}")
-        if links:
-            parts.append("🇰🇷 한국 관련주 체크\n" + "\n".join(links))
+        # 🇰🇷 한국 관련주 체크는 뺌 (2026-11-07 JM)
     try:
         fl = us_sector_flow_endpoint().get("rows") or []
         if fl:
             parts.append("💵 섹터: 강세 " + ", ".join(f"{f['name']} {f['pct']:+.1f}%" for f in fl[:3]) + " / 약세 " + ", ".join(f"{f['name']} {f['pct']:+.1f}%" for f in fl[-3:]))
     except Exception:
         pass
-    wl = _global_watch_rows()
+    wl = []  # ⭐ 해외 관심종목은 뺌 — 새로 만들 예정 (2026-11-07 JM)
     hits = []
     for w in wl[:20]:
         q = _yahoo_quote(w["symbol"])
@@ -9783,7 +9902,7 @@ def _run_us_briefs():
     nowl = now.replace(tzinfo=None)
     today = sess
     for kind, at, builder in (
-        ("us_pre", open_kst - timedelta(minutes=60), build_us_pre_brief),
+        ("us_pre", open_kst - timedelta(minutes=65), build_us_pre_brief),  # 🇺🇸 22:25 (겨울) — 2026-11-07
         ("us_open30", open_kst + timedelta(minutes=30), build_us_open30_brief),
     ):
         if not (at <= nowl <= at + timedelta(minutes=40)) or _brief_already_sent(kind, today):
@@ -11900,18 +12019,106 @@ def _crab_big_alert(payload: dict):
                 break
 
 
+# ⚡ 단타 검색기 5종 키 (2026-11-07) — crab 큰형님 자전거 · small 완빨 · bong3 봉삼이 · gomt 곰발 통합 · big 곰발
+CRAB_KEYS = ("crab", "small", "bong3", "gomt", "big")
+
+
+# 🐻 오늘 곰발에 한 번이라도 잡힌 종목 (편입 + 이탈) — 다음 날 08:40 NXT 프리마켓에 씀 (2026-11-07)
+_gom_day = {"day": "", "items": {}, "saved": 0}
+
+
+def _gom_day_save(payload: dict):
+    now = now_kst()
+    if now.weekday() >= 5:
+        return
+    day = now.strftime("%Y-%m-%d")
+    if _gom_day["day"] != day:
+        _gom_day.update({"day": day, "items": {}, "saved": 0})
+        try:  # 서버 재시작 대비 — 오늘 저장분 이어받기
+            r = supabase.table("brief_cache").select("data").eq("key", f"gom_day:{day}").limit(1).execute().data
+            if r:
+                _gom_day["items"] = dict(r[0]["data"].get("items") or {})
+        except Exception:
+            pass
+    n0 = len(_gom_day["items"])
+    for k in ("big", "big_removed"):
+        for x in payload.get(k, []) or []:
+            if x.get("code"):
+                _gom_day["items"].setdefault(x["code"], x.get("name") or x["code"])
+    if len(_gom_day["items"]) != n0 or time.time() - _gom_day["saved"] > 600:
+        _gom_day["saved"] = time.time()
+        supabase.table("brief_cache").upsert({"key": f"gom_day:{day}", "data": {"day": day, "items": _gom_day["items"]},
+                                              "updated_at": now.isoformat()}).execute()
+
+
+def _gom_prev_day_items() -> tuple:
+    """오늘 이전 가장 최근 거래일의 곰발 포착 종목 → (날짜, {code: name})"""
+    today = now_kst().strftime("%Y-%m-%d")
+    try:
+        rows = supabase.table("brief_cache").select("key,data").like("key", "gom_day:%").order("key", desc=True).limit(5).execute().data or []
+    except Exception:
+        return "", {}
+    for r in rows:
+        d = r["key"].split(":", 1)[1]
+        if d < today and (r["data"] or {}).get("items"):
+            return d, dict(r["data"]["items"])
+    return "", {}
+
+
+_nxt_gom_info: dict = {"day": "", "rows": {}}
+
+
+def _nxt_gom_prefetch():
+    """08:20쯤 — 어제 곰발 종목의 외국인 순매수(전일) · 흑자/적자를 미리 받아 둠 (08:40 정각에 바로 보내려고)"""
+    day = now_kst().strftime("%Y-%m-%d")
+    _, items = _gom_prev_day_items()
+    out = {}
+    end = now_kst().strftime("%Y-%m-%d")
+    start = (now_kst() - timedelta(days=12)).strftime("%Y-%m-%d")
+    for code in list(items)[:40]:
+        info = {}
+        try:  # 어제 통합(KRX+NXT) 일봉 — 종가 · 등락률 · 거래대금 · 거래량 (NXT 프리마켓과 관계없음)
+            cs = [c for c in _kis_daily_candles(code, start, end, "UN") if c["date"] < end]
+            if len(cs) >= 2:
+                y, p0 = cs[-1], cs[-2]
+                info.update({"price": y["close"], "pct": (y["close"] / p0["close"] - 1) * 100 if p0["close"] else 0,
+                             "amount": (y.get("amount") or y["close"] * y["volume"]), "volume": y["volume"], "date": y["date"]})
+        except Exception:
+            pass
+        try:
+            inv = _investor_daily(code)
+            if inv:
+                info["foreign"] = inv["foreign"]
+        except Exception:
+            pass
+        try:
+            q = fetch_dart_quarterly(code)
+            info["status"] = q.get("latest_status") or ""
+            qs = q.get("quarters") or []
+            if qs and qs[-1].get("op") is not None:
+                info["op"] = qs[-1]["op"]
+        except Exception:
+            pass
+        out[code] = info
+        time.sleep(0.1)
+    _nxt_gom_info.update({"day": day, "rows": out})
+
+
 @app.post("/api/crab-pc")
 def crab_pc_post(payload: dict):
+    # 🐻 곰발 편입 · TOP 5 알림은 끔 (2026-11-07 JM — 09:30 상승 랭킹에 곰발 표시로 대신)
     try:
-        _crab_big_alert(payload)
+        _gom_day_save(payload)
     except Exception as e:
-        print(f"[crab] 큰 꽃게 알림 실패: {e}")
+        print(f"[gom_day] 저장 실패: {e}")
     _crab_pc.update({"data": payload, "at": time.time()})
     _crab_pc_view["at"] = 0  # 다음 조회 때 새로 시세 붙이기
-    try:
-        supabase.table("brief_cache").upsert({"key": "crab_pc", "data": payload, "updated_at": now_kst().isoformat()}).execute()
-    except Exception:
-        pass
+    if time.time() - _crab_pc.get("db_at", 0) > 30:  # ⚡ PC가 3초마다 보내니까 DB 저장은 30초에 한 번만 (2026-11-07)
+        _crab_pc["db_at"] = time.time()
+        try:
+            supabase.table("brief_cache").upsert({"key": "crab_pc", "data": payload, "updated_at": now_kst().isoformat()}).execute()
+        except Exception:
+            pass
     return {"ok": True}
 
 
@@ -12400,13 +12607,20 @@ def crab_pc_get():
                 "error": "오늘 PC 결과가 아직 없어요 — 새 crab_pc.py로 세력트래커를 다시 켜주세요"}
     alive = time.time() - at < 150
     v = _crab_pc_view
+    if d.get("quotes_from_pc"):
+        return _crab_pc_fast(d, alive)
     if v["data"] and time.time() - v["at"] < 30:
         out = dict(v["data"])
         out["alive"] = alive
         return out
     import concurrent.futures as cf
-    KEYS = ("crab", "small", "big")  # 꽃게 · 작은 꽃게 · 큰 꽃게 (2026-10-30)
+    KEYS = CRAB_KEYS
     codes = {x["code"] for k in KEYS for kk in (k, f"{k}_removed") for x in d.get(kk, [])}
+    # 🎯 겹침 (2026-11-07): 종목마다 지금 어느 검색기에 같이 떠 있나
+    member = {}
+    for k in KEYS:
+        for x in d.get(k, []) or []:
+            member.setdefault(x["code"], set()).add(k)
 
     def q(code):
         try:
@@ -12415,7 +12629,7 @@ def crab_pc_get():
             return code, {}
 
     with cf.ThreadPoolExecutor(max_workers=4) as ex:
-        quotes = dict(ex.map(q, list(codes)[:120]))
+        quotes = dict(ex.map(q, list(codes)[:180]))
     # 🐻▲ 오늘 신호: 장중엔 10분, 장 마감 후엔 하루 보관 — 없거나 오래된 건 뒤에서 계산
     ttl = 600 if 9 <= now_kst().hour < 16 else 6 * 3600
     stale = [c for c in codes if not _sig_cache.get(c) or time.time() - _sig_cache[c][0] > ttl]
@@ -12437,7 +12651,11 @@ def crab_pc_get():
             out.append({"code": x["code"], "name": x.get("name") or x["code"], "price": qq.get("price") or 0,
                         "pct": round(qq.get("pct") or 0, 2), "value_eok": round(qq.get("value_eok") or 0, 1), "volume": int(qq.get("volume") or 0),
                         "position": "—", "since": x.get("since"), "out": x.get("out") if gone else None,
-                        "gone": gone, "sig": (_sig_cache.get(x["code"]) or (0, None))[1]})
+                        "gone": gone, "sig": (_sig_cache.get(x["code"]) or (0, None))[1],
+                        "in": sorted(member.get(x["code"], set())),
+                        # 🎯 곰발+곰발 통합 · 🐻3 곰발+봉삼이 · ⬆ 완빨이 큰형님 자전거로 승격
+                        "combo": [t for t, ks in (("🎯", {"big", "gomt"}), ("🐻3", {"big", "bong3"}), ("⬆", {"small", "crab"}))
+                                  if ks <= member.get(x["code"], set())]})
         return sorted(out, key=lambda r: -r["value_eok"])
 
     out = {"ok": True, "source": "pc", "at": str(d.get("at", ""))[11:16], "alive": alive, "names": d.get("names") or {},
@@ -12446,6 +12664,54 @@ def crab_pc_get():
         out[k] = rows(d.get(k, []))
         out[f"{k}_removed"] = rows(d.get(f"{k}_removed", []), True)
     v.update({"at": time.time(), "data": out})
+    return out
+
+
+_crab_fill_px: dict = {}   # 체결이 아직 없어서 PC 시세가 비어 있는 종목만 한투로 한 번 채움 (code → (시각, quote))
+
+
+def _crab_pc_fast(d: dict, alive: bool) -> dict:
+    """⚡ 2026-11-07 JM: 사부님 화면처럼 빠르게 — PC(키움 실시간) 시세를 그대로 씀.
+    종목명 · 현재가 · 등락률 · 거래대금만 (흑자/적자·일봉 신호 계산 등 무거운 건 뺌)"""
+    member = {}
+    for k in CRAB_KEYS:
+        for x in d.get(k, []) or []:
+            member.setdefault(x["code"], set()).add(k)
+    need = [x["code"] for k in CRAB_KEYS for kk in (k, f"{k}_removed") for x in d.get(kk, []) or []
+            if not x.get("pct") and not x.get("value_eok") and time.time() - _crab_fill_px.get(x["code"], (0, None))[0] > 300]
+
+    def fill(codes):
+        for c in codes:
+            try:
+                _crab_fill_px[c] = (time.time(), _kis_quote(c))
+            except Exception:
+                _crab_fill_px[c] = (time.time(), {})
+            time.sleep(0.07)
+
+    if need:
+        for c in need[:30]:
+            _crab_fill_px.setdefault(c, (time.time(), {}))  # 표시 먼저 (같은 걸 계속 맡기지 않게)
+        threading.Thread(target=fill, args=(list(dict.fromkeys(need))[:30],), daemon=True).start()
+
+    def rows(lst, gone=False):
+        out = []
+        for x in lst or []:
+            px = x
+            if not x.get("pct") and not x.get("value_eok"):
+                px = {**x, **{k2: v2 for k2, v2 in (_crab_fill_px.get(x["code"], (0, {}))[1] or {}).items() if k2 in ("price", "pct", "value_eok", "volume")}}
+            m = member.get(x["code"], set())
+            out.append({"code": x["code"], "name": x.get("name") or x["code"], "price": px.get("price") or 0,
+                        "pct": round(px.get("pct") or 0, 2), "value_eok": round(px.get("value_eok") or 0, 1),
+                        "volume": int(px.get("volume") or 0), "since": x.get("since"), "out": x.get("out") if gone else None,
+                        "gone": gone, "in": sorted(m),
+                        "combo": [t for t, ks in (("🎯", {"big", "gomt"}), ("🐻3", {"big", "bong3"}), ("⬆", {"small", "crab"})) if ks <= m]})
+        return sorted(out, key=lambda r: -r["value_eok"])
+
+    out = {"ok": True, "source": "pc", "fast": True, "at": str(d.get("at", ""))[11:19], "alive": alive, "names": d.get("names") or {},
+           "note": "🖥 HTS 조건검색 + 키움 실시간 시세 그대로"}
+    for k in CRAB_KEYS:
+        out[k] = rows(d.get(k, []))
+        out[f"{k}_removed"] = rows(d.get(f"{k}_removed", []), True)
     return out
 
 
@@ -12940,7 +13206,7 @@ def _force_avg_line(code: str, mode: str, start: str = None, end: str = None):
 
 def _daytrade_touch_check():
     now = now_kst()
-    if now.weekday() >= 5 or not ((9, 6) <= (now.hour, now.minute) <= (15, 20)):
+    if now.weekday() >= 5 or not ((9, 6) <= (now.hour, now.minute) <= (10, 30)):  # ⏰ 10:30까지만 (2026-11-07 JM)
         return
     try:
         # 🎯 터치 알림은 '당일 눌림'(3분봉 기존 방식)만 — 당일 JM은 알림 없이 화면에서만 (2026-11-01 JM)
@@ -13444,7 +13710,7 @@ def _nxt_candidates() -> list:
     except Exception:
         pass
     d = _crab_pc.get("data") or {}
-    for k in ("crab", "small", "big"):
+    for k in CRAB_KEYS:
         codes += [x["code"] for x in d.get(k, []) or []]
     try:
         r = supabase.table("brief_cache").select("data").eq("key", "new_highs").limit(1).execute().data
@@ -13466,6 +13732,9 @@ def _run_nxt_premarket():
         return
     hm = (now.hour, now.minute)
     day = now.strftime("%Y-%m-%d")
+    if (8, 15) <= hm < (8, 40) and not _brief_already_sent("job_nxt_gom_pre", day):
+        _mark_brief_sent("job_nxt_gom_pre", day)
+        threading.Thread(target=_nxt_gom_prefetch, daemon=True).start()
     if (8, 5) <= hm < (8, 45) and time.time() - _bpc["alive_at"] < 20:
         slot = "a" if hm < (8, 25) else "b"
         if not _brief_already_sent(f"job_nxt_{slot}", day):
@@ -13510,6 +13779,29 @@ def _run_nxt_premarket():
             lines.append("▼ 약한 종목")
             lines += [f"· {x.get('name') or x['code']} {x['pct']:+.2f}%" for x in weak]
         lines.append("※ 대형주 30 + 관심종목·검색기·52주 신고가 후보 (NXT 프리마켓은 거래가 적어 방향 참고용 — 매매는 KRX 정규장)")
+        # 🐻 어제 곰발 포착 종목 (2026-11-07 JM) — NXT와 관계없이 어제 통합 종가 기준 · 거래대금 순
+        gday, gitems = _gom_prev_day_items()
+        info = _nxt_gom_info["rows"] if _nxt_gom_info.get("day") == day else {}
+        if gitems:
+            lines.append(f"\n🐾 어제({gday[5:].replace('-', '/')}) 곰발 포착 {len(gitems)}종목 (어제 통합 종가 · 거래대금 순)")
+            ordered = sorted(gitems, key=lambda c: -(info.get(c, {}).get("amount") or 0))
+            for i, c in enumerate(ordered, 1):
+                nm = gitems[c]
+                inf = info.get(c, {})
+                fr = inf.get("foreign")
+                ftxt = (f"외국인 🔴매수 {fr:+,.0f}억" if fr > 0 else f"외국인 🔵매도 {fr:,.0f}억" if fr < 0 else "외국인 ⚪0") if fr is not None else "외국인 -"
+                st = inf.get("status") or ""
+                op = inf.get("op")
+                ptxt = ("🟠적자" if ("적자" in st and "흑자전환" not in st) or (not st and op is not None and op < 0)
+                        else "🟢흑자" if st or (op is not None and op >= 0) else "실적 -")
+                if "전환" in st:
+                    ptxt += f"({st})"
+                if inf.get("price"):
+                    lines.append(f"{i}. {nm} {inf['price']:,.0f}원 ({inf['pct']:+.2f}%) · {inf['amount'] / 1e8:,.0f}억 · {inf['volume']:,.0f}주"
+                                 f"\n   {ftxt} · {ptxt}\n   🔗 {link(c)}")
+                else:
+                    lines.append(f"{i}. {nm} · {ftxt} · {ptxt}\n   🔗 {link(c)}")
+            lines.append("※ 가격·등락률 = 어제 통합(KRX+NXT) 종가 · 외국인 = 전일 KRX 순매수 · 흑자/적자 = 최근 분기 영업이익")
         if send_telegram("\n".join(lines)):
             _mark_brief_sent("nxt_premarket", day)
 
