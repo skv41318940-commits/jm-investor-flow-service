@@ -12051,6 +12051,20 @@ def _gom_day_save(payload: dict):
                                               "updated_at": now.isoformat()}).execute()
 
 
+@app.get("/api/gom-day")
+def gom_day_status():
+    """🐾 곰발 포착 저장 상태 확인 — 오늘 몇 종목 저장됐나 · 내일 08:40에 쓸 '어제' 목록"""
+    today = now_kst().strftime("%Y-%m-%d")
+    try:
+        rows = supabase.table("brief_cache").select("key,data,updated_at").like("key", "gom_day:%").order("key", desc=True).limit(5).execute().data or []
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    d, items = _gom_prev_day_items()
+    return {"ok": True, "today": today, "today_saved": len(_gom_day["items"]) if _gom_day["day"] == today else 0,
+            "prev_day": d, "prev_items": items,
+            "saved_days": [{"day": r["key"].split(":", 1)[1], "count": len((r["data"] or {}).get("items") or {}), "updated_at": r.get("updated_at")} for r in rows]}
+
+
 def _gom_prev_day_items() -> tuple:
     """오늘 이전 가장 최근 거래일의 곰발 포착 종목 → (날짜, {code: name})"""
     today = now_kst().strftime("%Y-%m-%d")
@@ -13802,6 +13816,8 @@ def _run_nxt_premarket():
                 else:
                     lines.append(f"{i}. {nm} · {ftxt} · {ptxt}\n   🔗 {link(c)}")
             lines.append("※ 가격·등락률 = 어제 통합(KRX+NXT) 종가 · 외국인 = 전일 KRX 순매수 · 흑자/적자 = 최근 분기 영업이익")
+        else:
+            lines.append("\n🐾 어제 곰발 포착 기록이 없어요 — 세력트래커가 어제 장중에 곰발 목록을 못 올렸거나, 저장을 시작한 첫날이에요")
         if send_telegram("\n".join(lines)):
             _mark_brief_sent("nxt_premarket", day)
 
