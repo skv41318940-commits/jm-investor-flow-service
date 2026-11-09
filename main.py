@@ -13792,16 +13792,16 @@ def _run_nxt_premarket():
                     _bpc["tasks"].append({"kind": "nxt", "codes": _nxt_candidates()})
                 print("[nxt] 최근 결과가 없어서 다시 조회 맡김")
                 return
+            _alert_clock_state["nxt_status"] = f"{now_kst().strftime('%H:%M')} PC NXT 결과 기다리는 중"
             if hm >= (8, 55):
                 # 끝까지 못 받았으면 조용히 넘어가지 말고 한 번 알려줌
                 _mark_brief_sent("nxt_premarket", day)
                 send_telegram("🌅 NXT 프리마켓 — 오늘은 PC(세력트래커)에서 NXT 시세를 못 받았어요 (중간에 꺼졌거나 오류). 세력트래커 상태만 확인해 주세요.")
             return
         rows = [x for x in r.get("rows", []) if x.get("price") and x.get("pct") is not None and x.get("volume")]
-        if not rows:
+        if not rows:  # 🔧 2026-11-09: 예전엔 여기서 조용히 끝났음 → 이젠 안내 + 🐾 어제 곰발은 그대로 보냄
             print("[nxt] 시세가 비어 있음 — 키움이 _NX 시세를 안 주는 듯")
-            _mark_brief_sent("nxt_premarket", day)
-            return
+            _alert_clock_state["nxt_status"] = f"{now_kst().strftime('%H:%M')} NXT 시세 비어 있음 (PC 결과 {len(r.get('rows', []))}행)"
         big = [x for x in rows if x["code"] in NXT_BIG_CAPS]
         mood = ""
         if big:
@@ -13812,13 +13812,15 @@ def _run_nxt_premarket():
         up = sorted(rows, key=lambda x: -x["pct"])[:8]
         dn = sorted(rows, key=lambda x: x["pct"])[:3]
         link = lambda c: f"https://jm-tracker.vercel.app/stock-analysis?code={c}"
-        lines = [f"🌅 NXT 프리마켓 ({r.get('at', '')[:5]} 기준 · {len(rows)}종목)"] + ([f"📊 {mood}"] if mood else []) + ["▲ 강한 종목"]
+        lines = ([f"🌅 NXT 프리마켓 ({r.get('at', '')[:5]} 기준 · {len(rows)}종목)"] + ([f"📊 {mood}"] if mood else []) + ["▲ 강한 종목"]) if rows else \
+                ["🌅 NXT 프리마켓 — 오늘은 NXT 시세가 비어서 왔어요 (키움이 프리마켓 시세를 0으로 줌). 🐾 어제 곰발만 보내요"]
         lines += [f"· {x.get('name') or x['code']} {x['pct']:+.2f}% · {x['price']:,}원 · {x['volume']:,}주\n  🔗 {link(x['code'])}" for x in up if x["pct"] > 0]
         weak = [x for x in dn if x["pct"] < 0]
         if weak:
             lines.append("▼ 약한 종목")
             lines += [f"· {x.get('name') or x['code']} {x['pct']:+.2f}%" for x in weak]
-        lines.append("※ 대형주 30 + 관심종목·검색기·52주 신고가 후보 (NXT 프리마켓은 거래가 적어 방향 참고용 — 매매는 KRX 정규장)")
+        if rows:
+            lines.append("※ 대형주 30 + 관심종목·검색기·52주 신고가 후보 (NXT 프리마켓은 거래가 적어 방향 참고용 — 매매는 KRX 정규장)")
         # 🐻 어제 곰발 포착 종목 (2026-11-07 JM) — NXT와 관계없이 어제 통합 종가 기준 · 거래대금 순
         gday, gitems = _gom_prev_day_items()
         info = _nxt_gom_info["rows"] if _nxt_gom_info.get("day") == day else {}
@@ -13846,6 +13848,12 @@ def _run_nxt_premarket():
             lines.append("\n🐾 어제 곰발 포착 기록이 없어요 — 세력트래커가 어제 장중에 곰발 목록을 못 올렸거나, 저장을 시작한 첫날이에요")
         if send_telegram("\n".join(lines)):
             _mark_brief_sent("nxt_premarket", day)
+            if rows:
+                _alert_clock_state["nxt_status"] = f"{now_kst().strftime('%H:%M')} 보냄 · NXT {len(rows)}종목 · 🐾 곰발 {len(gitems)}종목"
+            else:
+                _alert_clock_state["nxt_status"] += f" → 안내 + 🐾 곰발 {len(gitems)}종목 보냄"
+        else:
+            _alert_clock_state["nxt_status"] = f"{now_kst().strftime('%H:%M')} 텔레그램 전송 실패 — 다음 확인 때 다시"
 
 
 @app.get("/api/nxt-premarket")
