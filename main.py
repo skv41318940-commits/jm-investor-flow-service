@@ -6950,7 +6950,7 @@ def build_theme_brief(top_n: int = 5, title: str = "🔥 오늘의 테마 이슈
         lines = [f"📌 {rank}. {t['theme_name']}" + (f" {tp:+.2f}%" if isinstance(tp, (int, float)) else "")
                  + f" · 오른 종목 거래대금 {_fmt_eok(sc['money'], signed=False)}"]
         for x in sc["stocks"]:
-            tags = (" 🦀" if x is lead else "") + (" 🔥" if x["change_pct"] >= 29 else "")
+            tags = (" 🦀" if x is lead else "") + (" 🔥" if x["change_pct"] >= 29 else "") + _gom_mark(x["stock_code"])
             lines.append(f" {x['stock_name']} {x['change_pct']:+.2f}% · {_fmt_eok(x['eok'], signed=False)}{tags}")
         news = _theme_news([x["stock_name"] for x in sc["stocks"]], limit=2)
         if news:
@@ -6959,7 +6959,7 @@ def build_theme_brief(top_n: int = 5, title: str = "🔥 오늘의 테마 이슈
         else:
             lines.append("   ↳ 관련 뉴스 없음 — 수급·테마 순환 가능성")
         parts.append("\n".join(lines))
-    parts.append("※ 우리 시장분석(네이버 테마 순위) TOP 5 · 🦀 = 테마 1등 · 거래대금 10억 미만 종목 제외 · ↳는 관련 뉴스(원인이 아닐 수도)")
+    parts.append("※ 우리 시장분석(네이버 테마 순위) TOP 5 · 🦀 = 테마 1등 · ●곰발 · ○곰발 통합 · 🎯 둘 다 · 거래대금 10억 미만 종목 제외 · ↳는 관련 뉴스(원인이 아닐 수도)")
     return "\n\n".join(parts), now.strftime("%Y-%m-%d")
 
 
@@ -12043,6 +12043,20 @@ def _crab_big_alert(payload: dict):
             sent += 1
             if sent >= 5:
                 break
+
+
+def _gom_mark(code: str) -> str:
+    """🐻 곰발 겹침 표시 (2026-11-09) — ' ●곰발' · ' ○통합' · ' 🎯' · '' (PC 곰발/곰발 통합 목록 + 서버 일봉 신호)"""
+    d = _crab_pc.get("data") or {}
+    g = any(x.get("code") == code for x in (d.get("big") or []))
+    gi = any(x.get("code") == code for x in (d.get("gomt") or []))
+    try:
+        t = _jm_signal_series(code).get("today") or {}
+        g = g or bool(t.get("g"))
+        gi = gi or bool(t.get("gi"))
+    except Exception:
+        pass
+    return " 🎯" if (g and gi) else " ●곰발" if g else " ○통합" if gi else ""
 
 
 # ⚡ 단타 검색기 5종 키 (2026-11-07) — crab 큰형님 자전거 · small 완빨 · bong3 봉삼이 · gomt 곰발 통합 · big 곰발
