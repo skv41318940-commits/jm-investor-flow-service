@@ -2814,20 +2814,46 @@ async def _daily_jobs_worker():
         await asyncio.sleep(300)
 
 
+_alert_clock_state: dict = {"started": "", "ticks": 0, "last": "", "fns": {}}
+
+
+@app.get("/api/alert-clock")
+def alert_clock_status():
+    """⏰ 알림 시계 상태 — 살아있나 · 함수별 마지막 실행/오류 · 오늘 보낸 알림 기록"""
+    day = now_kst().strftime("%Y-%m-%d")
+    sent = []
+    try:
+        rows = supabase.table("telegram_sent_log").select("kind").eq("ref_date", day).limit(300).execute().data or []
+        sent = sorted({r.get("kind") for r in rows if r.get("kind")})
+    except Exception as e:
+        sent = [f"(기록 조회 실패: {e})"]
+    return {"ok": True, "now": now_kst().strftime("%H:%M:%S"), **_alert_clock_state, "sent_today": sent,
+            "pc_alive": _pc_alive(), "nxt_result_age_sec": round(time.time() - (_pc_task_results.get("nxt") or {}).get("got", 0))}
+
+
 def _alert_clock_loop():
     """⏰ 알림 전용 시계 (2026-11-07 JM) — 15초마다. 무거운 작업 고리(5분)와 따로 돌아서 앞 작업이 길어도 정시에 감.
     각 함수가 '이미 보냈나'를 DB 기록으로 확인하니까 서버가 재시작돼도 두 번 안 감"""
     time.sleep(20)
-    fns = (("briefs", _run_telegram_briefs), ("us", _run_us_briefs), ("nxt", _run_nxt_premarket),
+    _alert_clock_state["started"] = now_kst().strftime("%m-%d %H:%M:%S")
+    # 🌅 NXT를 맨 앞에 — 다른 브리핑 만드느라 늦어지지 않게
+    fns = (("nxt", _run_nxt_premarket), ("briefs", _run_telegram_briefs), ("us", _run_us_briefs),
            ("health", _ensure_health_report_sent_today), ("jm_report", _run_report_digest))
     while True:
         if now_kst().weekday() >= 5:  # 🛑 주말엔 알림 시계 쉼 (토요일 00:00 미국 개장·일요일 22:25 미국 장전 포함)
             time.sleep(60)
             continue
+        _alert_clock_state["ticks"] += 1
+        _alert_clock_state["last"] = now_kst().strftime("%H:%M:%S")
         for name, fn in fns:
+            t0 = time.time()
+            st = _alert_clock_state["fns"].setdefault(name, {})
             try:
                 fn()
+                st.update({"at": now_kst().strftime("%H:%M:%S"), "sec": round(time.time() - t0, 1)})
             except Exception as e:
+                st.update({"at": now_kst().strftime("%H:%M:%S"), "err": f"{type(e).__name__}: {e}"[:300],
+                           "err_at": now_kst().strftime("%H:%M:%S")})
                 print(f"[alert_clock] {name} 실패: {e}")
         time.sleep(15)
 
