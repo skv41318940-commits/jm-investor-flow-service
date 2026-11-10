@@ -2779,6 +2779,7 @@ async def _daily_jobs_worker():
         ("fundamentals", _ensure_fundamentals_synced_today, ()),
         ("market_flow", _ensure_market_flow_synced_today, ()),
         # ⏰ 정해진 시각 알림들은 _alert_clock_loop(15초)로 옮김 (2026-11-07)
+        ("gom_snapshot", _gom_snapshot_job, ()),  # 🐾 곰발 종목 마감 스냅샷 (15:45 종가 · 18:10 외국인·실적)
         ("sector_map", _ensure_sector_jobs, ()),
         ("futures_snap", _snap_futures, ()),
 
@@ -12122,10 +12123,89 @@ def _gom_prev_day_items() -> tuple:
 _nxt_gom_info: dict = {"day": "", "rows": {}}
 
 
+def _gom_snap_load(day: str) -> dict:
+    try:
+        r = supabase.table("brief_cache").select("data").eq("key", f"gom_snap:{day}").limit(1).execute().data
+        return dict((r[0]["data"] or {}).get("rows") or {}) if r else {}
+    except Exception:
+        return {}
+
+
+def _gom_snap_save(day: str, rows: dict):
+    supabase.table("brief_cache").upsert({"key": f"gom_snap:{day}", "data": {"day": day, "rows": rows},
+                                          "updated_at": now_kst().isoformat()}).execute()
+
+
+def _gom_snapshot_job():
+    """🐾 오늘 곰발 종목 — 정규장 마감 때 종가·등락률·거래대금·거래량(15:45) + 외국인·흑자/적자(18:10)를 저장해 두고
+    다음 날 08:40 NXT 알림에 그대로 씀 (2026-11-10 JM: 아침에 하나하나 조회하면 시간 안에 못 끝냄)"""
+    now = now_kst()
+    if now.weekday() >= 5:
+        return
+    day = now.strftime("%Y-%m-%d")
+    hm = (now.hour, now.minute)
+    items = dict(_gom_day["items"]) if _gom_day["day"] == day else {}
+    if not items:
+        try:
+            r = supabase.table("brief_cache").select("data").eq("key", f"gom_day:{day}").limit(1).execute().data
+            items = dict((r[0]["data"] or {}).get("items") or {}) if r else {}
+        except Exception:
+            items = {}
+    if not items:
+        return
+
+    def price_pass():
+        rows = _gom_snap_load(day)
+        for code in items:
+            try:
+                q = _kis_quote(code)  # 15:45 = 정규장 종가 (16시 애프터마켓 시작 전)
+                if q.get("price"):
+                    rows.setdefault(code, {}).update({"price": q["price"], "pct": q.get("pct", 0), "amount": (q.get("value_eok") or 0) * 1e8,
+                                                      "volume": q.get("volume") or 0, "name": items[code]})
+            except Exception:
+                pass
+            time.sleep(0.08)
+        _gom_snap_save(day, rows)
+        print(f"[gom_snap] 종가 저장 {len(rows)}종목")
+
+    def extra_pass():
+        rows = _gom_snap_load(day)
+        for code in items:
+            info = rows.setdefault(code, {"name": items[code]})
+            try:
+                inv = _investor_daily(code)
+                if inv:
+                    info["foreign"] = inv["foreign"]
+            except Exception:
+                pass
+            try:
+                q = fetch_dart_quarterly(code)
+                info["status"] = q.get("latest_status") or ""
+                qs = q.get("quarters") or []
+                if qs and qs[-1].get("op") is not None:
+                    info["op"] = qs[-1]["op"]
+            except Exception:
+                pass
+            time.sleep(0.1)
+        _gom_snap_save(day, rows)
+        print(f"[gom_snap] 외국인·실적 저장 {len(rows)}종목")
+
+    if (15, 45) <= hm < (16, 0) and not _brief_already_sent("job_gom_snap_px", day):
+        _mark_brief_sent("job_gom_snap_px", day)
+        threading.Thread(target=price_pass, daemon=True).start()
+    if (18, 10) <= hm < (23, 0) and not _brief_already_sent("job_gom_snap_ex", day):
+        _mark_brief_sent("job_gom_snap_ex", day)
+        threading.Thread(target=extra_pass, daemon=True).start()
+
+
 def _nxt_gom_prefetch():
     """08:20쯤 — 어제 곰발 종목의 외국인 순매수(전일) · 흑자/적자를 미리 받아 둠 (08:40 정각에 바로 보내려고)"""
     day = now_kst().strftime("%Y-%m-%d")
-    _, items = _gom_prev_day_items()
+    pday, items = _gom_prev_day_items()
+    snap = _gom_snap_load(pday) if pday else {}
+    if snap and sum(1 for v in snap.values() if v.get("price")) >= len(items) * 0.8:
+        _nxt_gom_info.update({"day": day, "rows": snap})  # 어제 저녁에 저장해 둔 걸 그대로
+        return
     out = {}
     end = now_kst().strftime("%Y-%m-%d")
     start = (now_kst() - timedelta(days=12)).strftime("%Y-%m-%d")
@@ -13837,9 +13917,12 @@ def _run_nxt_premarket():
             lines.append("※ 대형주 30 + 관심종목·검색기·52주 신고가 후보 (NXT 프리마켓은 거래가 적어 방향 참고용 — 매매는 KRX 정규장)")
         # 🐻 어제 곰발 포착 종목 (2026-11-07 JM) — NXT와 관계없이 어제 통합 종가 기준 · 거래대금 순
         gday, gitems = _gom_prev_day_items()
-        info = _nxt_gom_info["rows"] if _nxt_gom_info.get("day") == day else {}
+        info = dict(_nxt_gom_info["rows"]) if _nxt_gom_info.get("day") == day else {}
+        snap = _gom_snap_load(gday) if gday else {}
+        for c, v in snap.items():  # 🐾 어제 저녁에 저장한 값이 먼저 (2026-11-10)
+            info[c] = {**info.get(c, {}), **{k: x for k, x in v.items() if x not in (None, "")}}
         if gitems:
-            lines.append(f"\n🐾 어제({gday[5:].replace('-', '/')}) 곰발 포착 {len(gitems)}종목 (어제 통합 종가 · 거래대금 순)")
+            lines.append(f"\n🐾 어제({gday[5:].replace('-', '/')}) 곰발 포착 {len(gitems)}종목 (어제 정규장 종가 · 거래대금 순)")
             ordered = sorted(gitems, key=lambda c: -(info.get(c, {}).get("amount") or 0))
             for i, c in enumerate(ordered, 1):
                 nm = gitems[c]
@@ -13857,7 +13940,7 @@ def _run_nxt_premarket():
                                  f"\n   {ftxt} · {ptxt}\n   🔗 {link(c)}")
                 else:
                     lines.append(f"{i}. {nm} · {ftxt} · {ptxt}\n   🔗 {link(c)}")
-            lines.append("※ 가격·등락률 = 어제 통합(KRX+NXT) 종가 · 외국인 = 전일 KRX 순매수 · 흑자/적자 = 최근 분기 영업이익")
+            lines.append("※ 가격·등락률·거래대금 = 어제 정규장 마감(15:45 저장) · 외국인 = 어제 순매수(18:10 저장) · 흑자/적자 = 최근 분기 영업이익")
         else:
             lines.append("\n🐾 어제 곰발 포착 기록이 없어요 — 세력트래커가 어제 장중에 곰발 목록을 못 올렸거나, 저장을 시작한 첫날이에요")
         if send_telegram("\n".join(lines)):
