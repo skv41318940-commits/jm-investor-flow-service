@@ -12780,7 +12780,8 @@ def _gom_resolve(names: str, codes: str = "") -> tuple:
 
 
 @app.get("/api/gom-check")
-def gom_check(names: str = "", codes: str = "", date: str = "", j_eok: float = 50, k_eok: float = 500, d_pct: float = 8):
+def gom_check(names: str = "", codes: str = "", date: str = "", j_eok: float = 50, k_eok: float = 500, d_pct: float = 8,
+              premarket: bool = False):
     """🐻 곰발 확정식 A~N 조건별 체크 (2026-11-11) — 사부님 목록과 비교용. 키움 정규장 일봉 기준.
     예: /api/gom-check?names=이수페타시스,원익IPS   (date 생략 = 오늘)
         j_eok·k_eok·d_pct 로 J(5봉 거래대금)·K(40봉 거래대금)·D/H(26봉 급등%) 기준을 바꿔서 시험 가능"""
@@ -12809,6 +12810,10 @@ def gom_check(names: str = "", codes: str = "", date: str = "", j_eok: float = 5
                         mg[x["date"]] = x
                 b = [mg[k] for k in sorted(mg)]
             b = [x for x in b if x["date"] <= d]
+            if premarket and b and b[-1]["date"] < d:
+                # 🌅 장 전: 오늘 봉이 아직 없음 → HTS처럼 '납작한 오늘 봉'(시가=고가=저가=종가=어제 종가, 거래 0)을 붙여서 계산
+                pc = b[-1]["close"]
+                b = b + [{"date": d, "open": pc, "high": pc, "low": pc, "close": pc, "volume": 0, "amount": 0}]
             if not b or b[-1]["date"] != d or len(b) < 41:
                 rows.append({"종목": nm, "오류": f"{d} 일봉 없음 (마지막 {b[-1]['date'] if b else '-'})"})
                 continue
@@ -12835,6 +12840,7 @@ def gom_check(names: str = "", codes: str = "", date: str = "", j_eok: float = 5
                 "L 종가>전일고가": C[t] > H[t - 1],
                 "M 양봉": C[t] > O[t],
                 "N 고가 3봉 신고가": H[t] >= max(H[t - 2:t + 1]),
+                "M 5봉내 데드크로스": _dc5_ago(b, t) is not None,
             }
             today = f["A 1봉전 5이평↓"] and (f["B 종가>전일종가"] or f["C 종가>전일시가"]) and f["D/H 26봉 급등"]
             cont = f["E 3봉전 5이평↓"] and (f["F 3봉내 시가대비3%"] or f["G 3봉내 전일대비3%"]) and f["D/H 26봉 급등"]
@@ -12849,11 +12855,15 @@ def gom_check(names: str = "", codes: str = "", date: str = "", j_eok: float = 5
                          "등락%": round(CHG[t], 2), "종가": C[t],
                          "곰발통합(○)": "O" if core and f["N 고가 3봉 신고가"] else "X",
                          "곰발(●)": "O" if core and f["L 종가>전일고가"] and f["M 양봉"] else "X",
+                         "곰발?(HTS식)": "O" if core and f["M 5봉내 데드크로스"] else "X",
                          "경로": "오늘곰발" if today else ("연속곰발" if cont else "-"),
                          "막힌조건": " · ".join(blocked) or ("N" if not f["N 고가 3봉 신고가"] else "-"),
                          **{k: ("O" if v else "X") for k, v in f.items()},
                          "26봉최대등락%": round(up, 1), "5봉최대대금억": round(j5, 1), "40봉최대대금억": round(k40, 1),
-                         "이격도%": round(C[t] / m5 * 100, 1), "윗꼬리%": round((H[t] / max(C[t], O[t]) - 1) * 100, 2)})
+                         "이격도%": round(C[t] / m5 * 100, 1), "윗꼬리%": round((H[t] / max(C[t], O[t]) - 1) * 100, 2),
+                         "5봉내 데드크로스": ("X" if _dc5_ago(b, t) is None else f"{_dc5_ago(b, t)}봉전"),
+                         **_prev_candle(b, t),
+                         **{k.replace("어제", "그제"): v for k, v in _prev_candle(b, t - 1).items()}})
         except Exception as e:
             rows.append({"종목": nm, "오류": str(e)[:120]})
     tally = {}
@@ -12863,6 +12873,145 @@ def gom_check(names: str = "", codes: str = "", date: str = "", j_eok: float = 5
                 tally[k] = tally.get(k, 0) + 1
     return {"ok": True, "date": d, "기준": {"J억": j_eok, "K억": k_eok, "D%": d_pct}, "조건별X개수": tally,
             "rows": rows, "못찾은종목": unresolved}
+
+
+# 🐻 사부님 곰발바닥 마감 종목 5일치 (11/2~11/6, 53개) — 검증용 (2026-11-11)
+MASTER_GOM_5D = {
+    "2026-11-02": ["팬오션", "HD현대마린엔진", "한화오션", "코스맥스", "OCI홀딩스", "진코스텍", "효성중공업", "비아트론",
+                   "한미사이언스", "리메드", "LG화학", "포스코퓨처엠"],
+    "2026-11-03": ["매드업", "토마토시스템", "삼기에너지솔루션즈", "에스투더블유", "펩트론", "AP위성", "켄코아에어로스페이스",
+                   "알테오젠", "한화머시너리앤서비스홀딩스"],
+    "2026-11-04": ["국제약품", "동국산업", "코리아써키트", "한화솔루션", "삼표시멘트", "엘앤에프", "에코프로", "서진시스템", "심텍",
+                   "에코프로비엠", "HD현대에너지솔루션", "두산퓨얼셀", "한선엔지니어링", "가온전선", "한국항공우주", "오킨스전자", "LS", "동진쎄미켐"],
+    "2026-11-05": ["한국화장품제조", "GS건설", "JYP Ent.", "코스맥스", "엘앤씨바이오", "지투지바이오", "HD현대에너지솔루션", "대동기어", "대명에너지"],
+    "2026-11-06": ["혜인", "GS건설", "엘리스", "JYP Ent.", "삼성에스디에스"],
+}
+
+
+def _prev_candle(b: list, t: int) -> dict:
+    """🕯 1봉전(어제) 캔들 모양 — 사부님 종목 공통점 찾기용 (2026-11-11 JM: '전날 캔들에 답이 있다')"""
+    y, p = b[t - 1], b[t - 2]
+    o, h, l, c = y["open"], y["high"], y["low"], y["close"]
+    rng = (h - l) or 1
+    vols = [x["volume"] for x in b[t - 6:t - 1]]
+    m5 = sum(x["close"] for x in b[t - 5:t]) / 5
+    return {"어제 등락%": round((c / p["close"] - 1) * 100, 2) if p["close"] else 0,
+            "어제 양음": "양봉" if c > o else ("음봉" if c < o else "도지"),
+            "어제 몸통%": round(abs(c - o) / rng * 100), "어제 윗꼬리%": round((h - max(o, c)) / rng * 100),
+            "어제 아래꼬리%": round((min(o, c) - l) / rng * 100), "어제 종가위치%": round((c - l) / rng * 100),
+            "어제 시가갭%": round((o / p["close"] - 1) * 100, 2) if p["close"] else 0,
+            "어제 거래량/5일평균": round(y["volume"] / (sum(vols) / len(vols)), 2) if vols and sum(vols) else None,
+            "어제 종가/5이평%": round(c / m5 * 100, 1) if m5 else None,
+            "어제 고가 위치": "5이평 위" if h > m5 else "5이평 아래"}
+
+
+def _dc5_ago(b: list, t: int, win: int = 5):
+    """✂️ 5봉 이내 1이평(종가)이 5이평을 아래로 뚫은 데드크로스 — 몇 봉 전이었나 (없으면 None) (2026-11-11 JM 아이디어)"""
+    C = [x["close"] for x in b]
+    ma = lambda j: sum(C[j - 4:j + 1]) / 5
+    for k in range(0, win):
+        j = t - k
+        if j - 5 < 0:
+            break
+        if C[j - 1] >= ma(j - 1) and C[j] < ma(j):
+            return k
+    return None
+
+
+def _gom_flags(b: list, t: int, a_win: int = 1, i_ge: bool = False, j_eok: float = 50, k_eok: float = 500, d_pct: float = 8,
+               dc: str = "") -> dict:
+    """곰발 확정식 A~N (변형 옵션: A를 1~a_win봉전 중 하락 1회 · I를 ≥ 로 · dc=데드크로스 replace|and|or)"""
+    C = [x["close"] for x in b]; H = [x["high"] for x in b]; O = [x["open"] for x in b]
+    A = [(x.get("amount") or 0) or x["close"] * x["volume"] for x in b]
+    CHG = lambda j: (C[j] / C[j - 1] - 1) * 100 if C[j - 1] else 0.0
+    OCHG = lambda j: (C[j] / O[j] - 1) * 100 if O[j] else 0.0
+    m5 = sum(C[t - 4:t + 1]) / 5
+    up = max(CHG(j) for j in range(t - 25, t + 1))
+    a_ok = any(C[t - k] < C[t - k - 5] for k in range(1, a_win + 1))
+    if dc:
+        d_ok = _dc5_ago(b, t) is not None
+        a_ok = d_ok if dc == "replace" else (a_ok and d_ok) if dc == "and" else (a_ok or d_ok)
+    today = a_ok and (C[t] > C[t - 1] or C[t] > O[t - 1]) and up >= d_pct
+    cont = C[t - 3] < C[t - 8] and (max(OCHG(j) for j in range(t - 2, t + 1)) >= 3 or max(CHG(j) for j in range(t - 2, t + 1)) >= 3) and up >= d_pct
+    i_ok = C[t] >= m5 if i_ge else C[t] > m5
+    core = (today or cont) and i_ok and max(A[t - 4:t + 1]) >= j_eok * 1e8 and max(A[t - 39:t + 1]) >= k_eok * 1e8
+    return {"core": core, "tong": core and H[t] >= max(H[t - 2:t + 1]), "gom": core and C[t] > H[t - 1] and C[t] > O[t]}
+
+
+@app.get("/api/gom-validate")
+def gom_validate():
+    """🐻 사부님 5일치 마감 53개로 곰발 변형별 재현율 비교 (키움 정규장 일봉)"""
+    allnames = sorted({n for v in MASTER_GOM_5D.values() for n in v})
+    name_of = {}
+    for nm in allnames:
+        c, _ = _gom_resolve(nm)
+        if c:
+            name_of[nm] = c[0]
+    try:
+        _kiwoom_daily_al(list(name_of.values()), krx_only=True)
+    except Exception:
+        pass
+    variants = {
+        "V0 지금 (J50·A1봉전)": dict(),
+        "V1 J10억": dict(j_eok=10),
+        "V2 J10억 + A 1~2봉전": dict(j_eok=10, a_win=2),
+        "V3 V2 + I 종가≥5이평": dict(j_eok=10, a_win=2, i_ge=True),
+        "V4 V3 + D 6%": dict(j_eok=10, a_win=2, i_ge=True, d_pct=6),
+        "V5 V3 + A 1~3봉전": dict(j_eok=10, a_win=3, i_ge=True),
+        "V6 A 대신 5봉내 데드크로스": dict(j_eok=10, i_ge=True, dc="replace"),
+        "V7 A 또는 5봉내 데드크로스": dict(j_eok=10, i_ge=True, dc="or"),
+        "V8 A 그리고 5봉내 데드크로스": dict(j_eok=10, i_ge=True, dc="and"),
+    }
+    bars_cache = {}
+    res = {k: {"통합(○)": 0, "곰발(●)": 0, "기본(N전)": 0, "놓침(○)": []} for k in variants}
+    total, nodata, feats = 0, [], []
+    for d, names in MASTER_GOM_5D.items():
+        for nm in names:
+            code = name_of.get(nm)
+            if not code:
+                nodata.append(f"{d} {nm}(코드 못찾음)")
+                continue
+            if code not in bars_cache:
+                start = (datetime.strptime("2026-11-02", "%Y-%m-%d") - timedelta(days=200)).strftime("%Y-%m-%d")
+                b = _kis_daily_candles(code, start, now_kst().strftime("%Y-%m-%d"))
+                kk = _kk_daily.get(code)
+                if kk and kk[1]:
+                    mg = {x["date"]: x for x in b}
+                    for x in kk[1]:
+                        if x["date"] >= start:
+                            mg[x["date"]] = x
+                    b = [mg[k] for k in sorted(mg)]
+                bars_cache[code] = b
+            b = bars_cache[code]
+            idx = next((i for i, x in enumerate(b) if x["date"] == d), None)
+            if idx is None or idx < 45:
+                nodata.append(f"{d} {nm}(일봉 없음)")
+                continue
+            total += 1
+            dk = _dc5_ago(b, idx)
+            feats.append({"날짜": d[5:], "종목": nm, "5봉내 데드크로스": "X" if dk is None else f"{dk}봉전", **_prev_candle(b, idx)})
+            for k, opt in variants.items():
+                f = _gom_flags(b, idx, **opt)
+                res[k]["통합(○)"] += f["tong"]
+                res[k]["곰발(●)"] += f["gom"]
+                res[k]["기본(N전)"] += f["core"]
+                if not f["tong"]:
+                    res[k]["놓침(○)"].append(f"{d[5:]} {nm}")
+    for k in res:
+        for kk_ in ("통합(○)", "곰발(●)", "기본(N전)"):
+            res[k][kk_] = f"{res[k][kk_]}/{total} ({res[k][kk_] / total * 100:.0f}%)" if total else "0"
+    # 🕯 사부님 53개의 어제 캔들 모양 요약
+    def cnt(key, val):
+        return sum(1 for f in feats if f.get(key) == val)
+    summ = {"어제 양봉": cnt("어제 양음", "양봉"), "어제 음봉": cnt("어제 양음", "음봉"), "어제 도지": cnt("어제 양음", "도지"),
+            "어제 하락 마감": sum(1 for f in feats if f["어제 등락%"] < 0),
+            "어제 종가 5이평 아래": sum(1 for f in feats if (f["어제 종가/5이평%"] or 0) < 100),
+            "어제 아래꼬리 30%↑": sum(1 for f in feats if f["어제 아래꼬리%"] >= 30),
+            "어제 윗꼬리 30%↑": sum(1 for f in feats if f["어제 윗꼬리%"] >= 30),
+            "어제 거래량 5일평균 미만": sum(1 for f in feats if (f["어제 거래량/5일평균"] or 0) < 1),
+            "5봉내 데드크로스 있음": sum(1 for f in feats if f["5봉내 데드크로스"] != "X")}
+    return {"ok": True, "종목수": total, "데이터없음": nodata, "결과": res, "어제캔들_요약": summ, "어제캔들": feats,
+            "설명": "통합(○)=곰발 통합 · 곰발(●) · 기본(N전)=마무리 조건 빼고 A~K만. 사부님 마감 종목을 몇 개 잡나(재현율)"}
 
 
 @app.get("/api/gom-debug-multi")
