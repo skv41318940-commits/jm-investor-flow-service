@@ -11467,6 +11467,311 @@ def _mq_loop():
             time.sleep(60)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 🏛 매크로 지표 1순위 (2026-11-10 JM) — 연준·물가·고용·성장·위험 신호·한국 + 에너지·금속 추가
+#   발표형 지표는 FRED(연준 공식) · 한국은 한국은행 ECOS(ECOS_API_KEY) · 공급망은 뉴욕연은
+#   각 지표마다 "무슨 뜻인지(meaning)" · "보는 법(read)"을 같이 내려줌 → 화면 설명 칸
+# ══════════════════════════════════════════════════════════════════════════
+ECOS_API_KEY = os.environ.get("ECOS_API_KEY")
+
+# (묶음, 키, 이름, 출처, 시리즈, 변환, 단위, 주기, 뜻, 보는 법)
+#   변환: level 그대로 · yoy 전년비% · mom 전월비% · diff 전월 대비 증감 · scale:N 나누기
+MACRO_IND = [
+    ("fed", "fed_rate", "연준 기준금리", "fed_range", None, "level", "%", "FOMC 연 8회",
+     "연준이 정하는 미국 기준금리 (목표 범위)", "인상 = 긴축 · 동결 · 인하 = 완화 — 세계 돈의 가격"),
+    ("fed", "effr", "실효 연방기금금리", "fred", "EFFR", "level", "%", "매일",
+     "은행끼리 하루 동안 실제로 빌린 금리", "기준금리 범위 안이면 정상 · 위쪽에 붙으면 돈이 빠듯"),
+    ("fed", "iorb", "지급준비금 이자 (IORB)", "fred", "IORB", "level", "%", "FOMC 때",
+     "은행이 연준에 맡긴 돈에 주는 이자", "사실상 단기 금리의 바닥을 받쳐주는 장치"),
+    ("fed", "dgs2", "美 2년물", "fred", "DGS2", "level", "%", "매일",
+     "연준이 앞으로 금리를 어떻게 할지 시장 예상이 가장 잘 담긴 금리", "오르면 '더 올리거나 오래 높게' 예상 · 내리면 인하 기대"),
+    ("fed", "walcl", "연준 총자산 (대차대조표)", "fred", "WALCL", "scale:1000000", "조달러", "매주 목",
+     "연준이 가진 국채·MBS 등 전체 자산", "줄어들면 QT = 시중 돈 회수(긴축) · 늘면 돈 풀기"),
+    ("fed", "rrp", "역레포 잔액", "fred", "RRPONTSYD", "scale:1", "십억달러", "매일",
+     "갈 곳 없는 돈이 연준에 하룻밤 맡겨진 금액", "줄어들수록 시중 여유 자금이 줄어드는 중"),
+    ("fed", "reserves", "은행 지급준비금", "fred", "WRESBAL", "scale:1000", "조달러", "매주",
+     "은행들이 연준에 쌓아둔 돈", "너무 줄면 단기 자금시장이 경색 → 연준이 QT를 멈추는 신호"),
+
+    ("infl", "core_pce", "근원 PCE (전년비)", "fred", "PCEPILFE", "yoy", "%", "매월 말",
+     "식품·에너지 뺀 개인소비지출 물가 — 연준 2% 목표의 공식 기준", "2%보다 높을수록 매파 · 2%에 가까워지면 인하 근거"),
+    ("infl", "pce", "PCE (전년비)", "fred", "PCEPI", "yoy", "%", "매월 말",
+     "개인이 실제로 쓰는 돈 기준 전체 물가", "에너지·식품 포함이라 근원보다 출렁임이 큼"),
+    ("infl", "cpi", "CPI (전년비)", "fred", "CPIAUCSL", "yoy", "%", "매월 중순",
+     "소비자물가 — 시장이 가장 크게 반응하는 물가", "예상보다 높으면 주식 ↓·달러 ↑ · 낮으면 반대"),
+    ("infl", "core_cpi", "근원 CPI (전년비)", "fred", "CPILFESL", "yoy", "%", "매월 중순",
+     "식품·에너지 뺀 소비자물가", "일시적 출렁임을 뺀 '진짜 물가 흐름'"),
+    ("infl", "ppi", "PPI 최종수요 (전년비)", "fred", "PPIFIS", "yoy", "%", "매월 중순",
+     "생산자물가 — 공장·도매 단계 가격", "CPI·PCE보다 먼저 움직이는 선행 지표"),
+    ("infl", "bei5", "5년 기대인플레 (BEI)", "fred", "T5YIE", "level", "%", "매일",
+     "국채와 물가연동채 금리 차이로 계산한 시장의 5년 물가 예상", "오르면 시장이 물가를 걱정 · 기대 경로 체크"),
+    ("infl", "bei5y5", "장기 기대인플레 (5년 뒤 5년)", "fred", "T5YIFR", "level", "%", "매일",
+     "5년 뒤부터 5년간의 물가 예상 — 연준이 가장 지키려는 숫자", "2~2.5%에서 벗어나 오르면 연준이 긴장"),
+    ("infl", "mich", "미시간대 1년 기대인플레", "fred", "MICH", "level", "%", "매월",
+     "소비자들이 예상하는 1년 뒤 물가", "오르면 '물가가 계속 오를 거야' 심리 → 임금·가격 선반영 위험"),
+
+    ("job", "nfp", "비농업 고용 (증가)", "fred", "PAYEMS", "diff", "천명", "매월 첫 금요일",
+     "한 달 동안 늘어난 일자리 수", "예상보다 많으면 경기 강함 = 매파 · 적거나 마이너스면 비둘기파"),
+    ("job", "unrate", "실업률", "fred", "UNRATE", "level", "%", "매월 첫 금요일",
+     "일하고 싶은데 일자리가 없는 사람 비율", "오르기 시작하면 경기 둔화 신호 → 인하 압력"),
+    ("job", "ahe", "시간당 임금 (전년비)", "fred", "CES0500000003", "yoy", "%", "매월 첫 금요일",
+     "평균 시간당 임금 상승률", "높으면 임금발 물가(끈적한 서비스 물가) 우려"),
+    ("job", "jolts", "JOLTS 구인 건수", "fred", "JTSJOL", "scale:1", "천건", "매월",
+     "기업이 뽑으려고 내놓은 일자리 수", "실업자 수보다 많으면 일손 부족 → 임금 ↑"),
+    ("job", "claims", "신규 실업수당 청구", "fred", "ICSA", "scale:1000", "천건", "매주 목",
+     "한 주 동안 새로 실업수당을 신청한 사람", "가장 빠른 고용 신호 · 꾸준히 늘면 경고"),
+
+    ("growth", "gdp", "실질 GDP 성장률 (연율)", "fred", "A191RL1Q225SBEA", "level", "%", "분기",
+     "미국 경제 전체가 얼마나 성장했나 (분기, 연율 환산)", "2% 안팎이 보통 · 마이너스 2분기 연속이면 침체 얘기"),
+    ("growth", "retail", "소매판매 (전월비)", "fred", "RSAFS", "mom", "%", "매월 중순",
+     "가게·온라인에서 팔린 금액", "소비 = 미국 경제의 약 70% · 강하면 경기 탄탄"),
+    ("growth", "indpro", "산업생산 (전월비)", "fred", "INDPRO", "mom", "%", "매월 중순",
+     "공장·광산·전기 생산량", "제조업 경기 · 플러스면 생산 확장"),
+    ("growth", "houst", "주택착공", "fred", "HOUST", "scale:1", "천호(연율)", "매월",
+     "새로 짓기 시작한 집", "금리에 가장 민감 — 금리 ↑ 땐 먼저 줄어듦"),
+
+    ("risk", "t10y2y", "장단기 금리차 (10년−2년)", "fred", "T10Y2Y", "level", "%p", "매일",
+     "장기 금리 − 단기 금리", "마이너스(역전) = 침체 경고 · 역전이 풀리며 침체가 오는 경우가 많음"),
+    ("risk", "t10y3m", "장단기 금리차 (10년−3개월)", "fred", "T10Y3M", "level", "%p", "매일",
+     "연준이 침체 예측에 더 신뢰하는 금리차", "역전이 길어질수록 침체 확률 ↑"),
+    ("risk", "hy", "하이일드 스프레드", "fred", "BAMLH0A0HYM2", "level", "%p", "매일",
+     "위험한 회사채 금리 − 국채 금리", "벌어지면 돈 빌리기 어려워짐 = 위험 신호 · 좁으면 안심"),
+    ("risk", "nfci", "금융여건지수 (NFCI)", "fred", "NFCI", "level", "", "매주",
+     "금리·신용·주가를 합친 시카고연은 지수", "0보다 높으면 긴축적(돈 줄 빡빡) · 낮으면 완화적"),
+    ("risk", "gscpi", "공급망 압력 (GSCPI)", "nyfed", None, "level", "", "매월 초",
+     "운임·배송 지연을 합친 뉴욕연은 공급망 지수", "0보다 높으면 공급망 막힘 → 물가 압력"),
+    ("risk", "gold_copper", "금/구리 비율", "ratio", ("GC=F", "HG=F"), "level", "", "실시간",
+     "안전자산(금) ÷ 경기 자산(구리)", "오르면 불안 > 경기 (위험 회피) · 내리면 경기 기대"),
+    ("risk", "gold_silver", "금/은 비율", "ratio", ("GC=F", "SI=F"), "level", "", "실시간",
+     "금 ÷ 은 (은은 절반이 산업용)", "높으면 불안 · 낮아지면 경기 회복 기대"),
+
+    ("kr", "bok_rate", "한국 기준금리", "ecos", ("722Y001", "D", "0101000"), "level", "%", "금통위 연 8회",
+     "한국은행이 정하는 원화 기준금리", "인상 = 긴축 · 인하 = 완화 · 연준과의 차이가 환율을 움직임"),
+    ("kr", "kr_us_gap", "한미 금리차", "calc", None, "level", "%p", "수시",
+     "한국 기준금리 − 미국 기준금리(상단)", "마이너스가 클수록 원화 약세·외국인 자금 유출 압력"),
+    ("kr", "kr_cpi", "한국 CPI (전년비)", "ecos", ("901Y009", "M", "0"), "yoy", "%", "매월 초",
+     "한국 소비자물가 상승률", "한국은행 금리 결정의 기준 · 2% 목표"),
+    ("kr", "ktb3", "국고채 3년", "ecos", ("817Y002", "D", "010200000"), "level", "%", "매일",
+     "한국 정부 3년 채권 금리", "한국은행 금리 예상이 담김 · 기준금리보다 낮으면 인하 기대"),
+    ("kr", "cd91", "CD 91일", "ecos", ("817Y002", "D", "010502000"), "level", "%", "매일",
+     "은행이 돈을 빌릴 때 발행하는 양도성예금증서 금리", "변동금리 대출의 기준 — 금리 경로 2단계"),
+    ("kr", "fx_res", "외환보유액", "ecos", ("732Y001", "M", "99"), "scale:100000", "억달러", "매월 초",
+     "한국이 가진 외화(달러 등) 총액", "환율 방어 여력 · 급감하면 원화 불안"),
+    ("kr", "ca", "경상수지", "ecos", ("301Y013", "M", "000000"), "scale:100", "억달러", "매월 초",
+     "한국이 수출·서비스·투자로 번 외화 − 쓴 외화", "흑자 = 원화 지지 · 적자 전환은 경고"),
+    ("kr", "export", "한국 수출 (전년비)", "fred", "XTEXVA01KRM667S", "yoy", "%", "매월 (1~2달 늦음)",
+     "한국 상품 수출액 증가율", "세계 경기 바로미터 · 빠른 숫자는 매월 1일 수출입 발표"),
+
+    ("commod", "ng", "천연가스 (헨리허브)", "yahoo", "NG=F", "level", "달러", "실시간",
+     "미국 천연가스 가격", "겨울 난방·전력 수요 · 오르면 에너지 물가 ↑"),
+    ("commod", "rbob", "휘발유", "yahoo", "RB=F", "level", "달러", "실시간",
+     "미국 휘발유 선물", "미국 소비자 물가·체감 경기에 직결"),
+    ("commod", "ho", "경유·난방유", "yahoo", "HO=F", "level", "달러", "실시간",
+     "트럭·배 연료 — 운송비의 핵심", "오르면 몇 주 뒤 운임 ↑ → 수입 물가 ↑"),
+    ("commod", "alu", "알루미늄", "yahoo", "ALI=F", "level", "달러", "실시간",
+     "자동차·포장 소재 (중국 생산 압도적)", "중국 생산·전력 사정 · 제조 원가"),
+    ("commod", "plat", "백금", "yahoo", "PL=F", "level", "달러", "실시간",
+     "자동차 배기 정화·수소 (남아공)", "산업 수요 + 귀금속 성격"),
+    ("commod", "pall", "팔라듐", "yahoo", "PA=F", "level", "달러", "실시간",
+     "자동차 배기 정화 (러시아 비중 큼)", "러시아 제재 뉴스에 민감"),
+]
+MACRO_GROUPS = {"fed": "🏛 연준 정책", "infl": "💹 물가", "job": "👷 고용", "growth": "📈 성장",
+                "risk": "🚦 경기·위험 신호", "kr": "🇰🇷 한국 매크로", "commod": "🛢 에너지·금속 추가"}
+_macro_ind_cache = {"at": 0.0, "data": None, "busy": False}
+
+
+_macro_obs_cache: dict = {}  # 발표형 지표는 6시간 저장 (FRED·ECOS·뉴욕연은)
+
+
+def _macro_cached(key: str, fn, ttl: int = 21600):
+    c = _macro_obs_cache.get(key)
+    if c and time.time() - c[0] < ttl and c[1]:
+        return c[1]
+    v = fn()
+    if v:
+        _macro_obs_cache[key] = (time.time(), v)
+    return v or (c[1] if c else [])
+
+
+def _fred_obs(sid: str, n: int = 30) -> list:
+    return _macro_cached(f"fred:{sid}:{n}", lambda: _fred_obs_raw(sid, n))
+
+
+def _fred_obs_raw(sid: str, n: int = 30) -> list:
+    if not FRED_API_KEY:
+        return []
+    r = requests.get("https://api.stlouisfed.org/fred/series/observations",
+                     params={"series_id": sid, "api_key": FRED_API_KEY, "file_type": "json", "sort_order": "desc", "limit": n}, timeout=12)
+    r.raise_for_status()
+    return [(o["date"], float(o["value"])) for o in r.json().get("observations", []) if o.get("value") not in (".", None, "")]
+
+
+def _ecos_obs(stat: str, cycle: str, item: str) -> list:
+    return _macro_cached(f"ecos:{stat}:{item}", lambda: _ecos_obs_raw(stat, cycle, item))
+
+
+def _ecos_obs_raw(stat: str, cycle: str, item: str) -> list:
+    if not ECOS_API_KEY:
+        return []
+    now = now_kst()
+    if cycle == "D":
+        a, b = (now - timedelta(days=40)).strftime("%Y%m%d"), now.strftime("%Y%m%d")
+    else:
+        a, b = (now - timedelta(days=500)).strftime("%Y%m"), now.strftime("%Y%m")
+    url = f"https://ecos.bok.or.kr/api/StatisticSearch/{ECOS_API_KEY}/json/kr/1/200/{stat}/{cycle}/{a}/{b}/{item}"
+    rows = (requests.get(url, timeout=12).json().get("StatisticSearch") or {}).get("row") or []
+    out = []
+    for x in rows:
+        try:
+            t = x["TIME"]
+            d = f"{t[:4]}-{t[4:6]}-{t[6:8]}" if len(t) == 8 else f"{t[:4]}-{t[4:6]}-01"
+            out.append((d, float(x["DATA_VALUE"])))
+        except Exception:
+            pass
+    return sorted(out, reverse=True)
+
+
+def _gscpi_obs() -> list:
+    return _macro_cached("gscpi", _gscpi_obs_raw, 43200)
+
+
+def _gscpi_obs_raw() -> list:
+    try:
+        import openpyxl
+        r = requests.get("https://www.newyorkfed.org/medialibrary/research/interactives/gscpi/downloads/gscpi_data.xlsx", timeout=20)
+        wb = openpyxl.load_workbook(io.BytesIO(r.content), read_only=True, data_only=True)
+        out = []
+        for ws in wb.worksheets:
+            for row in ws.iter_rows(values_only=True):
+                if row and isinstance(row[0], datetime) and len(row) > 1 and isinstance(row[1], (int, float)):
+                    out.append((row[0].strftime("%Y-%m-%d"), float(row[1])))
+            if out:
+                break
+        return sorted(out, reverse=True)
+    except Exception as e:
+        print(f"[macro_ind] GSCPI 실패: {e}")
+        return []
+
+
+def _macro_fmt(v, unit):
+    if v is None:
+        return "—"
+    if unit in ("%", "%p"):
+        return f"{v:.2f}{unit}"
+    if unit == "천명":
+        return f"{v:+,.0f}천명"
+    if unit in ("조달러",):
+        return f"{v:,.2f}조달러"
+    if abs(v) >= 1000:
+        return f"{v:,.0f}" + (f" {unit}" if unit else "")
+    return f"{v:,.2f}" + (f" {unit}" if unit else "")
+
+
+def _macro_transform(obs: list, tf: str):
+    """obs = [(date, value)] 최신순 → (값, 이전값, 날짜)"""
+    if not obs:
+        return None, None, None
+    if tf == "level" or tf.startswith("scale:"):
+        k = float(tf.split(":")[1]) if tf.startswith("scale:") else 1.0
+        return obs[0][1] / k, (obs[1][1] / k if len(obs) > 1 else None), obs[0][0]
+    if tf == "diff":
+        if len(obs) < 3:
+            return None, None, obs[0][0]
+        return obs[0][1] - obs[1][1], obs[1][1] - obs[2][1], obs[0][0]
+    if tf == "mom":
+        if len(obs) < 3:
+            return None, None, obs[0][0]
+        return (obs[0][1] / obs[1][1] - 1) * 100, (obs[1][1] / obs[2][1] - 1) * 100, obs[0][0]
+    if tf == "yoy":  # 월간: 12개 전, 분기면 4개 전
+        lag = 12
+        try:
+            d0, d1 = datetime.strptime(obs[0][0], "%Y-%m-%d"), datetime.strptime(obs[1][0], "%Y-%m-%d")
+            if (d0 - d1).days > 80:
+                lag = 4
+        except Exception:
+            pass
+        if len(obs) <= lag + 1:
+            return None, None, obs[0][0]
+        return (obs[0][1] / obs[lag][1] - 1) * 100, (obs[1][1] / obs[lag + 1][1] - 1) * 100, obs[0][0]
+    return None, None, None
+
+
+def _macro_ind_build() -> dict:
+    out = []
+    vals = {}
+    for grp, key, name, src, sid, tf, unit, freq, meaning, read in MACRO_IND:
+        v = pv = d = None
+        note = ""
+        try:
+            if src == "fred":
+                v, pv, d = _macro_transform(_fred_obs(sid, 30), tf)
+            elif src == "fed_range":
+                lo, hi = _fred_obs("DFEDTARL", 400), _fred_obs("DFEDTARU", 400)
+                if lo and hi:
+                    v, d = hi[0][1], hi[0][0]
+                    prev_hi = next((x[1] for x in hi if x[1] != hi[0][1]), hi[0][1])
+                    pv = prev_hi
+                    note = f"{lo[0][1]:.2f}~{hi[0][1]:.2f}%"
+            elif src == "ecos":
+                if not ECOS_API_KEY:
+                    note = "ECOS 키 필요"
+                else:
+                    v, pv, d = _macro_transform(_ecos_obs(*sid), tf)
+            elif src == "nyfed":
+                v, pv, d = _macro_transform(_gscpi_obs(), tf)
+            elif src == "yahoo":
+                q = _macro_quote(sid)
+                if q.get("ok"):
+                    v, pv, d = q["price"], q["price"] - q.get("change", 0), now_kst().strftime("%Y-%m-%d")
+            elif src == "ratio":
+                a, b = _macro_quote(sid[0]), _macro_quote(sid[1])
+                if a.get("ok") and b.get("ok") and b["price"]:
+                    v = a["price"] / b["price"]
+                    pa, pb = a["price"] - a.get("change", 0), b["price"] - b.get("change", 0)
+                    pv = pa / pb if pb else None
+                    d = now_kst().strftime("%Y-%m-%d")
+            elif src == "calc" and key == "kr_us_gap":
+                if vals.get("bok_rate") is not None and vals.get("fed_rate") is not None:
+                    v = vals["bok_rate"] - vals["fed_rate"]
+                    d = now_kst().strftime("%Y-%m-%d")
+                elif not ECOS_API_KEY:
+                    note = "ECOS 키 필요"
+        except Exception as e:
+            note = f"받기 실패: {str(e)[:60]}"
+        vals[key] = v
+        out.append({"group": grp, "key": key, "name": name, "value": None if v is None else round(v, 4),
+                    "prev": None if pv is None else round(pv, 4), "display": note if (key == "fed_rate" and note) else _macro_fmt(v, unit),
+                    "prev_display": _macro_fmt(pv, unit) if pv is not None else "",
+                    "chg": None if (v is None or pv is None) else round(v - pv, 4),
+                    "date": d, "unit": unit, "freq": freq, "meaning": meaning, "read": read,
+                    "note": "" if key == "fed_rate" else note, "source": src})
+    return {"ok": True, "at": now_kst().strftime("%Y-%m-%d %H:%M"), "groups": MACRO_GROUPS, "items": out,
+            "ecos": bool(ECOS_API_KEY)}
+
+
+@app.get("/api/macro-indicators")
+def macro_indicators_endpoint(refresh: bool = False):
+    """🏛 매크로 1순위 지표 — 발표형은 6시간, 시세형(에너지·금속·비율)은 15분마다 새로"""
+    c = _macro_ind_cache
+    stale = (time.time() - c["at"]) > 900
+    if (refresh or stale or not c["data"]) and not c["busy"]:
+        c["busy"] = True
+
+        def run():
+            try:
+                c["data"] = _macro_ind_build()
+                c["at"] = time.time()
+            except Exception as e:
+                print(f"[macro_ind] 실패: {e}")
+            finally:
+                c["busy"] = False
+
+        if c["data"] and not refresh:
+            threading.Thread(target=run, daemon=True).start()  # 예전 값 먼저 주고 뒤에서 새로
+        else:
+            run()
+    return c["data"] or {"ok": False, "error": "만드는 중 — 잠시 뒤 다시"}
+
+
 @app.get("/api/macro-quotes")
 def macro_quotes_endpoint(symbols: str):
     import concurrent.futures as cf
@@ -13922,8 +14227,11 @@ def _run_nxt_premarket():
         for c, v in snap.items():  # 🐾 어제 저녁에 저장한 값이 먼저 (2026-11-10)
             info[c] = {**info.get(c, {}), **{k: x for k, x in v.items() if x not in (None, "")}}
         if gitems:
-            lines.append(f"\n🐾 어제({gday[5:].replace('-', '/')}) 곰발 포착 {len(gitems)}종목 (어제 정규장 종가 · 거래대금 순)")
-            ordered = sorted(gitems, key=lambda c: -(info.get(c, {}).get("amount") or 0))
+            lines.append(f"\n🐾 어제({gday[5:].replace('-', '/')}) 곰발 포착 {len(gitems)}종목 (어제 정규장 종가 · 거래대금+거래량 순위)")
+            # 🏆 2026-11-10 JM: 거래대금 순위 + 거래량 순위 → 두 순위 합이 작은 순
+            ra = {c: i for i, c in enumerate(sorted(gitems, key=lambda c: -(info.get(c, {}).get("amount") or 0)), 1)}
+            rv = {c: i for i, c in enumerate(sorted(gitems, key=lambda c: -(info.get(c, {}).get("volume") or 0)), 1)}
+            ordered = sorted(gitems, key=lambda c: (ra[c] + rv[c], ra[c]))
             for i, c in enumerate(ordered, 1):
                 nm = gitems[c]
                 inf = info.get(c, {})
@@ -13936,7 +14244,7 @@ def _run_nxt_premarket():
                 if "전환" in st:
                     ptxt += f"({st})"
                 if inf.get("price"):
-                    lines.append(f"{i}. {nm} {inf['price']:,.0f}원 ({inf['pct']:+.2f}%) · {inf['amount'] / 1e8:,.0f}억 · {inf['volume']:,.0f}주"
+                    lines.append(f"{i}. {nm} {inf['price']:,.0f}원 ({inf['pct']:+.2f}%) · {inf['amount'] / 1e8:,.0f}억 · {inf['volume']:,.0f}주 (대금 {ra[c]}위·거래량 {rv[c]}위)"
                                  f"\n   {ftxt} · {ptxt}\n   🔗 {link(c)}")
                 else:
                     lines.append(f"{i}. {nm} · {ftxt} · {ptxt}\n   🔗 {link(c)}")
