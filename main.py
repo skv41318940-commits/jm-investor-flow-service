@@ -12758,6 +12758,113 @@ def gom_debug(code: str, dates: str, market: str = "J"):
     return {"ok": True, "code": code, "rows": out}
 
 
+def _gom_resolve(names: str, codes: str = "") -> tuple:
+    lst = [c.strip().upper() for c in codes.split(",") if c.strip()]
+    unresolved = []
+    for nm in [x.strip() for x in names.split(",") if x.strip()]:
+        code = None
+        try:
+            r = supabase.table("stock_fundamentals").select("code,name").eq("name", nm).limit(1).execute().data
+            code = r[0]["code"] if r else None
+        except Exception:
+            pass
+        if not code:
+            try:
+                hits = _lookup_stock_code(nm)
+                ex = [h for h in hits if h["name"].replace(" ", "").upper() == nm.replace(" ", "").upper()] or hits[:1]
+                code = ex[0]["code"] if ex else None
+            except Exception:
+                code = None
+        (lst.append(code) if code else unresolved.append(nm))
+    return list(dict.fromkeys(lst))[:40], unresolved
+
+
+@app.get("/api/gom-check")
+def gom_check(names: str = "", codes: str = "", date: str = "", j_eok: float = 50, k_eok: float = 500, d_pct: float = 8):
+    """🐻 곰발 확정식 A~N 조건별 체크 (2026-11-11) — 사부님 목록과 비교용. 키움 정규장 일봉 기준.
+    예: /api/gom-check?names=이수페타시스,원익IPS   (date 생략 = 오늘)
+        j_eok·k_eok·d_pct 로 J(5봉 거래대금)·K(40봉 거래대금)·D/H(26봉 급등%) 기준을 바꿔서 시험 가능"""
+    d = (date or now_kst().strftime("%Y-%m-%d"))[:10]
+    lst, unresolved = _gom_resolve(names, codes)
+    try:
+        _kiwoom_daily_al(lst, krx_only=True)
+    except Exception:
+        pass
+    rows = []
+    start = (now_kst() - timedelta(days=200)).strftime("%Y-%m-%d")
+    for code in lst:
+        nm = code
+        try:
+            r = supabase.table("stock_fundamentals").select("name").eq("code", code).limit(1).execute().data
+            nm = r[0]["name"] if r else code
+        except Exception:
+            pass
+        try:
+            b = _kis_daily_candles(code, start, d)
+            kk = _kk_daily.get(code)
+            if kk and kk[1]:
+                mg = {x["date"]: x for x in b}
+                for x in kk[1]:
+                    if start <= x["date"] <= d:
+                        mg[x["date"]] = x
+                b = [mg[k] for k in sorted(mg)]
+            b = [x for x in b if x["date"] <= d]
+            if not b or b[-1]["date"] != d or len(b) < 41:
+                rows.append({"종목": nm, "오류": f"{d} 일봉 없음 (마지막 {b[-1]['date'] if b else '-'})"})
+                continue
+            t = len(b) - 1
+            C = [x["close"] for x in b]; H = [x["high"] for x in b]; O = [x["open"] for x in b]
+            A = [(x.get("amount") or 0) or x["close"] * x["volume"] for x in b]
+            CHG = [0.0] + [(C[j] / C[j - 1] - 1) * 100 if C[j - 1] else 0.0 for j in range(1, len(b))]
+            OCHG = [(C[j] / O[j] - 1) * 100 if O[j] else 0.0 for j in range(len(b))]
+            m5 = sum(C[t - 4:t + 1]) / 5
+            up = max(CHG[t - 25:t + 1])
+            j5 = max(A[t - 4:t + 1]) / 1e8
+            k40 = max(A[t - 39:t + 1]) / 1e8
+            f = {
+                "A 1봉전 5이평↓": C[t - 1] < C[t - 6],
+                "B 종가>전일종가": C[t] > C[t - 1],
+                "C 종가>전일시가": C[t] > O[t - 1],
+                "D/H 26봉 급등": up >= d_pct,
+                "E 3봉전 5이평↓": C[t - 3] < C[t - 8],
+                "F 3봉내 시가대비3%": max(OCHG[t - 2:t + 1]) >= 3,
+                "G 3봉내 전일대비3%": max(CHG[t - 2:t + 1]) >= 3,
+                "I 종가>5이평": C[t] > m5,
+                "J 5봉 거래대금": j5 >= j_eok,
+                "K 40봉 거래대금": k40 >= k_eok,
+                "L 종가>전일고가": C[t] > H[t - 1],
+                "M 양봉": C[t] > O[t],
+                "N 고가 3봉 신고가": H[t] >= max(H[t - 2:t + 1]),
+            }
+            today = f["A 1봉전 5이평↓"] and (f["B 종가>전일종가"] or f["C 종가>전일시가"]) and f["D/H 26봉 급등"]
+            cont = f["E 3봉전 5이평↓"] and (f["F 3봉내 시가대비3%"] or f["G 3봉내 전일대비3%"]) and f["D/H 26봉 급등"]
+            core = (today or cont) and f["I 종가>5이평"] and f["J 5봉 거래대금"] and f["K 40봉 거래대금"]
+            blocked = []
+            if not (today or cont):
+                blocked.append("경로(A·B·C 오늘곰발 / E·F·G 연속곰발)" + ("" if f["D/H 26봉 급등"] else " + D/H"))
+            for k in ("I 종가>5이평", "J 5봉 거래대금", "K 40봉 거래대금"):
+                if not f[k]:
+                    blocked.append(k)
+            rows.append({"종목": nm, "코드": code, "출처": "키움 정규장" if (kk and kk[1]) else "한투(밤엔 애프터 섞일 수 있음)",
+                         "등락%": round(CHG[t], 2), "종가": C[t],
+                         "곰발통합(○)": "O" if core and f["N 고가 3봉 신고가"] else "X",
+                         "곰발(●)": "O" if core and f["L 종가>전일고가"] and f["M 양봉"] else "X",
+                         "경로": "오늘곰발" if today else ("연속곰발" if cont else "-"),
+                         "막힌조건": " · ".join(blocked) or ("N" if not f["N 고가 3봉 신고가"] else "-"),
+                         **{k: ("O" if v else "X") for k, v in f.items()},
+                         "26봉최대등락%": round(up, 1), "5봉최대대금억": round(j5, 1), "40봉최대대금억": round(k40, 1),
+                         "이격도%": round(C[t] / m5 * 100, 1), "윗꼬리%": round((H[t] / max(C[t], O[t]) - 1) * 100, 2)})
+        except Exception as e:
+            rows.append({"종목": nm, "오류": str(e)[:120]})
+    tally = {}
+    for r in rows:
+        for k, v in r.items():
+            if v == "X" and k[:1] in "ABCDEFGIJKLMN" and " " in k:
+                tally[k] = tally.get(k, 0) + 1
+    return {"ok": True, "date": d, "기준": {"J억": j_eok, "K억": k_eok, "D%": d_pct}, "조건별X개수": tally,
+            "rows": rows, "못찾은종목": unresolved}
+
+
 @app.get("/api/gom-debug-multi")
 def gom_debug_multi(codes: str = "", date: str = "", names: str = "", market: str = "J"):
     """🐻 곰발 연구 — 여러 종목 한 번에 (한 줄씩 요약).
