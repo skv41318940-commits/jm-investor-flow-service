@@ -13010,6 +13010,98 @@ def gom_base(names: str = "파두,우리로,케이씨텍,테크윙,코리아써�
             "설명": "어제종가가 사부님 값과 같은 칸 = 사부님이 쓰는 시세" + ("" if pc else " ⚠️ PC 꺼짐 — 키움 일봉 못 받음")}
 
 
+# 🔬 사부님 흰색 vs 우리만 잡은 종목 — 일봉 지표로 둘을 가르는 '조건 X' 찾기 (2026-11-12)
+GOM_DIFF_A = ("고영,금호건설,네오셈,대덕전자,대한광통신,덕산넵코어스,브이엠,비아트론,산일전기,삼성전자우,삼현,성호전자,심텍,양지사,"
+              "이수스페셜티케미컬,이수페타시스,인텔리빅스,일진전기,지니언스,컨텍,케이씨텍,코리아써키트,티에스이,한빛레이저,"
+              "효성중공업,AP위성,HD현대일렉트릭,LS ELECTRIC,RF머트리얼즈,SK")
+GOM_DIFF_B = ("저스템,매드업,제이앤티씨,티엘비,한라캐스트,하이브,코스맥스,영광,삼양식품,큐리옥스바이오시스템즈,한선엔지니어링,SFA반도체,"
+              "RFHIC,삼성전자,서진시스템,가온전선,비에이치,와이씨,세미파이브,대한전선,두산에너빌리티,필옵틱스,SK하이닉스,삼천당제약,"
+              "동진쎄미켐,한국콜마,이오테크닉스,켄코아에어로스페이스,아모텍,유진테크,대원전선,원익홀딩스,한국화장품제조,에이비엘바이오,"
+              "스카이랩스,실리콘투,달바글로벌")
+
+
+def _gom_diff_feats(b: list, t: int) -> dict:
+    C = [x["close"] for x in b]; H = [x["high"] for x in b]; L = [x["low"] for x in b]
+    def ma(n, k=0):
+        e = t - k + 1
+        return sum(C[e - n:e]) / n if e - n >= 0 else None
+    def pct(a, c):
+        return round((a / c - 1) * 100, 1) if (a and c) else None
+    f = {}
+    for n in (5, 20, 60, 120):
+        m = ma(n)
+        f[f"종가/{n}이평%"] = pct(C[t], m)
+    for n in (20, 60):
+        m0, m5 = ma(n), ma(n, 5)
+        f[f"{n}이평 5일기울기%"] = pct(m0, m5)
+    for n in (20, 60, 120):
+        if t - n >= 0:
+            f[f"종가/{n}일고가%(오늘제외)"] = pct(C[t], max(H[t - n:t]))
+            f[f"종가/{n}일저가%"] = pct(C[t], min(L[t - n:t]))
+    for n in (5, 20, 60, 120):
+        if t - n >= 0:
+            f[f"{n}일 수익률%"] = pct(C[t], C[t - n])
+    f["오늘 등락%"] = pct(C[t], C[t - 1])
+    f["1봉전까지 5일 수익률%"] = pct(C[t - 1], C[t - 6]) if t >= 6 else None
+    m5, m20, m60 = ma(5), ma(20), ma(60)
+    f["정배열(5>20>60)"] = 1 if (m5 and m20 and m60 and m5 > m20 > m60) else 0
+    f["20>60이평"] = 1 if (m20 and m60 and m20 > m60) else 0
+    return f
+
+
+@app.get("/api/gom-diff")
+def gom_diff(a: str = GOM_DIFF_A, b: str = GOM_DIFF_B, date: str = ""):
+    """🔬 A(사부님 흰색) vs B(우리만 잡은 종목) 일봉 지표 비교 — 지표마다 둘을 가장 잘 가르는 기준값과 정확도"""
+    d = (date or now_kst().strftime("%Y-%m-%d"))[:10]
+    start = (datetime.strptime(d, "%Y-%m-%d") - timedelta(days=300)).strftime("%Y-%m-%d")
+    groups, rows, miss = {"A": [], "B": []}, [], []
+    for g, names in (("A", a), ("B", b)):
+        nm_list = [x.strip() for x in names.split(",") if x.strip()]
+        for i in range(0, len(nm_list), 40):
+            lst, un = _gom_resolve(",".join(nm_list[i:i + 40]))
+            miss += un
+            for code in lst:
+                try:
+                    bars = [x for x in _kis_daily_candles(code, start, d) if x["date"] <= d]
+                    if not bars or bars[-1]["date"] != d or len(bars) < 30:
+                        miss.append(f"{code}(일봉부족)")
+                        continue
+                    nm = code
+                    try:
+                        r = supabase.table("stock_fundamentals").select("name").eq("code", code).limit(1).execute().data
+                        nm = r[0]["name"] if r else code
+                    except Exception:
+                        pass
+                    f = _gom_diff_feats(bars, len(bars) - 1)
+                    groups[g].append(f)
+                    rows.append({"그룹": "A 사부님흰색" if g == "A" else "B 우리만", "종목": nm, **f})
+                except Exception as e:
+                    miss.append(f"{code}({str(e)[:40]})")
+    ranks = []
+    keys = sorted({k for f in groups["A"] + groups["B"] for k in f})
+    for k in keys:
+        va = [f[k] for f in groups["A"] if f.get(k) is not None]
+        vb = [f[k] for f in groups["B"] if f.get(k) is not None]
+        if len(va) < 5 or len(vb) < 5:
+            continue
+        best = None
+        for th in sorted(set(va + vb)):
+            for side in (">=", "<="):
+                pa = sum((v >= th) if side == ">=" else (v <= th) for v in va) / len(va)
+                pb = sum((v >= th) if side == ">=" else (v <= th) for v in vb) / len(vb)
+                score = (pa + (1 - pb)) / 2
+                if not best or score > best[0]:
+                    best = (score, th, side, pa, pb)
+        sa, sb = sorted(va), sorted(vb)
+        ranks.append({"지표": k, "가르는 정확도%": round(best[0] * 100), "기준": f"A면 {best[2]} {best[1]}",
+                      "A 통과%": round(best[3] * 100), "B 통과%": round(best[4] * 100),
+                      "A 중간값": sa[len(sa) // 2], "B 중간값": sb[len(sb) // 2]})
+    ranks.sort(key=lambda r: -r["가르는 정확도%"])
+    return {"ok": True, "date": d, "A개수": len(groups["A"]), "B개수": len(groups["B"]), "못찾음": miss,
+            "지표 순위": ranks, "종목별": rows,
+            "설명": "가르는 정확도 = (A 중 기준 통과 비율 + B 중 기준 탈락 비율) ÷ 2. 높을수록 사부님 흰색과 우리만 잡은 종목을 잘 가름"}
+
+
 @app.get("/api/gom-validate")
 def gom_validate(src: str = "krx", tong: int = 0, shift: int = 0):
     """🐻 사부님 5일치 마감 53개로 곰발 변형별 재현율 비교 — src: krx(정규장) · al(통합) · nx(NXT)"""
