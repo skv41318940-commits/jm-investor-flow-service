@@ -13111,6 +13111,146 @@ def gom_diff(a: str = GOM_DIFF_A, b: str = GOM_DIFF_B, date: str = ""):
             "설명": "가르는 정확도 = (A 중 기준 통과 비율 + B 중 기준 탈락 비율) ÷ 2. 높을수록 사부님 흰색과 우리만 잡은 종목을 잘 가름"}
 
 
+# ⏱ 사부님 목록(흰+회) vs 우리만 잡은 종목 — 오늘 3분봉으로 '분봉 조건 X' 찾기 (2026-11-12)
+GOM_MIN_A = ("금호건설,대덕전자,산일전기,삼성전자우,이수스페셜티케미컬,이수페타시스,일진전기,케이씨텍,코리아써키트,효성중공업,"
+             "HD현대일렉트릭,LS ELECTRIC,SK,고영,네오셈,대한광통신,덕산넵코어스,브이엠,비아트론,삼현,성호전자,심텍,양지사,"
+             "인텔리빅스,지니언스,컨텍,티에스이,한빛레이저,AP위성,RF머트리얼즈,"
+             "천일고속,금호전기,포스코퓨처엠,LS,삼성SDI,한국항공우주,동양고속,현대글로비스,LIG디펜스앤에어로스페이스,"
+             "우리로,리노공업,빛과전자,서산,펩트론,로보티즈,녹십자엠에스,파수AI,레인보우로보틱스,파두,피앤에스로보틱스")
+GOM_MIN_WHITE = set(GOM_MIN_A.split(",")[:30])
+GOM_MIN_B = ("가온전선,현대건설,대한전선,삼양식품,현대제철,POSCO홀딩스,삼성전자,KBI동양철관,HD한국조선해양,삼성중공업,현대모비스,"
+             "삼성E&A,삼성물산,팬오션,삼성생명,두산에너빌리티,한화오션,포스코인터내셔널,LG화학,현대로템,한국금융지주,HD현대마린엔진,GS,"
+             "비에이치,코스맥스,삼성바이오로직스,크래프톤,HD현대,한화시스템,HD현대중공업,하이브,LG에너지솔루션,DL이앤씨,HD현대마린솔루션,"
+             "삼천당제약,와이즈플래닛컴퍼니,매드업,삼익제약,네오사피엔스,KBI메탈,우리기술,SFA반도체,우리기술투자,비츠로테크,안랩,"
+             "케이엔더블유,케이씨에스,한라캐스트,코칩,아톤,서진시스템,페니트리움바이오,미투온,제이앤티씨,RFHIC,올릭스,와이씨,"
+             "라온로보틱스,센서뷰,루닛,스피어,티엘비,레메디,샌즈랩,저스템,큐리옥스바이오시스템즈,한선엔지니어링,오름테라퓨틱,노타,에스투더블유")
+
+
+def _gom_min_feats(rows: list, d: str) -> dict:
+    """오늘 정규장(09:00~15:30) 3분봉에서 분봉 후보 지표 계산 — 앞쪽 봉은 이평·볼린저 계산용"""
+    ymd = d.replace("-", "")
+    T = [r[0] for r in rows]; O = [r[1] for r in rows]; H = [r[2] for r in rows]; C = [r[4] for r in rows]; V = [r[5] for r in rows]
+    idx = [i for i, t in enumerate(T) if t[:8] == ymd and "0900" <= t[8:12] <= "1530"]
+    if not idx:
+        return {}
+    prev = [i for i, t in enumerate(T) if t[:8] < ymd and "0900" <= t[8:12] <= "1530"]
+    pc = C[prev[-1]] if prev else None
+    i0 = idx[0]
+    def ma(n, i):
+        return sum(C[i - n + 1:i + 1]) / n if i - n + 1 >= 0 else None
+    def bb_up(n, i):
+        if i - n + 1 < 0:
+            return None
+        w = C[i - n + 1:i + 1]; m = sum(w) / n
+        sd = (sum((x - m) ** 2 for x in w) / n) ** 0.5
+        return m + 2 * sd
+    f = {}
+    hi = max(H[i] for i in idx)
+    if pc:
+        f["오늘 최고 등락%"] = round((hi / pc - 1) * 100, 1)
+        f["시가갭%"] = round((O[i0] / pc - 1) * 100, 1)
+        f["10시까지 최고 등락%"] = round((max(H[i] for i in idx if T[i][8:12] <= "1000") / pc - 1) * 100, 1)
+    f["3분 1봉 최대상승%"] = round(max((C[i] / C[i - 1] - 1) * 100 for i in idx if i > 0), 1)
+    f["3분 1봉 최대거래대금억"] = round(max(C[i] * V[i] for i in idx) / 1e8, 1)
+    gaps, above, gap520, bb300, bb20, pc40, up300 = [], 0, [], 0, 0, 0, []
+    for i in idx:
+        m20, m5 = ma(20, i), ma(5, i)
+        if m20:
+            gaps.append((C[i] / m20 - 1) * 100)
+            above += C[i] > m20
+            if m5:
+                gap520.append(abs(m5 / m20 - 1) * 100)
+        u = bb_up(300, i)
+        if u:
+            bb300 = max(bb300, 1 if C[i] > u else 0)
+            up300.append((C[i] / u - 1) * 100)
+        u2 = bb_up(20, i)
+        if u2 and C[i] > u2:
+            bb20 = 1
+        if i >= 40 and C[i] > max(H[i - 40:i]):
+            pc40 = 1
+    if gaps:
+        f["3분 20이평 최대이격%"] = round(max(gaps), 1)
+        f["3분 20이평 위 비율%"] = round(above / len(gaps) * 100)
+    if gap520:
+        f["3분 5·20 최대벌어짐%"] = round(max(gap520), 1)
+    f["3분 볼린저300 상한돌파"] = bb300
+    if up300:
+        f["3분 볼린저300 상한 최대거리%"] = round(max(up300), 1)
+    f["3분 볼린저20 상한돌파"] = bb20
+    f["3분 PC40 상한돌파"] = pc40
+    f["마감/오늘고가%"] = round((C[idx[-1]] / hi - 1) * 100, 1)
+    return f
+
+
+@app.get("/api/gom-minute")
+def gom_minute(a: str = GOM_MIN_A, b: str = GOM_MIN_B, date: str = "", refresh: int = 0):
+    """⏱ 3분봉 후보 지표로 A(사부님 목록 흰+회) vs B(우리만) 가르기. 처음 열면 PC에 3분봉을 맡기고, 1~3분 뒤 새로고침하면 결과"""
+    d = (date or now_kst().strftime("%Y-%m-%d"))[:10]
+    group, miss = {}, []
+    for g, names in (("A", a), ("B", b)):
+        nm_list = [x.strip() for x in names.split(",") if x.strip()]
+        for i in range(0, len(nm_list), 40):
+            lst, un = _gom_resolve(",".join(nm_list[i:i + 40]))
+            miss += un
+            for code in lst:
+                group[code] = g
+    codes = list(group)
+    need = [c for c in codes if refresh or c not in _min_store]
+    if need:
+        if not _pc_alive():
+            return {"ok": False, "상태": "PC 꺼짐 — 키움 3분봉을 못 받아요", "필요종목": len(need)}
+        fresh = [c for c in need if time.time() - _min_asked.get(c, 0) > 300]
+        with _bpc_lock:
+            for i in range(0, len(fresh), 30):
+                _bpc["tasks"].append({"kind": "minute", "codes": fresh[i:i + 30], "tick": "3"})
+        for c in fresh:
+            _min_asked[c] = time.time()
+        return {"ok": False, "상태": "⏱ PC가 3분봉 받는 중", "받은종목": len(codes) - len(need), "전체": len(codes),
+                "안내": "1~3분 뒤 같은 링크를 새로고침하세요 (refresh 빼고)"}
+    names = {}
+    try:
+        r = supabase.table("stock_fundamentals").select("code,name").in_("code", codes).execute().data
+        names = {x["code"]: x["name"] for x in r}
+    except Exception:
+        pass
+    feats = {"A": [], "B": []}
+    rows = []
+    for code in codes:
+        f = _gom_min_feats(_min_store[code][1], d)
+        if not f:
+            miss.append(f"{code}(오늘 3분봉 없음)")
+            continue
+        g = group[code]
+        nm = names.get(code, code)
+        feats[g].append(f)
+        tag = "A 사부님 흰색" if (g == "A" and nm in GOM_MIN_WHITE) else ("A 사부님 회색" if g == "A" else "B 우리만")
+        rows.append({"그룹": tag, "종목": nm, **f})
+    ranks = []
+    keys = sorted({k for f in feats["A"] + feats["B"] for k in f})
+    for k in keys:
+        va = [f[k] for f in feats["A"] if f.get(k) is not None]
+        vb = [f[k] for f in feats["B"] if f.get(k) is not None]
+        if len(va) < 5 or len(vb) < 5:
+            continue
+        best = None
+        for th in sorted(set(va + vb)):
+            for side in (">=", "<="):
+                pa = sum((v >= th) if side == ">=" else (v <= th) for v in va) / len(va)
+                pb = sum((v >= th) if side == ">=" else (v <= th) for v in vb) / len(vb)
+                sc = (pa + (1 - pb)) / 2
+                if not best or sc > best[0]:
+                    best = (sc, th, side, pa, pb)
+        sa, sb = sorted(va), sorted(vb)
+        ranks.append({"지표": k, "가르는 정확도%": round(best[0] * 100), "기준": f"사부님쪽이면 {best[2]} {best[1]}",
+                      "사부님 통과%": round(best[3] * 100), "우리만 통과%": round(best[4] * 100),
+                      "사부님 중간값": sa[len(sa) // 2], "우리만 중간값": sb[len(sb) // 2]})
+    ranks.sort(key=lambda r: -r["가르는 정확도%"])
+    return {"ok": True, "date": d, "사부님쪽": len(feats["A"]), "우리만": len(feats["B"]), "못찾음": miss,
+            "지표 순위": ranks, "종목별": sorted(rows, key=lambda r: r["그룹"]),
+            "설명": "오늘 정규장 3분봉 기준. 사부님 통과%는 높고 우리만 통과%는 낮을수록 좋은 거름망"}
+
+
 @app.get("/api/gom-validate")
 def gom_validate(src: str = "krx", tong: int = 0, shift: int = 0):
     """🐻 사부님 5일치 마감 53개로 곰발 변형별 재현율 비교 — src: krx(정규장) · al(통합) · nx(NXT)"""
@@ -14552,6 +14692,8 @@ def _run_broker_pc_daily():
 # 🟢 키움 통합 일봉 (PC 켜져 있을 때) — 사부님 곰발 ● 은 통합(KRX+NXT) 캔들 기준 (11/5 JM 발견)
 _kw_daily: dict = {}   # 통합: code → (받은 시각, [{date, open, high, low, close, volume, amount}])
 _kk_daily: dict = {}   # KRX 정규장만 (키움, 종목코드 그대로)
+_min_store: dict = {}  # ⏱ 3분봉: code → (받은 시각, [[YYYYMMDDHHMM, 시, 고, 저, 종, 량], ...])
+_min_asked: dict = {}  # code → 마지막으로 PC에 맡긴 시각
 _nx_daily: dict = {}   # NXT만 (키움, 종목코드_NX) — 2026-11-12 기준가 비교용
 _SRC_SUFFIX = {"krx": "", "al": "_AL", "nx": "_NX"}
 _SRC_LABEL = {"krx": "키움 KRX 정규장", "al": "키움 통합(KRX+NXT)", "nx": "키움 NXT"}
@@ -14585,6 +14727,12 @@ def _kiwoom_daily_al(codes: list, wait: int = 90, krx_only: bool = False, suffix
 @app.post("/api/pc-task/result")
 def pc_task_result(payload: dict):
     kind = payload.get("kind") or "unknown"
+    if kind == "minute":  # ⏱ 3분봉 보관 (2026-11-12) — 큰 데이터라 결과 기록엔 개수만
+        for code, rows in (payload.get("data") or {}).items():
+            if rows:
+                _min_store[code] = (time.time(), rows)
+        payload = {k: v for k, v in payload.items() if k != "data"}
+        payload["받은종목"] = len(_min_store)
     _pc_task_results[kind] = {**payload, "got": time.time()}
     if kind == "daily_al":  # 🟢 키움 일봉 보관 — 통합(_AL) / KRX 정규장("") (2026-11-05)
         store = _daily_store(payload.get("suffix", "_AL"))
