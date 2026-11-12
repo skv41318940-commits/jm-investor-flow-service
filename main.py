@@ -13006,7 +13006,7 @@ def gom_base(names: str = "파두,우리로,케이씨텍,테크윙,코리아써�
 
 
 @app.get("/api/gom-validate")
-def gom_validate(src: str = "krx", tong: int = 0):
+def gom_validate(src: str = "krx", tong: int = 0, shift: int = 0):
     """🐻 사부님 5일치 마감 53개로 곰발 변형별 재현율 비교 — src: krx(정규장) · al(통합) · nx(NXT)"""
     src = "al" if tong else (src if src in _SRC_SUFFIX else "krx")
     sfx = _SRC_SUFFIX[src]
@@ -13057,6 +13057,10 @@ def gom_validate(src: str = "krx", tong: int = 0):
                 bars_cache[code] = b
             b = bars_cache[code]
             idx = next((i for i, x in enumerate(b) if x["date"] == d), None)
+            if idx is not None:
+                idx += shift  # 🔀 2026-11-12 JM 발견: 사부님 d일 목록 vs 우리 식 d+shift일 계산 (하루 밀림 확인용)
+                if idx >= len(b):
+                    idx = None
             if idx is None or idx < 45:
                 nodata.append(f"{d} {nm}(일봉 없음)")
                 continue
@@ -13083,7 +13087,7 @@ def gom_validate(src: str = "krx", tong: int = 0):
             "어제 윗꼬리 30%↑": sum(1 for f in feats if f["어제 윗꼬리%"] >= 30),
             "어제 거래량 5일평균 미만": sum(1 for f in feats if (f["어제 거래량/5일평균"] or 0) < 1),
             "5봉내 데드크로스 있음": sum(1 for f in feats if f["5봉내 데드크로스"] != "X")}
-    return {"ok": True, "출처": _SRC_LABEL[src], "종목수": total, "데이터없음": nodata, "결과": res, "어제캔들_요약": summ, "어제캔들": feats,
+    return {"ok": True, "출처": _SRC_LABEL[src], "shift": f"사부님 d일 목록 ↔ 우리 식 d{shift:+d}일" if shift else "같은 날", "종목수": total, "데이터없음": nodata, "결과": res, "어제캔들_요약": summ, "어제캔들": feats,
             "설명": "통합(○)=곰발 통합 · 곰발(●) · 기본(N전)=마무리 조건 빼고 A~K만. 사부님 마감 종목을 몇 개 잡나(재현율)"}
 
 
