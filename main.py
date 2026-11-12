@@ -12781,14 +12781,14 @@ def _gom_resolve(names: str, codes: str = "") -> tuple:
 
 @app.get("/api/gom-check")
 def gom_check(names: str = "", codes: str = "", date: str = "", j_eok: float = 50, k_eok: float = 500, d_pct: float = 8,
-              premarket: bool = False):
+              premarket: bool = False, tong: bool = False):
     """🐻 곰발 확정식 A~N 조건별 체크 (2026-11-11) — 사부님 목록과 비교용. 키움 정규장 일봉 기준.
     예: /api/gom-check?names=이수페타시스,원익IPS   (date 생략 = 오늘)
         j_eok·k_eok·d_pct 로 J(5봉 거래대금)·K(40봉 거래대금)·D/H(26봉 급등%) 기준을 바꿔서 시험 가능"""
     d = (date or now_kst().strftime("%Y-%m-%d"))[:10]
     lst, unresolved = _gom_resolve(names, codes)
     try:
-        _kiwoom_daily_al(lst, krx_only=True)
+        _kiwoom_daily_al(lst, krx_only=not tong)  # 🌙 tong=1: 애프터마켓까지 포함한 일봉 (사부님 '어제 종가' 기준과 같음, 2026-11-12)
     except Exception:
         pass
     rows = []
@@ -12802,7 +12802,7 @@ def gom_check(names: str = "", codes: str = "", date: str = "", j_eok: float = 5
             pass
         try:
             b = _kis_daily_candles(code, start, d)
-            kk = _kk_daily.get(code)
+            kk = (_kw_daily if tong else _kk_daily).get(code)
             if kk and kk[1]:
                 mg = {x["date"]: x for x in b}
                 for x in kk[1]:
@@ -12851,7 +12851,7 @@ def gom_check(names: str = "", codes: str = "", date: str = "", j_eok: float = 5
             for k in ("I 종가>5이평", "J 5봉 거래대금", "K 40봉 거래대금"):
                 if not f[k]:
                     blocked.append(k)
-            rows.append({"종목": nm, "코드": code, "출처": "키움 정규장" if (kk and kk[1]) else "한투(밤엔 애프터 섞일 수 있음)",
+            rows.append({"종목": nm, "코드": code, "출처": ("키움 통합(애프터 포함)" if tong else "키움 정규장") if (kk and kk[1]) else "한투(밤엔 애프터 섞일 수 있음)",
                          "등락%": round(CHG[t], 2), "종가": C[t],
                          "곰발통합(○)": "O" if core and f["N 고가 3봉 신고가"] else "X",
                          "곰발(●)": "O" if core and f["L 종가>전일고가"] and f["M 양봉"] else "X",
@@ -12949,7 +12949,7 @@ def _gom_flags(b: list, t: int, a_win: int = 1, i_ge: bool = False, j_eok: float
 
 
 @app.get("/api/gom-validate")
-def gom_validate():
+def gom_validate(tong: bool = False):
     """🐻 사부님 5일치 마감 53개로 곰발 변형별 재현율 비교 (키움 정규장 일봉)"""
     allnames = sorted({n for v in MASTER_GOM_5D.values() for n in v})
     name_of = {}
@@ -12958,7 +12958,7 @@ def gom_validate():
         if c:
             name_of[nm] = c[0]
     try:
-        _kiwoom_daily_al(list(name_of.values()), krx_only=True)
+        _kiwoom_daily_al(list(name_of.values()), krx_only=not tong)
     except Exception:
         pass
     variants = {
@@ -12987,7 +12987,7 @@ def gom_validate():
             if code not in bars_cache:
                 start = (datetime.strptime("2026-11-02", "%Y-%m-%d") - timedelta(days=200)).strftime("%Y-%m-%d")
                 b = _kis_daily_candles(code, start, now_kst().strftime("%Y-%m-%d"))
-                kk = _kk_daily.get(code)
+                kk = (_kw_daily if tong else _kk_daily).get(code)
                 if kk and kk[1]:
                     mg = {x["date"]: x for x in b}
                     for x in kk[1]:
