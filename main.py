@@ -12781,14 +12781,17 @@ def _gom_resolve(names: str, codes: str = "") -> tuple:
 
 @app.get("/api/gom-check")
 def gom_check(names: str = "", codes: str = "", date: str = "", j_eok: float = 50, k_eok: float = 500, d_pct: float = 8,
-              premarket: bool = False, tong: bool = False):
+              premarket: bool = False, src: str = "krx", tong: int = 0):
     """🐻 곰발 확정식 A~N 조건별 체크 (2026-11-11) — 사부님 목록과 비교용. 키움 정규장 일봉 기준.
     예: /api/gom-check?names=이수페타시스,원익IPS   (date 생략 = 오늘)
         j_eok·k_eok·d_pct 로 J(5봉 거래대금)·K(40봉 거래대금)·D/H(26봉 급등%) 기준을 바꿔서 시험 가능"""
     d = (date or now_kst().strftime("%Y-%m-%d"))[:10]
     lst, unresolved = _gom_resolve(names, codes)
+    src = "al" if tong else (src if src in _SRC_SUFFIX else "krx")  # 📏 기준가 출처 (2026-11-12): krx · al(통합) · nx
+    sfx = _SRC_SUFFIX[src]
+    store = _daily_store(sfx)
     try:
-        _kiwoom_daily_al(lst, krx_only=not tong)  # 🌙 tong=1: 애프터마켓까지 포함한 일봉 (사부님 '어제 종가' 기준과 같음, 2026-11-12)
+        _kiwoom_daily_al(lst, suffix=sfx)
     except Exception:
         pass
     rows = []
@@ -12802,7 +12805,7 @@ def gom_check(names: str = "", codes: str = "", date: str = "", j_eok: float = 5
             pass
         try:
             b = _kis_daily_candles(code, start, d)
-            kk = (_kw_daily if tong else _kk_daily).get(code)
+            kk = store.get(code)
             if kk and kk[1]:
                 mg = {x["date"]: x for x in b}
                 for x in kk[1]:
@@ -12851,7 +12854,7 @@ def gom_check(names: str = "", codes: str = "", date: str = "", j_eok: float = 5
             for k in ("I 종가>5이평", "J 5봉 거래대금", "K 40봉 거래대금"):
                 if not f[k]:
                     blocked.append(k)
-            rows.append({"종목": nm, "코드": code, "출처": ("키움 통합(애프터 포함)" if tong else "키움 정규장") if (kk and kk[1]) else "한투(밤엔 애프터 섞일 수 있음)",
+            rows.append({"종목": nm, "코드": code, "출처": _SRC_LABEL[src] if (kk and kk[1]) else "한투 KRX(키움 못 받음)",
                          "등락%": round(CHG[t], 2), "종가": C[t],
                          "곰발통합(○)": "O" if core and f["N 고가 3봉 신고가"] else "X",
                          "곰발(●)": "O" if core and f["L 종가>전일고가"] and f["M 양봉"] else "X",
@@ -12948,9 +12951,66 @@ def _gom_flags(b: list, t: int, a_win: int = 1, i_ge: bool = False, j_eok: float
     return {"core": core, "tong": core and H[t] >= max(H[t - 2:t + 1]), "gom": core and C[t] > H[t - 1] and C[t] > O[t]}
 
 
+# 📏 사부님 목록에서 읽은 '어제 종가' (11/12 화면 기준, 11/11 종가) — 어느 시세가 맞는지 대조용
+MASTER_PREV_CLOSE = {"2026-11-12": {"파두": 36300, "우리로": 6850, "케이씨텍": 73400, "테크윙": 38800, "코리아써키트": 86400}}
+
+
+@app.get("/api/gom-base")
+def gom_base(names: str = "파두,우리로,케이씨텍,테크윙,코리아써키트", date: str = ""):
+    """📏 기준가 대조 (2026-11-12): 같은 종목의 어제 봉을 KRX 정규장 · 통합 · NXT 세 가지로 받아 나란히 보여줌
+    → 사부님 '어제 종가'가 어느 시세와 같은지 확인. 예: /api/gom-base?names=파두,우리로"""
+    d = (date or now_kst().strftime("%Y-%m-%d"))[:10]
+    lst, unresolved = _gom_resolve(names, "")
+    got = {}
+    for key, sfx in _SRC_SUFFIX.items():
+        try:
+            got[key] = _kiwoom_daily_al(lst, wait=60, suffix=sfx)
+        except Exception:
+            got[key] = {}
+    known = MASTER_PREV_CLOSE.get(d, {})
+    rows, hit = [], {k: 0 for k in _SRC_SUFFIX}
+    for code in lst:
+        nm = code
+        try:
+            r = supabase.table("stock_fundamentals").select("name").eq("code", code).limit(1).execute().data
+            nm = r[0]["name"] if r else code
+        except Exception:
+            pass
+        row = {"종목": nm, "코드": code}
+        m = known.get(nm)
+        if m:
+            row["사부님 어제종가"] = m
+        for key in _SRC_SUFFIX:
+            b = [x for x in (got.get(key, {}).get(code) or []) if x["date"] <= d]
+            lab = {"krx": "KRX", "al": "통합", "nx": "NXT"}[key]
+            if len(b) < 2:
+                row[f"{lab} 어제종가"] = "-"
+                continue
+            y, t = (b[-2], b[-1]) if b[-1]["date"] == d else (b[-1], None)
+            row[f"{lab} 어제({y['date'][5:]}) 시가·고가·종가"] = f"{y['open']:,} · {y['high']:,} · {y['close']:,}"
+            row[f"{lab} 어제종가"] = y["close"]
+            if t:
+                row[f"{lab} 오늘종가"] = t["close"]
+            if m and y["close"] == m:
+                hit[key] += 1
+                row.setdefault("일치", [])
+                row["일치"].append(lab)
+        if m and "일치" not in row:
+            row["일치"] = "없음"
+        rows.append(row)
+    pc = _pc_alive()
+    return {"ok": True, "date": d, "PC연결": pc,
+            "사부님과_일치_개수": {"KRX 정규장": hit["krx"], "통합": hit["al"], "NXT": hit["nx"], "비교 종목": len([r for r in rows if "사부님 어제종가" in r])},
+            "rows": rows, "못찾은종목": unresolved,
+            "설명": "어제종가가 사부님 값과 같은 칸 = 사부님이 쓰는 시세" + ("" if pc else " ⚠️ PC 꺼짐 — 키움 일봉 못 받음")}
+
+
 @app.get("/api/gom-validate")
-def gom_validate(tong: bool = False):
-    """🐻 사부님 5일치 마감 53개로 곰발 변형별 재현율 비교 (키움 정규장 일봉)"""
+def gom_validate(src: str = "krx", tong: int = 0):
+    """🐻 사부님 5일치 마감 53개로 곰발 변형별 재현율 비교 — src: krx(정규장) · al(통합) · nx(NXT)"""
+    src = "al" if tong else (src if src in _SRC_SUFFIX else "krx")
+    sfx = _SRC_SUFFIX[src]
+    store = _daily_store(sfx)
     allnames = sorted({n for v in MASTER_GOM_5D.values() for n in v})
     name_of = {}
     for nm in allnames:
@@ -12958,7 +13018,7 @@ def gom_validate(tong: bool = False):
         if c:
             name_of[nm] = c[0]
     try:
-        _kiwoom_daily_al(list(name_of.values()), krx_only=not tong)
+        _kiwoom_daily_al(list(name_of.values()), suffix=sfx)
     except Exception:
         pass
     variants = {
@@ -12987,7 +13047,7 @@ def gom_validate(tong: bool = False):
             if code not in bars_cache:
                 start = (datetime.strptime("2026-11-02", "%Y-%m-%d") - timedelta(days=200)).strftime("%Y-%m-%d")
                 b = _kis_daily_candles(code, start, now_kst().strftime("%Y-%m-%d"))
-                kk = (_kw_daily if tong else _kk_daily).get(code)
+                kk = store.get(code)
                 if kk and kk[1]:
                     mg = {x["date"]: x for x in b}
                     for x in kk[1]:
@@ -13023,7 +13083,7 @@ def gom_validate(tong: bool = False):
             "어제 윗꼬리 30%↑": sum(1 for f in feats if f["어제 윗꼬리%"] >= 30),
             "어제 거래량 5일평균 미만": sum(1 for f in feats if (f["어제 거래량/5일평균"] or 0) < 1),
             "5봉내 데드크로스 있음": sum(1 for f in feats if f["5봉내 데드크로스"] != "X")}
-    return {"ok": True, "종목수": total, "데이터없음": nodata, "결과": res, "어제캔들_요약": summ, "어제캔들": feats,
+    return {"ok": True, "출처": _SRC_LABEL[src], "종목수": total, "데이터없음": nodata, "결과": res, "어제캔들_요약": summ, "어제캔들": feats,
             "설명": "통합(○)=곰발 통합 · 곰발(●) · 기본(N전)=마무리 조건 빼고 A~K만. 사부님 마감 종목을 몇 개 잡나(재현율)"}
 
 
@@ -14355,21 +14415,31 @@ def _run_broker_pc_daily():
 # 🟢 키움 통합 일봉 (PC 켜져 있을 때) — 사부님 곰발 ● 은 통합(KRX+NXT) 캔들 기준 (11/5 JM 발견)
 _kw_daily: dict = {}   # 통합: code → (받은 시각, [{date, open, high, low, close, volume, amount}])
 _kk_daily: dict = {}   # KRX 정규장만 (키움, 종목코드 그대로)
+_nx_daily: dict = {}   # NXT만 (키움, 종목코드_NX) — 2026-11-12 기준가 비교용
+_SRC_SUFFIX = {"krx": "", "al": "_AL", "nx": "_NX"}
+_SRC_LABEL = {"krx": "키움 KRX 정규장", "al": "키움 통합(KRX+NXT)", "nx": "키움 NXT"}
 
 
-def _kiwoom_daily_al(codes: list, wait: int = 90, krx_only: bool = False) -> dict:
-    """PC(키움)에 일봉을 맡기고 기다림 (krx_only=True면 정규장만). PC가 꺼져 있으면 빈 값 → 한투로 대체"""
-    store = _kk_daily if krx_only else _kw_daily
+def _daily_store(suffix: str) -> dict:
+    return _kk_daily if suffix == "" else (_nx_daily if suffix == "_NX" else _kw_daily)
+
+
+def _kiwoom_daily_al(codes: list, wait: int = 90, krx_only: bool = False, suffix: str = None) -> dict:
+    """PC(키움)에 일봉을 맡기고 기다림. suffix: "" KRX 정규장 · "_AL" 통합 · "_NX" NXT (없으면 krx_only로 결정)
+    PC가 꺼져 있으면 빈 값 → 한투로 대체"""
+    if suffix is None:
+        suffix = "" if krx_only else "_AL"
+    store = _daily_store(suffix)
     need = [c for c in codes if not store.get(c) or time.time() - store[c][0] > 600]
     if need:
         if time.time() - _bpc["alive_at"] > 30:
             return {}
         asked = time.time()
         with _bpc_lock:
-            _bpc["tasks"].append({"kind": "daily_al", "codes": need, "suffix": "" if krx_only else "_AL"})
+            _bpc["tasks"].append({"kind": "daily_al", "codes": need, "suffix": suffix})
         while time.time() - asked < wait:
             r = _pc_task_results.get("daily_al")
-            if r and r.get("got", 0) > asked:
+            if r and r.get("got", 0) > asked and r.get("suffix", "_AL") == suffix:
                 break
             time.sleep(1)
     return {c: store[c][1] for c in codes if store.get(c)}
@@ -14380,7 +14450,7 @@ def pc_task_result(payload: dict):
     kind = payload.get("kind") or "unknown"
     _pc_task_results[kind] = {**payload, "got": time.time()}
     if kind == "daily_al":  # 🟢 키움 일봉 보관 — 통합(_AL) / KRX 정규장("") (2026-11-05)
-        store = _kk_daily if payload.get("suffix") == "" else _kw_daily
+        store = _daily_store(payload.get("suffix", "_AL"))
         for code, rows in (payload.get("data") or {}).items():
             if rows:
                 store[code] = (time.time(), sorted(rows, key=lambda x: x["date"]))
