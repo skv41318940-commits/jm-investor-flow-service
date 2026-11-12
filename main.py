@@ -12932,7 +12932,7 @@ def _dc5_ago(b: list, t: int, win: int = 5):
 
 
 def _gom_flags(b: list, t: int, a_win: int = 1, i_ge: bool = False, j_eok: float = 50, k_eok: float = 500, d_pct: float = 8,
-               dc: str = "", simple: bool = False, hts: bool = False, hts_k: float = 0, hts_j: float = 0, hts_i: bool = False, low20: float = None, prev5: float = None, day_min: float = None, ma5_min: float = None, hi_min: float = None, vol_max: float = None, dd_n: int = 0, dd_max: float = None, body_max: float = None, dd_req: float = None, bleed: tuple = None, ret5_min: float = None, ma10_up: bool = False, ma20_gap: float = None, poke_n: int = 0, poke_rej: bool = False, rev: str = "", jm2: bool = False) -> dict:
+               dc: str = "", simple: bool = False, hts: bool = False, hts_k: float = 0, hts_j: float = 0, hts_i: bool = False, low20: float = None, prev5: float = None, day_min: float = None, ma5_min: float = None, hi_min: float = None, vol_max: float = None, dd_n: int = 0, dd_max: float = None, body_max: float = None, dd_req: float = None, bleed: tuple = None, ret5_min: float = None, ma10_up: bool = False, ma20_gap: float = None, poke_n: int = 0, poke_rej: bool = False, rev: str = "", jm2: bool = False, fg: float = 3, r_down: bool = False) -> dict:
     """곰발 확정식 A~N (변형 옵션: A를 1~a_win봉전 중 하락 1회 · I를 ≥ 로 · dc=데드크로스 replace|and|or)"""
     C = [x["close"] for x in b]; H = [x["high"] for x in b]; O = [x["open"] for x in b]
     A = [(x.get("amount") or 0) or x["close"] * x["volume"] for x in b]
@@ -12945,7 +12945,7 @@ def _gom_flags(b: list, t: int, a_win: int = 1, i_ge: bool = False, j_eok: float
         d_ok = _dc5_ago(b, t) is not None
         a_ok = d_ok if dc == "replace" else (a_ok and d_ok) if dc == "and" else (a_ok or d_ok)
     today = a_ok and (C[t] > C[t - 1] or C[t] > O[t - 1]) and up >= d_pct
-    cont = C[t - 3] < C[t - 8] and (max(OCHG(j) for j in range(t - 2, t + 1)) >= 3 or max(CHG(j) for j in range(t - 2, t + 1)) >= 3) and up >= d_pct
+    cont = C[t - 3] < C[t - 8] and (max(OCHG(j) for j in range(t - 2, t + 1)) >= fg or max(CHG(j) for j in range(t - 2, t + 1)) >= fg) and up >= d_pct  # fg: F·G 기준 (기본 3%)
     i_ok = C[t] >= m5 if i_ge else C[t] > m5
     if simple:  # 🧪 사부님식 추정 (2026-11-12): 5봉내 데드크로스(눌림) + 오늘 5이평 위(회복) + 급등 이력 + 거래대금 — A·B·C·E·F·G 없이
         today = cont = (_dc5_ago(b, t) is not None) and up >= d_pct
@@ -12972,6 +12972,8 @@ def _gom_flags(b: list, t: int, a_win: int = 1, i_ge: bool = False, j_eok: float
                 core = core and _poke()
             if rev:
                 core = core and _rev()
+        if r_down:  # R: 1봉전 종가 > 0봉전 종가 (오늘 하락 마감)
+            core = core and C[t - 1] > C[t]
         if low20 is not None:  # 🔬 하방 컷: 종가가 20일 저가(오늘 제외)보다 low20% 이상 위 (2026-11-12 gom-diff)
             L = [x["low"] for x in b]
             core = core and C[t] >= min(L[t - 20:t]) * (1 + low20 / 100)
@@ -13393,6 +13395,10 @@ def gom_validate(src: str = "krx", tong: int = 0, shift: int = 0):
         "T2 N10 + 5일수익률 ≥ 2%": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, ret5_min=2),
         "T3 N10 + 10이평 위 & 상승": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, ma10_up=True),
         "T4 N10 + 종가/20이평 ≥ -10%": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, ma20_gap=-10),
+        "S ★나의곰발 최종 (N10 + S 오늘 고가>5이평)": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, poke_n=1),
+        "Z1 JM 좁힘: F·G 5% + P 1% + S": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=1, poke_n=1, fg=5),
+        "Z2 F·G 5% + P 3% + S": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, poke_n=1, fg=5),
+        "Z3 F·G 5% + R(오늘 하락) + S": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, poke_n=1, fg=5, r_down=True),
         "J1 N10 + 3봉내 고가가 5이평 찌름": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, poke_n=3),
         "J2 N10 + 5봉내 고가가 5이평 찌름": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, poke_n=5),
         "J3 N10 + 5봉내 찌르고 실패(고가≥5이평>종가)": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, poke_n=5, poke_rej=True),
