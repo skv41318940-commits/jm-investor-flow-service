@@ -12857,6 +12857,7 @@ def gom_check(names: str = "", codes: str = "", date: str = "", j_eok: float = 5
             rows.append({"종목": nm, "코드": code, "출처": _SRC_LABEL[src] if (kk and kk[1]) else "한투 KRX(키움 못 받음)",
                          "등락%": round(CHG[t], 2), "종가": C[t],
                          "HTS곰발통합(실제식)": "O" if (today or cont) else "X",
+                         "HTS실제식+K": "O" if ((today or cont) and f["K 40봉 거래대금"]) else "X",
                          "곰발통합(○)": "O" if core and f["N 고가 3봉 신고가"] else "X",
                          "곰발(●)": "O" if core and f["L 종가>전일고가"] and f["M 양봉"] else "X",
                          "곰발?(HTS식)": "O" if core and f["M 5봉내 데드크로스"] else "X",
@@ -12931,7 +12932,7 @@ def _dc5_ago(b: list, t: int, win: int = 5):
 
 
 def _gom_flags(b: list, t: int, a_win: int = 1, i_ge: bool = False, j_eok: float = 50, k_eok: float = 500, d_pct: float = 8,
-               dc: str = "", simple: bool = False, hts: bool = False) -> dict:
+               dc: str = "", simple: bool = False, hts: bool = False, hts_k: float = 0, hts_j: float = 0, hts_i: bool = False) -> dict:
     """곰발 확정식 A~N (변형 옵션: A를 1~a_win봉전 중 하락 1회 · I를 ≥ 로 · dc=데드크로스 replace|and|or)"""
     C = [x["close"] for x in b]; H = [x["high"] for x in b]; O = [x["open"] for x in b]
     A = [(x.get("amount") or 0) or x["close"] * x["volume"] for x in b]
@@ -12949,7 +12950,7 @@ def _gom_flags(b: list, t: int, a_win: int = 1, i_ge: bool = False, j_eok: float
     if simple:  # 🧪 사부님식 추정 (2026-11-12): 5봉내 데드크로스(눌림) + 오늘 5이평 위(회복) + 급등 이력 + 거래대금 — A·B·C·E·F·G 없이
         today = cont = (_dc5_ago(b, t) is not None) and up >= d_pct
     if hts:  # 🐻 HTS '곰발 통합' 실제 조건식 그대로 (2026-11-12): (A and (B or C) and D) or (E and (F or G) and H) — I·J·K·L은 체크만 되고 식에 없음
-        core = today or cont
+        core = (today or cont) and max(A[t - 39:t + 1]) >= hts_k * 1e8 and max(A[t - 4:t + 1]) >= hts_j * 1e8 and (i_ok or not hts_i)  # hts_i: I 5이평 시험 · hts_k·hts_j: 거래대금 거름망 시험용 (0 = 없음)
         return {"core": core, "tong": core, "gom": core}
     core = (today or cont) and i_ok and max(A[t - 4:t + 1]) >= j_eok * 1e8 and max(A[t - 39:t + 1]) >= k_eok * 1e8
     return {"core": core, "tong": core and H[t] >= max(H[t - 2:t + 1]), "gom": core and C[t] > H[t - 1] and C[t] > O[t]}
@@ -13031,6 +13032,11 @@ def gom_validate(src: str = "krx", tong: int = 0, shift: int = 0):
         "H2 HTS + D 5%": dict(hts=True, d_pct=5),
         "H3 HTS + D 4.5%": dict(hts=True, d_pct=4.5),
         "H4 HTS + D 4%": dict(hts=True, d_pct=4),
+        "H5 H3 + K 40봉 500억": dict(hts=True, d_pct=4.5, hts_k=500),
+        "H6 H3 + K 500억 + J 10억": dict(hts=True, d_pct=4.5, hts_k=500, hts_j=10),
+        "H7 H3 + K 300억": dict(hts=True, d_pct=4.5, hts_k=300),
+        "H8 H3 + I 종가>5이평": dict(hts=True, d_pct=4.5, hts_i=True),
+        "H9 H3 + I 종가≥5이평": dict(hts=True, d_pct=4.5, hts_i=True, i_ge=True),
         "V0 지금 (J50·A1봉전)": dict(),
         "V1 J10억": dict(j_eok=10),
         "V2 J10억 + A 1~2봉전": dict(j_eok=10, a_win=2),
