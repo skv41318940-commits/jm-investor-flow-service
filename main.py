@@ -12932,7 +12932,7 @@ def _dc5_ago(b: list, t: int, win: int = 5):
 
 
 def _gom_flags(b: list, t: int, a_win: int = 1, i_ge: bool = False, j_eok: float = 50, k_eok: float = 500, d_pct: float = 8,
-               dc: str = "", simple: bool = False, hts: bool = False, hts_k: float = 0, hts_j: float = 0, hts_i: bool = False, low20: float = None, prev5: float = None, day_min: float = None, ma5_min: float = None, hi_min: float = None, vol_max: float = None) -> dict:
+               dc: str = "", simple: bool = False, hts: bool = False, hts_k: float = 0, hts_j: float = 0, hts_i: bool = False, low20: float = None, prev5: float = None, day_min: float = None, ma5_min: float = None, hi_min: float = None, vol_max: float = None, dd_n: int = 0, dd_max: float = None, body_max: float = None) -> dict:
     """곰발 확정식 A~N (변형 옵션: A를 1~a_win봉전 중 하락 1회 · I를 ≥ 로 · dc=데드크로스 replace|and|or)"""
     C = [x["close"] for x in b]; H = [x["high"] for x in b]; O = [x["open"] for x in b]
     A = [(x.get("amount") or 0) or x["close"] * x["volume"] for x in b]
@@ -12954,6 +12954,11 @@ def _gom_flags(b: list, t: int, a_win: int = 1, i_ge: bool = False, j_eok: float
         if low20 is not None:  # 🔬 하방 컷: 종가가 20일 저가(오늘 제외)보다 low20% 이상 위 (2026-11-12 gom-diff)
             L = [x["low"] for x in b]
             core = core and C[t] >= min(L[t - 20:t]) * (1 + low20 / 100)
+        if dd_n and dd_max is not None:  # 📉 최근 dd_n봉(오늘 제외) 안에 dd_max% 넘게 빠진 날이 없어야 (장대음봉 컷, 2026-11-12 JM)
+            core = core and min((C[j] / C[j - 1] - 1) * 100 for j in range(t - dd_n, t)) > -dd_max
+        if dd_n and body_max is not None:  # 📉 최근 dd_n봉 안에 음봉 몸통이 body_max% 넘는 날 없어야
+            Oo = [x["open"] for x in b]
+            core = core and max(((Oo[j] - C[j]) / C[j - 1] * 100 if Oo[j] > C[j] else 0) for j in range(t - dd_n, t)) <= body_max
         if vol_max is not None:  # 📦 오늘 거래량이 5일 평균의 vol_max배 이하 (거래 폭발 종목 제외 가설, 2026-11-12 JM)
             Vv = [x.get("volume") or 0 for x in b]
             v5 = sum(Vv[t - 5:t]) / 5
@@ -13057,6 +13062,18 @@ def _gom_diff_feats(b: list, t: int) -> dict:
         if t - n >= 0:
             f[f"{n}일 수익률%"] = pct(C[t], C[t - n])
     f["오늘 등락%"] = pct(C[t], C[t - 1])
+    O_ = [x["open"] for x in b]
+    chg = lambda j: (C[j] / C[j - 1] - 1) * 100 if C[j - 1] else 0.0
+    body_dn = lambda j: (O_[j] - C[j]) / C[j - 1] * 100 if (C[j - 1] and O_[j] > C[j]) else 0.0
+    for n in (5, 10, 20):
+        if t - n >= 1:
+            f[f"{n}봉내 최대 하락일%"] = round(min(chg(j) for j in range(t - n, t)), 1)
+            f[f"{n}봉내 최대 음봉몸통%"] = round(max(body_dn(j) for j in range(t - n, t)), 1)
+    k = 0
+    while t - 1 - k >= 1 and C[t - 1 - k] < C[t - 2 - k]:
+        k += 1
+    f["어제까지 연속 하락일"] = k
+    f["5일전→어제 수익률%"] = pct(C[t - 1], C[t - 6]) if t >= 6 else None
     V = [x.get("volume") or 0 for x in b]
     A_ = [(x.get("amount") or 0) or x["close"] * (x.get("volume") or 0) for x in b]
     if t >= 20:
@@ -13318,6 +13335,11 @@ def gom_validate(src: str = "krx", tong: int = 0, shift: int = 0):
         "V13 N10 + 거래량 ≤ 3배": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, vol_max=3),
         "V14 N10 + 거래량 ≤ 2배": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, vol_max=2),
         "V15 N10 + 거래량 ≤ 1.5배": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, vol_max=1.5),
+        "D1 N10 + 5봉내 -5% 넘는 날 없음": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, dd_n=5, dd_max=5),
+        "D2 N10 + 5봉내 -7% 넘는 날 없음": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, dd_n=5, dd_max=7),
+        "D3 N10 + 10봉내 -7% 넘는 날 없음": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, dd_n=10, dd_max=7),
+        "D4 N10 + 10봉내 -10% 넘는 날 없음": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, dd_n=10, dd_max=10),
+        "D5 N10 + 5봉내 음봉몸통 ≤ 5%": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, dd_n=5, body_max=5),
         "V0 지금 (J50·A1봉전)": dict(),
         "V1 J10억": dict(j_eok=10),
         "V2 J10억 + A 1~2봉전": dict(j_eok=10, a_win=2),
