@@ -12932,7 +12932,7 @@ def _dc5_ago(b: list, t: int, win: int = 5):
 
 
 def _gom_flags(b: list, t: int, a_win: int = 1, i_ge: bool = False, j_eok: float = 50, k_eok: float = 500, d_pct: float = 8,
-               dc: str = "", simple: bool = False, hts: bool = False, hts_k: float = 0, hts_j: float = 0, hts_i: bool = False, low20: float = None, prev5: float = None) -> dict:
+               dc: str = "", simple: bool = False, hts: bool = False, hts_k: float = 0, hts_j: float = 0, hts_i: bool = False, low20: float = None, prev5: float = None, day_min: float = None) -> dict:
     """곰발 확정식 A~N (변형 옵션: A를 1~a_win봉전 중 하락 1회 · I를 ≥ 로 · dc=데드크로스 replace|and|or)"""
     C = [x["close"] for x in b]; H = [x["high"] for x in b]; O = [x["open"] for x in b]
     A = [(x.get("amount") or 0) or x["close"] * x["volume"] for x in b]
@@ -12954,6 +12954,8 @@ def _gom_flags(b: list, t: int, a_win: int = 1, i_ge: bool = False, j_eok: float
         if low20 is not None:  # 🔬 하방 컷: 종가가 20일 저가(오늘 제외)보다 low20% 이상 위 (2026-11-12 gom-diff)
             L = [x["low"] for x in b]
             core = core and C[t] >= min(L[t - 20:t]) * (1 + low20 / 100)
+        if day_min is not None:  # 🔬 오늘 등락률 하한 (폭락 종목 컷)
+            core = core and (C[t] / C[t - 1] - 1) * 100 >= day_min
         if prev5 is not None:  # 🔬 이미 오름 컷: 어제까지 5일 수익률 ≤ prev5%
             core = core and (C[t - 1] / C[t - 6] - 1) * 100 <= prev5
         return {"core": core, "tong": core, "gom": core}
@@ -13142,6 +13144,11 @@ def gom_validate(src: str = "krx", tong: int = 0, shift: int = 0):
         "H15 H5 + 20일저가 +3%↑": dict(hts=True, d_pct=4.5, hts_k=500, low20=3),
         "H16 H5 + 20일저가 +5%↑": dict(hts=True, d_pct=4.5, hts_k=500, low20=5),
         "H17 H5 + 어제까지5일 ≤10%": dict(hts=True, d_pct=4.5, hts_k=500, prev5=10),
+        "N0 나의곰발 (H5 + 신저가컷 3%)": dict(hts=True, d_pct=4.5, hts_k=500, low20=3),
+        "N1 N0 + 오늘 등락 ≥ -2%": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-2),
+        "N2 N0 + 오늘 등락 ≥ 0%": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=0),
+        "N3 N0 + K 700억": dict(hts=True, d_pct=4.5, hts_k=700, low20=3),
+        "N4 N0 + K 1000억": dict(hts=True, d_pct=4.5, hts_k=1000, low20=3),
         "V0 지금 (J50·A1봉전)": dict(),
         "V1 J10억": dict(j_eok=10),
         "V2 J10억 + A 1~2봉전": dict(j_eok=10, a_win=2),
