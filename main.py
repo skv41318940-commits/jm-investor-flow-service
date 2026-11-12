@@ -13105,6 +13105,12 @@ def _gom_diff_feats(b: list, t: int) -> dict:
         if t - n >= 1:
             f[f"{n}봉내 최대 하락일%"] = round(min(chg(j) for j in range(t - n, t)), 1)
             f[f"{n}봉내 최대 음봉몸통%"] = round(max(body_dn(j) for j in range(t - n, t)), 1)
+    H_ = [x["high"] for x in b]
+    m5j = lambda j, last=None: (sum(C[j - 4:j]) + (C[j] if last is None else last)) / 5
+    for n in (1, 3, 5):  # 🐻 JM 가설①: 최근 n봉 안에 고가가 5이평 찌름
+        f[f"{n}봉내 고가 5이평 찌름"] = int(any(H_[j] >= m5j(j) for j in range(t - n + 1, t + 1)))
+    f["오늘 고가/5이평%"] = round((H_[t] / m5j(t, H_[t]) - 1) * 100, 1)
+    f["5이평 0봉 상승반전(고가)"] = int(m5j(t, H_[t]) > m5j(t - 1) and m5j(t - 1) < m5j(t - 2))
     k = 0
     while t - 1 - k >= 1 and C[t - 1 - k] < C[t - 2 - k]:
         k += 1
