@@ -12932,7 +12932,7 @@ def _dc5_ago(b: list, t: int, win: int = 5):
 
 
 def _gom_flags(b: list, t: int, a_win: int = 1, i_ge: bool = False, j_eok: float = 50, k_eok: float = 500, d_pct: float = 8,
-               dc: str = "", simple: bool = False, hts: bool = False, hts_k: float = 0, hts_j: float = 0, hts_i: bool = False, low20: float = None, prev5: float = None, day_min: float = None, ma5_min: float = None, hi_min: float = None, vol_max: float = None, dd_n: int = 0, dd_max: float = None, body_max: float = None) -> dict:
+               dc: str = "", simple: bool = False, hts: bool = False, hts_k: float = 0, hts_j: float = 0, hts_i: bool = False, low20: float = None, prev5: float = None, day_min: float = None, ma5_min: float = None, hi_min: float = None, vol_max: float = None, dd_n: int = 0, dd_max: float = None, body_max: float = None, dd_req: float = None) -> dict:
     """곰발 확정식 A~N (변형 옵션: A를 1~a_win봉전 중 하락 1회 · I를 ≥ 로 · dc=데드크로스 replace|and|or)"""
     C = [x["close"] for x in b]; H = [x["high"] for x in b]; O = [x["open"] for x in b]
     A = [(x.get("amount") or 0) or x["close"] * x["volume"] for x in b]
@@ -12956,6 +12956,8 @@ def _gom_flags(b: list, t: int, a_win: int = 1, i_ge: bool = False, j_eok: float
             core = core and C[t] >= min(L[t - 20:t]) * (1 + low20 / 100)
         if dd_n and dd_max is not None:  # 📉 최근 dd_n봉(오늘 제외) 안에 dd_max% 넘게 빠진 날이 없어야 (장대음봉 컷, 2026-11-12 JM)
             core = core and min((C[j] / C[j - 1] - 1) * 100 for j in range(t - dd_n, t)) > -dd_max
+        if dd_n and dd_req is not None:  # 📉 반대로: 최근 dd_n봉 안에 dd_req% 이상 '급락한 날이 있어야' (흔들고 반등 = 곰발바닥)
+            core = core and min((C[j] / C[j - 1] - 1) * 100 for j in range(t - dd_n, t)) <= -dd_req
         if dd_n and body_max is not None:  # 📉 최근 dd_n봉 안에 음봉 몸통이 body_max% 넘는 날 없어야
             Oo = [x["open"] for x in b]
             core = core and max(((Oo[j] - C[j]) / C[j - 1] * 100 if Oo[j] > C[j] else 0) for j in range(t - dd_n, t)) <= body_max
@@ -13340,6 +13342,10 @@ def gom_validate(src: str = "krx", tong: int = 0, shift: int = 0):
         "D3 N10 + 10봉내 -7% 넘는 날 없음": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, dd_n=10, dd_max=7),
         "D4 N10 + 10봉내 -10% 넘는 날 없음": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, dd_n=10, dd_max=10),
         "D5 N10 + 5봉내 음봉몸통 ≤ 5%": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, dd_n=5, body_max=5),
+        "R1 N10 + 10봉내 -4% 급락 있음": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, dd_n=10, dd_req=4),
+        "R2 N10 + 10봉내 -5% 급락 있음": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, dd_n=10, dd_req=5),
+        "R3 N10 + 10봉내 -6% 급락 있음": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, dd_n=10, dd_req=6),
+        "R4 N10 + 20봉내 -5% 급락 있음": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, dd_n=20, dd_req=5),
         "V0 지금 (J50·A1봉전)": dict(),
         "V1 J10억": dict(j_eok=10),
         "V2 J10억 + A 1~2봉전": dict(j_eok=10, a_win=2),
