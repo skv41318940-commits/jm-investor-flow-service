@@ -12856,6 +12856,7 @@ def gom_check(names: str = "", codes: str = "", date: str = "", j_eok: float = 5
                          "곰발통합(○)": "O" if core and f["N 고가 3봉 신고가"] else "X",
                          "곰발(●)": "O" if core and f["L 종가>전일고가"] and f["M 양봉"] else "X",
                          "곰발?(HTS식)": "O" if core and f["M 5봉내 데드크로스"] else "X",
+                         "사부님식추정(M·I·D·K)": "O" if (f["M 5봉내 데드크로스"] and C[t] >= m5 and f["D/H 26봉 급등"] and f["K 40봉 거래대금"]) else "X",
                          "경로": "오늘곰발" if today else ("연속곰발" if cont else "-"),
                          "막힌조건": " · ".join(blocked) or ("N" if not f["N 고가 3봉 신고가"] else "-"),
                          **{k: ("O" if v else "X") for k, v in f.items()},
@@ -12863,7 +12864,14 @@ def gom_check(names: str = "", codes: str = "", date: str = "", j_eok: float = 5
                          "이격도%": round(C[t] / m5 * 100, 1), "윗꼬리%": round((H[t] / max(C[t], O[t]) - 1) * 100, 2),
                          "5봉내 데드크로스": ("X" if _dc5_ago(b, t) is None else f"{_dc5_ago(b, t)}봉전"),
                          **_prev_candle(b, t),
-                         **{k.replace("어제", "그제"): v for k, v in _prev_candle(b, t - 1).items()}})
+                         **{k.replace("어제", "그제"): v for k, v in _prev_candle(b, t - 1).items()},
+                         # 📏 장중 '선' (2026-11-12) — 현재가가 이 선을 넘나드는 순간 목록에 들어오고 빠짐 → 캡처 가격과 맞춰보기
+                         "선_B 어제종가": C[t - 1], "선_C 어제시가": O[t - 1], "선_L 어제고가": H[t - 1],
+                         "선_I 5이평돌파가(직전4일평균)": round(sum(C[t - 4:t]) / 4),
+                         "선_N 직전2일 최고가": max(H[t - 2:t]), "오늘 고가": H[t],
+                         # ⭐ 가설(11/12 11:00): 오늘 5이평이 아직 '하락 중'이어야 함 → 현재가 < 5일 전 종가 (넘으면 5이평이 위로 꺾여서 빠짐)
+                         "선_U 5이평하락 상한(5일전종가)": C[t - 5],
+                         "0봉 5이평하락": "O" if C[t] < C[t - 5] else "X"})
         except Exception as e:
             rows.append({"종목": nm, "오류": str(e)[:120]})
     tally = {}
@@ -12919,7 +12927,7 @@ def _dc5_ago(b: list, t: int, win: int = 5):
 
 
 def _gom_flags(b: list, t: int, a_win: int = 1, i_ge: bool = False, j_eok: float = 50, k_eok: float = 500, d_pct: float = 8,
-               dc: str = "") -> dict:
+               dc: str = "", simple: bool = False) -> dict:
     """곰발 확정식 A~N (변형 옵션: A를 1~a_win봉전 중 하락 1회 · I를 ≥ 로 · dc=데드크로스 replace|and|or)"""
     C = [x["close"] for x in b]; H = [x["high"] for x in b]; O = [x["open"] for x in b]
     A = [(x.get("amount") or 0) or x["close"] * x["volume"] for x in b]
@@ -12934,6 +12942,8 @@ def _gom_flags(b: list, t: int, a_win: int = 1, i_ge: bool = False, j_eok: float
     today = a_ok and (C[t] > C[t - 1] or C[t] > O[t - 1]) and up >= d_pct
     cont = C[t - 3] < C[t - 8] and (max(OCHG(j) for j in range(t - 2, t + 1)) >= 3 or max(CHG(j) for j in range(t - 2, t + 1)) >= 3) and up >= d_pct
     i_ok = C[t] >= m5 if i_ge else C[t] > m5
+    if simple:  # 🧪 사부님식 추정 (2026-11-12): 5봉내 데드크로스(눌림) + 오늘 5이평 위(회복) + 급등 이력 + 거래대금 — A·B·C·E·F·G 없이
+        today = cont = (_dc5_ago(b, t) is not None) and up >= d_pct
     core = (today or cont) and i_ok and max(A[t - 4:t + 1]) >= j_eok * 1e8 and max(A[t - 39:t + 1]) >= k_eok * 1e8
     return {"core": core, "tong": core and H[t] >= max(H[t - 2:t + 1]), "gom": core and C[t] > H[t - 1] and C[t] > O[t]}
 
@@ -12961,6 +12971,9 @@ def gom_validate():
         "V6 A 대신 5봉내 데드크로스": dict(j_eok=10, i_ge=True, dc="replace"),
         "V7 A 또는 5봉내 데드크로스": dict(j_eok=10, i_ge=True, dc="or"),
         "V8 A 그리고 5봉내 데드크로스": dict(j_eok=10, i_ge=True, dc="and"),
+        "V9 사부님식 추정 (M·I·D·K만)": dict(j_eok=0, i_ge=True, simple=True),
+        "V10 V9 + J10억": dict(j_eok=10, i_ge=True, simple=True),
+        "V11 V9 + D 5%": dict(j_eok=0, i_ge=True, simple=True, d_pct=5),
     }
     bars_cache = {}
     res = {k: {"통합(○)": 0, "곰발(●)": 0, "기본(N전)": 0, "놓침(○)": []} for k in variants}
