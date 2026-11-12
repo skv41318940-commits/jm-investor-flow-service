@@ -12932,7 +12932,7 @@ def _dc5_ago(b: list, t: int, win: int = 5):
 
 
 def _gom_flags(b: list, t: int, a_win: int = 1, i_ge: bool = False, j_eok: float = 50, k_eok: float = 500, d_pct: float = 8,
-               dc: str = "", simple: bool = False, hts: bool = False, hts_k: float = 0, hts_j: float = 0, hts_i: bool = False, low20: float = None, prev5: float = None, day_min: float = None, ma5_min: float = None, hi_min: float = None, vol_max: float = None, dd_n: int = 0, dd_max: float = None, body_max: float = None, dd_req: float = None, bleed: tuple = None, ret5_min: float = None, ma10_up: bool = False, ma20_gap: float = None) -> dict:
+               dc: str = "", simple: bool = False, hts: bool = False, hts_k: float = 0, hts_j: float = 0, hts_i: bool = False, low20: float = None, prev5: float = None, day_min: float = None, ma5_min: float = None, hi_min: float = None, vol_max: float = None, dd_n: int = 0, dd_max: float = None, body_max: float = None, dd_req: float = None, bleed: tuple = None, ret5_min: float = None, ma10_up: bool = False, ma20_gap: float = None, poke_n: int = 0, poke_rej: bool = False, rev: str = "", jm2: bool = False) -> dict:
     """곰발 확정식 A~N (변형 옵션: A를 1~a_win봉전 중 하락 1회 · I를 ≥ 로 · dc=데드크로스 replace|and|or)"""
     C = [x["close"] for x in b]; H = [x["high"] for x in b]; O = [x["open"] for x in b]
     A = [(x.get("amount") or 0) or x["close"] * x["volume"] for x in b]
@@ -12951,6 +12951,27 @@ def _gom_flags(b: list, t: int, a_win: int = 1, i_ge: bool = False, j_eok: float
         today = cont = (_dc5_ago(b, t) is not None) and up >= d_pct
     if hts:  # 🐻 HTS '곰발 통합' 실제 조건식 그대로 (2026-11-12): (A and (B or C) and D) or (E and (F or G) and H) — I·J·K·L은 체크만 되고 식에 없음
         core = (today or cont) and max(A[t - 39:t + 1]) >= hts_k * 1e8 and max(A[t - 4:t + 1]) >= hts_j * 1e8 and (i_ok or not hts_i)  # hts_i: I 5이평 시험 · hts_k·hts_j: 거래대금 거름망 시험용 (0 = 없음)
+        # 🐻 JM 가설 2개 (2026-11-13): ① 최근 poke_n봉 안에 고가가 5이평을 찔렀다 ② 5이평 하락추세 → 0봉 상승반전
+        M5 = lambda j, last=None: (sum(C[j - 4:j]) + (C[j] if last is None else last)) / 5
+        def _poke():
+            for j in range(t - poke_n + 1, t + 1):
+                m = M5(j)
+                if H[j] >= m and (not poke_rej or C[j] < m):
+                    return True
+            return False
+        def _rev():
+            last = H[t] if rev == "hi" else None  # hi: 장중 고가로 한 번이라도 꺾였으면 (실시간 누적 기준)
+            m0, m1, m2 = M5(t, last), M5(t - 1), M5(t - 2)
+            if rev == "loose":
+                return m0 > m1 and min(M5(t - k) - M5(t - k - 1) for k in range(1, 4)) < 0
+            return m0 > m1 and m1 < m2
+        if jm2:  # 경로(A~H) 대신 JM 2핵심 + 급등이력 D + K
+            core = _rev() and (_poke() if poke_n else True) and up >= d_pct and max(A[t - 39:t + 1]) >= hts_k * 1e8
+        else:
+            if poke_n:
+                core = core and _poke()
+            if rev:
+                core = core and _rev()
         if low20 is not None:  # 🔬 하방 컷: 종가가 20일 저가(오늘 제외)보다 low20% 이상 위 (2026-11-12 gom-diff)
             L = [x["low"] for x in b]
             core = core and C[t] >= min(L[t - 20:t]) * (1 + low20 / 100)
@@ -13366,6 +13387,15 @@ def gom_validate(src: str = "krx", tong: int = 0, shift: int = 0):
         "T2 N10 + 5일수익률 ≥ 2%": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, ret5_min=2),
         "T3 N10 + 10이평 위 & 상승": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, ma10_up=True),
         "T4 N10 + 종가/20이평 ≥ -10%": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, ma20_gap=-10),
+        "J1 N10 + 3봉내 고가가 5이평 찌름": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, poke_n=3),
+        "J2 N10 + 5봉내 고가가 5이평 찌름": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, poke_n=5),
+        "J3 N10 + 5봉내 찌르고 실패(고가≥5이평>종가)": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, poke_n=5, poke_rej=True),
+        "J4 N10 + 5이평 0봉 상승반전(종가)": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, rev="close"),
+        "J5 N10 + 5이평 0봉 상승반전(장중고가)": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, rev="hi"),
+        "J6 N10 + 상승반전(고가) + 5봉 찌름": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, rev="hi", poke_n=5),
+        "X1 JM 2핵심만 (반전고가+5봉찌름+D4.5+K)": dict(hts=True, d_pct=4.5, hts_k=500, jm2=True, rev="hi", poke_n=5),
+        "X2 JM 2핵심만 (반전종가+5봉찌름+D4.5+K)": dict(hts=True, d_pct=4.5, hts_k=500, jm2=True, rev="close", poke_n=5),
+        "X3 JM 반전만 (반전고가+D4.5+K)": dict(hts=True, d_pct=4.5, hts_k=500, jm2=True, rev="hi"),
         "V0 지금 (J50·A1봉전)": dict(),
         "V1 J10억": dict(j_eok=10),
         "V2 J10억 + A 1~2봉전": dict(j_eok=10, a_win=2),
