@@ -12932,7 +12932,7 @@ def _dc5_ago(b: list, t: int, win: int = 5):
 
 
 def _gom_flags(b: list, t: int, a_win: int = 1, i_ge: bool = False, j_eok: float = 50, k_eok: float = 500, d_pct: float = 8,
-               dc: str = "", simple: bool = False, hts: bool = False, hts_k: float = 0, hts_j: float = 0, hts_i: bool = False, low20: float = None, prev5: float = None, day_min: float = None, ma5_min: float = None, hi_min: float = None) -> dict:
+               dc: str = "", simple: bool = False, hts: bool = False, hts_k: float = 0, hts_j: float = 0, hts_i: bool = False, low20: float = None, prev5: float = None, day_min: float = None, ma5_min: float = None, hi_min: float = None, vol_max: float = None) -> dict:
     """곰발 확정식 A~N (변형 옵션: A를 1~a_win봉전 중 하락 1회 · I를 ≥ 로 · dc=데드크로스 replace|and|or)"""
     C = [x["close"] for x in b]; H = [x["high"] for x in b]; O = [x["open"] for x in b]
     A = [(x.get("amount") or 0) or x["close"] * x["volume"] for x in b]
@@ -12954,6 +12954,10 @@ def _gom_flags(b: list, t: int, a_win: int = 1, i_ge: bool = False, j_eok: float
         if low20 is not None:  # 🔬 하방 컷: 종가가 20일 저가(오늘 제외)보다 low20% 이상 위 (2026-11-12 gom-diff)
             L = [x["low"] for x in b]
             core = core and C[t] >= min(L[t - 20:t]) * (1 + low20 / 100)
+        if vol_max is not None:  # 📦 오늘 거래량이 5일 평균의 vol_max배 이하 (거래 폭발 종목 제외 가설, 2026-11-12 JM)
+            Vv = [x.get("volume") or 0 for x in b]
+            v5 = sum(Vv[t - 5:t]) / 5
+            core = core and (not v5 or Vv[t] / v5 <= vol_max)
         if hi_min is not None:  # ⏱ 오늘 고가가 어제 종가보다 hi_min% 이상 (장중 한 번 넘으면 유지) — 2026-11-12 gom-minute
             core = core and (H[t] / C[t - 1] - 1) * 100 >= hi_min
         if ma5_min is not None:  # 🔬 종가가 5이평보다 ma5_min% 이상 위 (2026-11-12 gom-diff 2차 1위)
@@ -13053,6 +13057,16 @@ def _gom_diff_feats(b: list, t: int) -> dict:
         if t - n >= 0:
             f[f"{n}일 수익률%"] = pct(C[t], C[t - n])
     f["오늘 등락%"] = pct(C[t], C[t - 1])
+    V = [x.get("volume") or 0 for x in b]
+    A_ = [(x.get("amount") or 0) or x["close"] * (x.get("volume") or 0) for x in b]
+    if t >= 20:
+        v5 = sum(V[t - 5:t]) / 5
+        v20 = sum(V[t - 20:t]) / 20
+        a20 = sum(A_[t - 20:t]) / 20
+        f["오늘 거래량/5일평균 배"] = round(V[t] / v5, 2) if v5 else None
+        f["오늘 거래량/20일평균 배"] = round(V[t] / v20, 2) if v20 else None
+        f["오늘 거래대금/20일평균 배"] = round(A_[t] / a20, 2) if a20 else None
+        f["오늘 거래량/어제 배"] = round(V[t] / V[t - 1], 2) if V[t - 1] else None
     f["1봉전까지 5일 수익률%"] = pct(C[t - 1], C[t - 6]) if t >= 6 else None
     m5, m20, m60 = ma(5), ma(20), ma(60)
     f["정배열(5>20>60)"] = 1 if (m5 and m20 and m60 and m5 > m20 > m60) else 0
@@ -13300,6 +13314,10 @@ def gom_validate(src: str = "krx", tong: int = 0, shift: int = 0):
         "N9 N1 + 고가등락 ≥ 2%": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=2),
         "N10 N1 + 고가등락 ≥ 3%": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3),
         "N11 N1 + 고가등락 ≥ 4%": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=4),
+        "V12 N10 + 거래량 ≤ 5일평균 5배": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, vol_max=5),
+        "V13 N10 + 거래량 ≤ 3배": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, vol_max=3),
+        "V14 N10 + 거래량 ≤ 2배": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, vol_max=2),
+        "V15 N10 + 거래량 ≤ 1.5배": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, vol_max=1.5),
         "V0 지금 (J50·A1봉전)": dict(),
         "V1 J10억": dict(j_eok=10),
         "V2 J10억 + A 1~2봉전": dict(j_eok=10, a_win=2),
