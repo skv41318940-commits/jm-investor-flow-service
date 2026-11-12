@@ -12932,7 +12932,7 @@ def _dc5_ago(b: list, t: int, win: int = 5):
 
 
 def _gom_flags(b: list, t: int, a_win: int = 1, i_ge: bool = False, j_eok: float = 50, k_eok: float = 500, d_pct: float = 8,
-               dc: str = "", simple: bool = False, hts: bool = False, hts_k: float = 0, hts_j: float = 0, hts_i: bool = False) -> dict:
+               dc: str = "", simple: bool = False, hts: bool = False, hts_k: float = 0, hts_j: float = 0, hts_i: bool = False, low20: float = None, prev5: float = None) -> dict:
     """곰발 확정식 A~N (변형 옵션: A를 1~a_win봉전 중 하락 1회 · I를 ≥ 로 · dc=데드크로스 replace|and|or)"""
     C = [x["close"] for x in b]; H = [x["high"] for x in b]; O = [x["open"] for x in b]
     A = [(x.get("amount") or 0) or x["close"] * x["volume"] for x in b]
@@ -12951,6 +12951,11 @@ def _gom_flags(b: list, t: int, a_win: int = 1, i_ge: bool = False, j_eok: float
         today = cont = (_dc5_ago(b, t) is not None) and up >= d_pct
     if hts:  # 🐻 HTS '곰발 통합' 실제 조건식 그대로 (2026-11-12): (A and (B or C) and D) or (E and (F or G) and H) — I·J·K·L은 체크만 되고 식에 없음
         core = (today or cont) and max(A[t - 39:t + 1]) >= hts_k * 1e8 and max(A[t - 4:t + 1]) >= hts_j * 1e8 and (i_ok or not hts_i)  # hts_i: I 5이평 시험 · hts_k·hts_j: 거래대금 거름망 시험용 (0 = 없음)
+        if low20 is not None:  # 🔬 하방 컷: 종가가 20일 저가(오늘 제외)보다 low20% 이상 위 (2026-11-12 gom-diff)
+            L = [x["low"] for x in b]
+            core = core and C[t] >= min(L[t - 20:t]) * (1 + low20 / 100)
+        if prev5 is not None:  # 🔬 이미 오름 컷: 어제까지 5일 수익률 ≤ prev5%
+            core = core and (C[t - 1] / C[t - 6] - 1) * 100 <= prev5
         return {"core": core, "tong": core, "gom": core}
     core = (today or cont) and i_ok and max(A[t - 4:t + 1]) >= j_eok * 1e8 and max(A[t - 39:t + 1]) >= k_eok * 1e8
     return {"core": core, "tong": core and H[t] >= max(H[t - 2:t + 1]), "gom": core and C[t] > H[t - 1] and C[t] > O[t]}
@@ -13129,6 +13134,10 @@ def gom_validate(src: str = "krx", tong: int = 0, shift: int = 0):
         "H7 H3 + K 300억": dict(hts=True, d_pct=4.5, hts_k=300),
         "H8 H3 + I 종가>5이평": dict(hts=True, d_pct=4.5, hts_i=True),
         "H9 H3 + I 종가≥5이평": dict(hts=True, d_pct=4.5, hts_i=True, i_ge=True),
+        "H10 H5 + 20일저가 +10%↑": dict(hts=True, d_pct=4.5, hts_k=500, low20=10),
+        "H11 H5 + 어제까지5일 ≤3.4%": dict(hts=True, d_pct=4.5, hts_k=500, prev5=3.4),
+        "H12 H5 + 둘 다": dict(hts=True, d_pct=4.5, hts_k=500, low20=10, prev5=3.4),
+        "H13 H5 + 20일저가 +10% + 5일 ≤5%": dict(hts=True, d_pct=4.5, hts_k=500, low20=10, prev5=5),
         "V0 지금 (J50·A1봉전)": dict(),
         "V1 J10억": dict(j_eok=10),
         "V2 J10억 + A 1~2봉전": dict(j_eok=10, a_win=2),
