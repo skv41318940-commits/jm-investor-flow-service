@@ -12932,14 +12932,14 @@ def _dc5_ago(b: list, t: int, win: int = 5):
 
 
 def _gom_flags(b: list, t: int, a_win: int = 1, i_ge: bool = False, j_eok: float = 50, k_eok: float = 500, d_pct: float = 8,
-               dc: str = "", simple: bool = False, hts: bool = False, hts_k: float = 0, hts_j: float = 0, hts_i: bool = False, low20: float = None, prev5: float = None, day_min: float = None, ma5_min: float = None, hi_min: float = None, vol_max: float = None, dd_n: int = 0, dd_max: float = None, body_max: float = None, dd_req: float = None, bleed: tuple = None, ret5_min: float = None, ma10_up: bool = False, ma20_gap: float = None, poke_n: int = 0, poke_rej: bool = False, rev: str = "", jm2: bool = False, fg: float = 3, r_down: bool = False) -> dict:
+               dc: str = "", simple: bool = False, hts: bool = False, hts_k: float = 0, hts_j: float = 0, hts_i: bool = False, low20: float = None, prev5: float = None, day_min: float = None, ma5_min: float = None, hi_min: float = None, vol_max: float = None, dd_n: int = 0, dd_max: float = None, body_max: float = None, dd_req: float = None, bleed: tuple = None, ret5_min: float = None, ma10_up: bool = False, ma20_gap: float = None, poke_n: int = 0, poke_rej: bool = False, rev: str = "", jm2: bool = False, fg: float = 3, r_down: bool = False, hi5_prev: float = None, hi5_now: float = None, d_win: int = 26, d_open: bool = False) -> dict:
     """곰발 확정식 A~N (변형 옵션: A를 1~a_win봉전 중 하락 1회 · I를 ≥ 로 · dc=데드크로스 replace|and|or)"""
     C = [x["close"] for x in b]; H = [x["high"] for x in b]; O = [x["open"] for x in b]
     A = [(x.get("amount") or 0) or x["close"] * x["volume"] for x in b]
     CHG = lambda j: (C[j] / C[j - 1] - 1) * 100 if C[j - 1] else 0.0
     OCHG = lambda j: (C[j] / O[j] - 1) * 100 if O[j] else 0.0
     m5 = sum(C[t - 4:t + 1]) / 5
-    up = max(CHG(j) for j in range(t - 25, t + 1))
+    up = max((OCHG(j) if d_open else CHG(j)) for j in range(t - d_win + 1, t + 1))  # 🐻 JM(11/13): D·H 기간(d_win)·시가대비 양봉(d_open) 시험
     a_ok = any(C[t - k] < C[t - k - 5] for k in range(1, a_win + 1))
     if dc:
         d_ok = _dc5_ago(b, t) is not None
@@ -12972,6 +12972,10 @@ def _gom_flags(b: list, t: int, a_win: int = 1, i_ge: bool = False, j_eok: float
                 core = core and _poke()
             if rev:
                 core = core and _rev()
+        if hi5_prev is not None:  # 🎯 11/13 09:15 비교: 어제(1봉전) 고가가 어제 5이평보다 hi5_prev% 이상 위 (사부님 100% · 우리만 52%)
+            core = core and H[t - 1] >= M5(t - 1) * (1 + hi5_prev / 100)
+        if hi5_now is not None:  # 오늘(0봉) 고가가 오늘 5이평보다 hi5_now% 이상 위
+            core = core and H[t] >= M5(t) * (1 + hi5_now / 100)
         if r_down:  # R: 1봉전 종가 > 0봉전 종가 (오늘 하락 마감)
             core = core and C[t - 1] > C[t]
         if low20 is not None:  # 🔬 하방 컷: 종가가 20일 저가(오늘 제외)보다 low20% 이상 위 (2026-11-12 gom-diff)
@@ -13130,6 +13134,18 @@ def _gom_diff_feats(b: list, t: int) -> dict:
         f["오늘 거래량/어제 배"] = round(V[t] / V[t - 1], 2) if V[t - 1] else None
     f["1봉전까지 5일 수익률%"] = pct(C[t - 1], C[t - 6]) if t >= 6 else None
     m5, m20, m60 = ma(5), ma(20), ma(60)
+    # 🐻 JM(11/14): "하락하면서 20이평을 찔러줬던 종목은 노이즈가 아니다" — N봉 안에 고가가 그날 20이평 이상이었던 횟수
+    def m20j(j):
+        return sum(C[j - 19:j + 1]) / 20 if j - 19 >= 0 else None
+    down = 1 if (m60 and C[t] < m60) else 0
+    f["하락추세(종가<60이평)"] = down
+    for n in (26, 40):
+        if t - n + 1 >= 19:
+            cnt = sum(1 for j in range(t - n + 1, t + 1) if m20j(j) and H[j] >= m20j(j))
+            cnt_prev = sum(1 for j in range(t - n + 1, t) if m20j(j) and H[j] >= m20j(j))  # 오늘 제외
+            f[f"{n}봉내 고가 20이평 찌름 횟수"] = cnt
+            f[f"{n}봉내 20이평 찌름(오늘제외)"] = int(cnt_prev > 0)
+            f[f"JM {n}봉: 찌름 or 비하락"] = int(cnt_prev > 0 or not down)
     f["정배열(5>20>60)"] = 1 if (m5 and m20 and m60 and m5 > m20 > m60) else 0
     f["20>60이평"] = 1 if (m20 and m60 and m20 > m60) else 0
     return f
@@ -13396,6 +13412,16 @@ def gom_validate(src: str = "krx", tong: int = 0, shift: int = 0):
         "T3 N10 + 10이평 위 & 상승": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, ma10_up=True),
         "T4 N10 + 종가/20이평 ≥ -10%": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, ma20_gap=-10),
         "S ★나의곰발 최종 (N10 + S 오늘 고가>5이평)": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, poke_n=1),
+        "W1 JM: D·H 10봉내 5%": dict(hts=True, d_pct=5, d_win=10, hts_k=500, low20=3, day_min=-3, hi_min=3, poke_n=1),
+        "W2 JM: D·H 5봉내 5%": dict(hts=True, d_pct=5, d_win=5, hts_k=500, low20=3, day_min=-3, hi_min=3, poke_n=1),
+        "W3 JM: D·H 3봉내 5%": dict(hts=True, d_pct=5, d_win=3, hts_k=500, low20=3, day_min=-3, hi_min=3, poke_n=1),
+        "W4 JM: D·H 10봉내 시가대비 5% 양봉": dict(hts=True, d_pct=5, d_win=10, d_open=True, hts_k=500, low20=3, day_min=-3, hi_min=3, poke_n=1),
+        "W5 JM: D·H 10봉내 5% (P 없이)": dict(hts=True, d_pct=5, d_win=10, hts_k=500, low20=3, day_min=-3, poke_n=1),
+        "Y1 S★ + 어제 고가/5이평 ≥ 5.5%": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, poke_n=1, hi5_prev=5.5),
+        "Y2 S★ + 어제 고가/5이평 ≥ 3%": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, poke_n=1, hi5_prev=3),
+        "Y3 S★ + 오늘 고가/5이평 ≥ 5.5%": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, poke_n=1, hi5_now=5.5),
+        "Y4 S★ + 오늘 고가/5이평 ≥ 3%": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, poke_n=1, hi5_now=3),
+        "Y5 P없이: S + 오늘 고가/5이평 ≥ 5.5%": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, poke_n=1, hi5_now=5.5),
         "Z1 JM 좁힘: F·G 5% + P 1% + S": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=1, poke_n=1, fg=5),
         "Z2 F·G 5% + P 3% + S": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, hi_min=3, poke_n=1, fg=5),
         "Z3 F·G 5% + R(오늘 하락) + S": dict(hts=True, d_pct=4.5, hts_k=500, low20=3, day_min=-3, poke_n=1, fg=5, r_down=True),
