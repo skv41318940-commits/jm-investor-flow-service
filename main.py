@@ -13311,6 +13311,7 @@ def _disc_run(days_back: int, max_loss: int, steps: int):
         X = np.array([[r[k] for k in keys] for r in rows], dtype=float)
         y = np.array(labels, dtype=bool)
         dts = np.array([m[0] for m in meta])
+        _disc["data"] = (X, y, keys, dts, meta)
         _disc["progress"] = f"조건 찾는 중 (종목·날 {len(rows):,}개, 사부님 {int(y.sum())}개)"
 
         def day_table(mask):
@@ -13358,6 +13359,23 @@ def _disc_run(days_back: int, max_loss: int, steps: int):
             chosen.append({"조건": f"{k} {op} {th:g}", "키움 메뉴": _DISC_KIWOOM.get(k, k), "자른 종목": cut, "잃은 사부님": lost,
                            "남은 개수": int(keep.sum()), "사부님 재현": f"{int((keep & y).sum())}/{npos}"})
         lost_names = [f"{meta[i][0][5:]} {meta[i][2]}" for i in range(len(y)) if y[i] and not keep[i]]
+        # 🔭② 성과4에서 출발 → 사부님을 안 잃는 추가 컷만 쌓기
+        keep2, chosen2 = base4.copy(), []
+        for _ in range(6):
+            kp, kn, best = int((keep2 & y).sum()), int((keep2 & ~y).sum()), None
+            for k, op, th, m in cands:
+                nk = keep2 & m
+                lost = kp - int((nk & y).sum())
+                if lost > 0:
+                    continue
+                cut = kn - int((nk & ~y).sum())
+                if cut > 0 and (best is None or cut > best[0]):
+                    best = (cut, k, op, th, m)
+            if not best or best[0] < 3:
+                break
+            cut, k, op, th, m = best
+            keep2 = keep2 & m
+            chosen2.append({"조건": f"{k} {op} {th:g}", "자른 종목": cut, "남은 개수": int(keep2.sum()), "사부님 재현": f"{int((keep2 & y).sum())}/{npos}"})
         # 단일 지표 순위 (사부님 95% 지키면서 가장 많이 자르는 선)
         singles = []
         for k, op, th, m in cands:
@@ -13380,6 +13398,8 @@ def _disc_run(days_back: int, max_loss: int, steps: int):
             "🔭 새로 찾은 조건 (위에서부터 and)": chosen,
             "🔭 새 조건 날짜별": day_table(keep),
             "🔭 새 조건이 놓친 사부님": lost_names,
+            "🧩 성과4 + 공짜 컷 (사부님 0개 손실)": chosen2,
+            "🧩 성과4 + 공짜 컷 날짜별": day_table(keep2),
             "단일 지표 순위 (사부님 95% 유지)": top,
             "설명": "사부님 종목은 거의 안 잃고(한 단계 최대 max_loss개) 나머지를 가장 많이 자르는 조건을 차례로 쌓음. 회색(장중 한번 만족)은 마감 기준으론 '아님'이 맞아서 나머지에 포함."})
     except Exception as e:
@@ -13388,8 +13408,34 @@ def _disc_run(days_back: int, max_loss: int, steps: int):
 
 
 @app.get("/api/gom-discover")
-def gom_discover(run: int = 0, days_back: int = 110, max_loss: int = 1, steps: int = 10):
-    """🔭 사부님 날짜별 목록으로 새 조건 자동 탐색 — run=1로 시작(백그라운드, 수 분), 그 뒤 run 없이 열어 결과 확인"""
+def gom_discover(run: int = 0, days_back: int = 110, max_loss: int = 1, steps: int = 10, f: str = ""):
+    """🔭 사부님 날짜별 목록으로 새 조건 자동 탐색 — run=1로 시작(백그라운드, 수 분), 그 뒤 run 없이 열어 결과 확인
+    f= 로 내 식 바로 시험: 예) f=성과4,고가등락%>=3,종가/5일저가%>=6  (쉼표 = and)"""
+    if f and _disc.get("data"):
+        import numpy as np
+        X, y, keys, dts, meta = _disc["data"]
+        ki = {k: i for i, k in enumerate(keys)}
+        g = lambda k: X[:, ki[k]]
+        m = np.ones(len(y), dtype=bool)
+        bad = []
+        for part in [x.strip() for x in f.split(",") if x.strip()]:
+            if part == "성과4":
+                m &= (g("40봉내 최대거래대금(억)") >= 500) & (g("오늘등락%") >= -2.5) & (g("26봉내 최대 시가대비종가%") >= 8) & \
+                     (g("10봉내 최대하락일%") <= -5) & ((g("종가/1봉전시가%") > 0) | (g("오늘등락%") > 0))
+                continue
+            mm = re.match(r"(.+?)(>=|<=)(-?[0-9.]+)$", part)
+            if not mm or mm.group(1).strip() not in ki:
+                bad.append(part)
+                continue
+            col = g(mm.group(1).strip())
+            m &= (col >= float(mm.group(3))) if mm.group(2) == ">=" else (col <= float(mm.group(3)))
+        tbl = {}
+        for d in sorted(set(dts)):
+            md = dts == d
+            tbl[d[5:]] = f"{int((m & md).sum())}개 · 사부님 {int((m & md & y).sum())}/{int((md & y).sum())}"
+        return {"식": f, "모르는 조건": bad, "재현": f"{int((m & y).sum())}/{int(y.sum())}", "총 개수": int(m.sum()), "날짜별": tbl,
+                "놓친 사부님": [f"{meta[i][0][5:]} {meta[i][2]}" for i in range(len(y)) if y[i] and not m[i]],
+                "쓸 수 있는 지표": keys}
     if run and _disc["status"] != "실행중":
         threading.Thread(target=_disc_run, args=(days_back, max_loss, steps), daemon=True).start()
         time.sleep(1)
