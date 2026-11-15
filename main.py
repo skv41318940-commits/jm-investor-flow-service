@@ -13162,6 +13162,245 @@ def _gom_diff_feats(b: list, t: int) -> dict:
     return f
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 🔭 곰발 새 조건 찾기 (2026-11-15 JM: "사부님 종목 11/02~11/14 정보로 새 조건 찾아줘")
+#   전종목(KRX 정규장 일봉) × 사부님 날짜별 목록 → 지표마다 자르는 선을 자동으로 찾아
+#   "사부님 종목은 거의 안 잃고 나머지는 최대한 자르는" 조건을 하나씩 쌓아 올림 (욕심쟁이 탐색)
+# ══════════════════════════════════════════════════════════════════════════
+GOM_TRUTH = dict(MASTER_GOM_5D)
+GOM_TRUTH["2026-11-12"] = ["HD현대일렉트릭", "LS ELECTRIC", "SK", "고영", "금호건설", "네오셈", "대덕전자", "대한광통신", "덕산넵코어스",
+                           "브이엠", "비아트론", "산일전기", "삼성전자우", "삼현", "성호전자", "심텍", "양지사", "이수스페셜티케미컬",
+                           "이수페타시스", "인텔리빅스", "일진전기", "지니언스", "컨텍", "케이씨텍", "코리아써키트", "티에스이",
+                           "한빛레이저", "한화머시너리앤서비스홀딩스", "효성중공업", "AP위성", "RF머트리얼즈"]
+GOM_TRUTH["2026-11-13"] = ["금호전기", "오킨스전자", "서산", "루닛", "액스비스", "피에스케이", "레인보우로보틱스", "이수페타시스",
+                           "피에스케이홀딩스", "글로벌테크놀로지", "ISC", "일진전기", "브이엠", "라온시큐어", "티에스이", "고영",
+                           "원익홀딩스", "LS에코에너지", "이수스페셜티케미컬", "두산테스나", "라온로보틱스", "가온전선", "대한광통신",
+                           "케이씨텍", "에코프로비엠", "심텍", "한화오션", "삼성전자우", "앤로보틱스", "우리로", "삼성SDI", "HPSP",
+                           "네오셈", "SK", "LG이노텍", "LS", "에코프로", "진양홀딩스", "HD현대일렉트릭", "LS ELECTRIC", "한미반도체",
+                           "포스코퓨처엠", "AP위성"]
+_disc = {"status": "대기", "progress": "", "result": None, "started": 0.0}
+
+# 지표 이름 → 키움 조건검색에서 쓰는 메뉴 (JM이 HTS로 옮기기 쉽게)
+_DISC_KIWOOM = {
+    "오늘등락%": "주가등락률 [일] 1봉전(중) 종가대비 0봉전 종가등락률",
+    "시가대비종가%": "주가등락률 [일] 0봉전 시가대비 종가",
+    "고가등락%": "주가등락률 [일] 1봉전 종가대비 0봉전 고가등락률",
+    "갭%": "주가등락률 [일] 1봉전 종가대비 0봉전 시가",
+    "윗꼬리%": "캔들 윗꼬리 (고가-몸통위)/전일종가",
+    "아래꼬리%": "캔들 아래꼬리 (몸통아래-저가)/전일종가",
+    "종가/1봉전시가%": "주가비교 [일] 0봉전 종가 vs 1봉전 시가",
+    "1봉전 등락%": "주가등락률 [일] 2봉전 종가대비 1봉전 종가",
+    "1봉전 시가대비종가%": "주가등락률 [일] 1봉전 시가대비 종가",
+    "2봉전 등락%": "주가등락률 [일] 3봉전 종가대비 2봉전 종가",
+    "거래대금(억)": "거래대금 [일] 0봉전",
+    "거래대금/20일평균": "거래대금비율 [일] 0봉전 / 20봉 평균",
+    "거래량/1봉전": "거래량비율 [일] 0봉전 / 1봉전",
+}
+
+
+def _disc_feats(O, H, L, C, A, t) -> dict:
+    """한 종목·한 날(t)의 지표 — 전부 키움 조건검색으로 옮길 수 있는 것만"""
+    def pct(a, b):
+        return (a / b - 1) * 100 if b else 0.0
+    c1 = C[t - 1]
+    f = {
+        "오늘등락%": pct(C[t], c1), "시가대비종가%": pct(C[t], O[t]), "고가등락%": pct(H[t], c1), "갭%": pct(O[t], c1),
+        "윗꼬리%": (H[t] - max(O[t], C[t])) / c1 * 100 if c1 else 0, "아래꼬리%": (min(O[t], C[t]) - L[t]) / c1 * 100 if c1 else 0,
+        "종가/1봉전시가%": pct(C[t], O[t - 1]), "1봉전 등락%": pct(C[t - 1], C[t - 2]), "1봉전 시가대비종가%": pct(C[t - 1], O[t - 1]),
+        "2봉전 등락%": pct(C[t - 2], C[t - 3]), "거래대금(억)": A[t],
+    }
+    a20 = sum(A[t - 20:t]) / 20
+    f["거래대금/20일평균"] = A[t] / a20 if a20 else 0
+    chg = [pct(C[j], C[j - 1]) for j in range(t - 40, t + 1)]  # 41개, 마지막이 오늘
+    body = [pct(C[j], O[j]) for j in range(t - 40, t + 1)]
+    for n in (3, 5, 10, 26, 40):
+        f[f"{n}봉내 최대상승일%"] = max(chg[-n:])
+        f[f"{n}봉내 최대하락일%"] = min(chg[-n:])
+        f[f"{n}봉내 최대 시가대비종가%"] = max(body[-n:])
+        f[f"{n}봉내 최대 음봉몸통%"] = -min(body[-n:])
+        f[f"{n}봉내 최대거래대금(억)"] = max(A[t - n + 1:t + 1])
+    for n in (5, 10, 20, 60):
+        m = sum(C[t - n + 1:t + 1]) / n
+        f[f"종가/{n}이평%"] = pct(C[t], m)
+    for n in (5, 20):
+        m0 = sum(C[t - n + 1:t + 1]) / n
+        m1 = sum(C[t - n:t]) / n
+        m5 = sum(C[t - n - 4:t - 4]) / n
+        f[f"{n}이평 1봉 기울기%"] = pct(m0, m1)
+        f[f"{n}이평 5봉 기울기%"] = pct(m0, m5)
+    for n in (5, 10, 20, 60):
+        f[f"종가/{n}일고가%"] = pct(C[t], max(H[t - n + 1:t + 1]))
+        f[f"종가/{n}일저가%"] = pct(C[t], min(L[t - n + 1:t + 1]))
+        f[f"{n}일 수익률%"] = pct(C[t], C[t - n])
+    k = 0
+    while k < 10 and C[t - 1 - k] < C[t - 2 - k]:
+        k += 1
+    f["어제까지 연속하락일"] = k
+    return f
+
+
+def _disc_run(days_back: int, max_loss: int, steps: int):
+    import numpy as np
+    try:
+        _disc.update(status="실행중", progress="전종목 일봉 받는 중", result=None, started=time.time())
+        last = max(GOM_TRUTH)
+        end = datetime.strptime(last, "%Y-%m-%d")
+        days, d = [], end
+        while len(days) < days_back:
+            if d.weekday() < 5:
+                days.append(d.strftime("%Y%m%d"))
+            d -= timedelta(days=1)
+        days.reverse()
+        names = {}
+        for start in range(0, 6000, 1000):
+            rows = supabase.table("stock_fundamentals").select("code,name").range(start, start + 999).execute().data or []
+            for x in rows:
+                names[x["code"]] = x["name"]
+            if len(rows) < 1000:
+                break
+        allowed = set()
+        try:
+            for mk in ("KOSPI", "KOSDAQ"):
+                allowed |= set(stock.get_market_ticker_list(days[-1], market=mk))
+        except Exception:
+            pass
+        hist, real_days = {}, []
+        for i, ymd in enumerate(days):
+            _disc["progress"] = f"전종목 일봉 {i + 1}/{len(days)}일"
+            try:
+                df = _krx_df(stock.get_market_ohlcv, ymd, market="ALL")
+            except Exception:
+                df = None
+            if df is None or df.empty or float(df["종가"].sum()) == 0:
+                continue
+            real_days.append(f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}")
+            for code, r in df.iterrows():
+                hist.setdefault(code, {})[real_days[-1]] = (float(r["시가"]), float(r["고가"]), float(r["저가"]), float(r["종가"]),
+                                                            float(r.get("거래대금", 0)) / 1e8)
+        _disc["progress"] = "지표 계산 중"
+        name2code = {v.replace(" ", "").upper(): k for k, v in names.items()}
+        rows, labels, meta, missing = [], [], [], []
+        for d, truth in GOM_TRUTH.items():
+            if d not in real_days:
+                missing.append(f"{d}(일봉 없음)")
+                continue
+            pos = set()
+            for nm in truth:
+                c = name2code.get(nm.replace(" ", "").upper())
+                (pos.add(c) if c else missing.append(f"{d} {nm}"))
+            ti = real_days.index(d)
+            for code, hh in hist.items():
+                if allowed and code not in allowed:
+                    continue
+                nm = names.get(code, "")
+                if nm and CRAB_SKIP_NAME.search(nm):
+                    continue
+                seq = [hh.get(x) for x in real_days[:ti + 1]]
+                if any(v is None for v in seq[-70:]) or len(seq) < 70 or seq[-1][3] <= 0:
+                    if code in pos:
+                        missing.append(f"{d} {nm}(일봉부족)")
+                    continue
+                seq = seq[-70:]
+                O, H, L, C, A = ([s[k] for s in seq] for k in range(5))
+                if min(C) <= 0 or min(O) <= 0:
+                    continue
+                rows.append(_disc_feats(O, H, L, C, A, 69))
+                labels.append(1 if code in pos else 0)
+                meta.append((d, code, nm))
+        keys = list(rows[0].keys())
+        X = np.array([[r[k] for k in keys] for r in rows], dtype=float)
+        y = np.array(labels, dtype=bool)
+        dts = np.array([m[0] for m in meta])
+        _disc["progress"] = f"조건 찾는 중 (종목·날 {len(rows):,}개, 사부님 {int(y.sum())}개)"
+
+        def day_table(mask):
+            out = {}
+            for d in sorted(set(dts)):
+                md = dts == d
+                out[d[5:]] = f"{int((mask & md).sum())}개 · 사부님 {int((mask & md & y).sum())}/{int((md & y).sum())}"
+            return out
+
+        # 📏 기준: 지금 성과4 (A·B·C·D·(E or F)) — 같은 데이터로
+        ki = {k: i for i, k in enumerate(keys)}
+        g = lambda k: X[:, ki[k]]
+        base4 = (g("40봉내 최대거래대금(억)") >= 500) & (g("오늘등락%") >= -2.5) & (g("26봉내 최대 시가대비종가%") >= 8) & \
+                (g("10봉내 최대하락일%") <= -5) & ((g("종가/1봉전시가%") > 0) | (g("오늘등락%") > 0))
+        cands = []
+        for j, k in enumerate(keys):
+            col = X[:, j]
+            qs = np.unique(np.round(np.quantile(col[y], [0.01, 0.02, 0.03, 0.05, 0.08, 0.1, 0.15, 0.2, 0.3, 0.5, 0.7, 0.8, 0.85, 0.9, 0.92, 0.95, 0.97, 0.98, 0.99]), 2))
+            for th in qs:
+                cands.append((k, ">=", float(th), col >= th))
+                cands.append((k, "<=", float(th), col <= th))
+        keep = np.ones(len(y), dtype=bool)
+        npos = int(y.sum())
+        chosen = []
+        lost_total = 0
+        for _ in range(steps):
+            best = None
+            kp = int((keep & y).sum())
+            kn = int((keep & ~y).sum())
+            for k, op, th, m in cands:
+                nk = keep & m
+                p = int((nk & y).sum())
+                lost = kp - p
+                if lost > max_loss or lost_total + lost > max(3, npos // 12):
+                    continue
+                cut = kn - int((nk & ~y).sum())
+                score = cut - lost * max(30, kn // 15)
+                if cut > 0 and (best is None or score > best[0]):
+                    best = (score, k, op, th, m, lost, cut)
+            if not best:
+                break
+            _, k, op, th, m, lost, cut = best
+            keep = keep & m
+            lost_total += lost
+            chosen.append({"조건": f"{k} {op} {th:g}", "키움 메뉴": _DISC_KIWOOM.get(k, k), "자른 종목": cut, "잃은 사부님": lost,
+                           "남은 개수": int(keep.sum()), "사부님 재현": f"{int((keep & y).sum())}/{npos}"})
+        lost_names = [f"{meta[i][0][5:]} {meta[i][2]}" for i in range(len(y)) if y[i] and not keep[i]]
+        # 단일 지표 순위 (사부님 95% 지키면서 가장 많이 자르는 선)
+        singles = []
+        for k, op, th, m in cands:
+            p = int((m & y).sum())
+            if p >= npos * 0.95:
+                singles.append((int((~m & ~y).sum()), k, op, th, p))
+        singles.sort(reverse=True)
+        seen, top = set(), []
+        for cut, k, op, th, p in singles:
+            if k in seen:
+                continue
+            seen.add(k)
+            top.append({"지표": f"{k} {op} {th:g}", "사부님 유지": f"{p}/{npos}", "자르는 종목(날 합계)": cut})
+            if len(top) >= 25:
+                break
+        _disc.update(status="완료", progress=f"{time.time() - _disc['started']:.0f}초", result={
+            "데이터": f"KRX 정규장 일봉 · {len(real_days)}거래일 · 종목·날 {len(rows):,}개 · 사부님 {npos}개",
+            "빠진 사부님 종목": missing,
+            "📏 지금 성과4 (같은 데이터)": {"날짜별": day_table(base4), "재현": f"{int((base4 & y).sum())}/{npos}", "총 개수": int(base4.sum())},
+            "🔭 새로 찾은 조건 (위에서부터 and)": chosen,
+            "🔭 새 조건 날짜별": day_table(keep),
+            "🔭 새 조건이 놓친 사부님": lost_names,
+            "단일 지표 순위 (사부님 95% 유지)": top,
+            "설명": "사부님 종목은 거의 안 잃고(한 단계 최대 max_loss개) 나머지를 가장 많이 자르는 조건을 차례로 쌓음. 회색(장중 한번 만족)은 마감 기준으론 '아님'이 맞아서 나머지에 포함."})
+    except Exception as e:
+        import traceback
+        _disc.update(status="실패", progress=str(e)[:200], result={"trace": traceback.format_exc()[-1500:]})
+
+
+@app.get("/api/gom-discover")
+def gom_discover(run: int = 0, days_back: int = 110, max_loss: int = 1, steps: int = 10):
+    """🔭 사부님 날짜별 목록으로 새 조건 자동 탐색 — run=1로 시작(백그라운드, 수 분), 그 뒤 run 없이 열어 결과 확인"""
+    if run and _disc["status"] != "실행중":
+        threading.Thread(target=_disc_run, args=(days_back, max_loss, steps), daemon=True).start()
+        time.sleep(1)
+    out = {"상태": _disc["status"], "진행": _disc["progress"]}
+    if _disc["status"] == "실행중":
+        out["경과초"] = int(time.time() - _disc["started"])
+    if _disc["result"]:
+        out.update(_disc["result"])
+    return out
+
+
 @app.get("/api/gom-touch")
 def gom_touch(code: str = "267260", date: str = "", n: int = 30):
     """🔎 JM(11/15): 20이평 찌름 검증용 — 최근 n봉의 고가 · 20이평 · 찌름 여부를 KRX(J)와 통합(UN) 둘 다로 보여줌"""
