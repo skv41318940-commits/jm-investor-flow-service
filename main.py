@@ -13236,6 +13236,10 @@ def _disc_feats(O, H, L, C, A, t) -> dict:
     while k < 10 and C[t - 1 - k] < C[t - 2 - k]:
         k += 1
     f["어제까지 연속하락일"] = k
+    m5t = sum(C[t - 4:t + 1]) / 5
+    m5y = sum(C[t - 5:t]) / 5
+    f["고가/5이평%"] = pct(H[t], m5t)          # 확정식 G: 0봉 고가 > 0봉 5이평
+    f["1봉전 고가/5이평%"] = pct(H[t - 1], m5y)  # 확정식 H: 1봉전 고가 > 1봉전 5이평
     return f
 
 
@@ -13326,6 +13330,7 @@ def _disc_run(days_back: int, max_loss: int, steps: int):
         g = lambda k: X[:, ki[k]]
         base4 = (g("40봉내 최대거래대금(억)") >= 500) & (g("오늘등락%") >= -2.5) & (g("26봉내 최대 시가대비종가%") >= 8) & \
                 (g("10봉내 최대하락일%") <= -5) & ((g("종가/1봉전시가%") > 0) | (g("오늘등락%") > 0))
+        base15 = base4 & (g("고가/5이평%") > 0) & (g("1봉전 고가/5이평%") > 0)  # 🐻 11/15 확정식 A~F + G + H
         cands = []
         for j, k in enumerate(keys):
             col = X[:, j]
@@ -13360,7 +13365,7 @@ def _disc_run(days_back: int, max_loss: int, steps: int):
                            "남은 개수": int(keep.sum()), "사부님 재현": f"{int((keep & y).sum())}/{npos}"})
         lost_names = [f"{meta[i][0][5:]} {meta[i][2]}" for i in range(len(y)) if y[i] and not keep[i]]
         # 🔭② 성과4에서 출발 → 사부님을 안 잃는 추가 컷만 쌓기
-        keep2, chosen2 = base4.copy(), []
+        keep2, chosen2 = base15.copy(), []
         for _ in range(6):
             kp, kn, best = int((keep2 & y).sum()), int((keep2 & ~y).sum()), None
             for k, op, th, m in cands:
@@ -13395,11 +13400,13 @@ def _disc_run(days_back: int, max_loss: int, steps: int):
             "데이터": f"KRX 정규장 일봉 · {len(real_days)}거래일 · 종목·날 {len(rows):,}개 · 사부님 {npos}개",
             "빠진 사부님 종목": missing,
             "📏 지금 성과4 (같은 데이터)": {"날짜별": day_table(base4), "재현": f"{int((base4 & y).sum())}/{npos}", "총 개수": int(base4.sum())},
+            "📏 11/15 확정식 A~H (같은 데이터)": {"날짜별": day_table(base15), "재현": f"{int((base15 & y).sum())}/{npos}", "총 개수": int(base15.sum()),
+                                           "놓친 사부님": [f"{meta[i][0][5:]} {meta[i][2]}" for i in range(len(y)) if y[i] and not base15[i]]},
             "🔭 새로 찾은 조건 (위에서부터 and)": chosen,
             "🔭 새 조건 날짜별": day_table(keep),
             "🔭 새 조건이 놓친 사부님": lost_names,
-            "🧩 성과4 + 공짜 컷 (사부님 0개 손실)": chosen2,
-            "🧩 성과4 + 공짜 컷 날짜별": day_table(keep2),
+            "🧩 확정식(11/15) + 공짜 컷 (사부님 0개 손실)": chosen2,
+            "🧩 확정식(11/15) + 공짜 컷 날짜별": day_table(keep2),
             "단일 지표 순위 (사부님 95% 유지)": top,
             "설명": "사부님 종목은 거의 안 잃고(한 단계 최대 max_loss개) 나머지를 가장 많이 자르는 조건을 차례로 쌓음. 회색(장중 한번 만족)은 마감 기준으론 '아님'이 맞아서 나머지에 포함."})
     except Exception as e:
@@ -13419,6 +13426,9 @@ def gom_discover(run: int = 0, days_back: int = 110, max_loss: int = 1, steps: i
         m = np.ones(len(y), dtype=bool)
         bad = []
         for part in [x.strip() for x in f.split(",") if x.strip()]:
+            if part == "확정15":
+                part = "성과4"
+                m &= (g("고가/5이평%") > 0) & (g("1봉전 고가/5이평%") > 0)
             if part == "성과4":
                 m &= (g("40봉내 최대거래대금(억)") >= 500) & (g("오늘등락%") >= -2.5) & (g("26봉내 최대 시가대비종가%") >= 8) & \
                      (g("10봉내 최대하락일%") <= -5) & ((g("종가/1봉전시가%") > 0) | (g("오늘등락%") > 0))
