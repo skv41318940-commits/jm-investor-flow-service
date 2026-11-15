@@ -13146,9 +13146,42 @@ def _gom_diff_feats(b: list, t: int) -> dict:
             f[f"{n}봉내 고가 20이평 찌름 횟수"] = cnt
             f[f"{n}봉내 20이평 찌름(오늘제외)"] = int(cnt_prev > 0)
             f[f"JM {n}봉: 찌름 or 비하락"] = int(cnt_prev > 0 or not down)
+    # 🐻 JM(11/15): "하락 중 거래량 급증 = 매물소화 = 세력 하방매집 흔적" — N봉 이내(오늘 제외) 거래량 급증 횟수
+    def v20j(j):
+        return sum(V[j - 20:j]) / 20 if j - 20 >= 0 else None
+    for n in (26, 40):
+        if t - n >= 60:
+            days = range(t - n + 1, t)  # 오늘 제외
+            for mul in (2, 3):
+                sp = [j for j in days if v20j(j) and V[j] >= mul * v20j(j)]
+                f[f"{n}봉내 거래량급증{mul}배 횟수"] = len(sp)
+                f[f"{n}봉내 하락중 급증{mul}배 횟수"] = sum(1 for j in sp if m20j(j) and C[j] < m20j(j))
+            f[f"{n}봉내 신고거래량(60봉) 횟수"] = sum(1 for j in days if V[j] > 0 and V[j] >= max(V[j - 60:j]))
     f["정배열(5>20>60)"] = 1 if (m5 and m20 and m60 and m5 > m20 > m60) else 0
     f["20>60이평"] = 1 if (m20 and m60 and m20 > m60) else 0
     return f
+
+
+@app.get("/api/gom-touch")
+def gom_touch(code: str = "267260", date: str = "", n: int = 30):
+    """🔎 JM(11/15): 20이평 찌름 검증용 — 최근 n봉의 고가 · 20이평 · 찌름 여부를 KRX(J)와 통합(UN) 둘 다로 보여줌"""
+    d = (date or now_kst().strftime("%Y-%m-%d"))[:10]
+    start = (datetime.strptime(d, "%Y-%m-%d") - timedelta(days=200)).strftime("%Y-%m-%d")
+    out = {"ok": True, "code": code, "date": d}
+    for mk in ("J", "UN"):
+        try:
+            b = [x for x in _kis_daily_candles(code, start, d, market=mk) if x["date"] <= d]
+        except Exception as e:
+            out[mk] = {"error": str(e)[:80]}
+            continue
+        C = [x["close"] for x in b]
+        rows = []
+        for j in range(max(19, len(b) - n), len(b)):
+            m20 = sum(C[j - 19:j + 1]) / 20
+            rows.append({"봉전": len(b) - 1 - j, "날짜": b[j]["date"], "고가": b[j]["high"], "종가": b[j]["close"],
+                         "20이평": round(m20, 1), "찌름": "✅" if b[j]["high"] >= m20 else ""})
+        out[mk] = {"봉수": len(b), "26봉내 찌름": sum(1 for r in rows if r["봉전"] <= 25 and r["찌름"]), "rows": rows}
+    return out
 
 
 @app.get("/api/gom-diff")
