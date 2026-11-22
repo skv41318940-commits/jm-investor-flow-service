@@ -5540,6 +5540,7 @@ def send_telegram(text: str, token: str = None, chat_id: str = None) -> bool:
 
 
 _tg_last_error = {"msg": ""}
+_tg_last_sent = {"at": 0.0}  # 마지막으로 텔레그램 보낸 시각 (🔁 3번 후보 알림이 다른 알림과 붙지 않게)
 
 
 def _send_telegram_once(text: str, token: str, chat_id: str) -> bool:
@@ -5550,6 +5551,8 @@ def _send_telegram_once(text: str, token: str, chat_id: str) -> bool:
             json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
             timeout=10,
         )
+        if res.ok:
+            _tg_last_sent["at"] = time.time()
         if not res.ok:
             print(f"[telegram] 전송 실패: {res.status_code} {res.text[:200]}")
             # 이유를 쉬운 말로 남겨서 테스트 화면에 보여줌 (2026-10-26)
@@ -12844,6 +12847,115 @@ def _hts_sig_map() -> dict:
     return _hts_sig_cache
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 🔁 곰발 3번 후보 (2026-11-22 JM · 사부님 분봉 차트의 정석)
+#   1번에 편입(흰) → 2번 골파기에서 빠짐(회) → 다시 편입 = 3번 후보 → 3-1번 안착을 세력평단으로 노림
+#   5분 넘게 빠졌다가 다시 들어와야 인정 (잠깐 깜빡이는 건 무시) · 하루 종목당 알림 1번 · 정규장 09:00~15:20
+# ══════════════════════════════════════════════════════════════════════════
+GOM_RE_MIN_OUT = 300
+GOM_RE_ALERT = {"kkot"}  # 🔔 2026-11-22 JM: 알림은 🦀 꽃게 3번 후보만 (곰발은 화면 🔁 배지로만)
+_re_queue: list = []      # 보낼 3번 후보 (알림 시간표와 안 겹치게 모아서 한 번에)
+
+
+def _alert_quiet_now() -> bool:
+    """정해진 알림(브리핑·점검) 앞뒤 3분이면 True — 그때는 3번 후보 알림을 잠깐 미룸"""
+    now = now_kst()
+    m = now.hour * 60 + now.minute
+    times = list(BRIEF_SCHEDULE.values()) + [(HEALTH_REPORT_HOUR, HEALTH_REPORT_MINUTE), (CLOSE_CHECK_HOUR, CLOSE_CHECK_MINUTE)]
+    return any(abs(m - (h * 60 + mm)) <= 3 for h, mm in times)
+
+
+def _re_flush():
+    """모아 둔 3번 후보를 한 메시지로 — 첫 후보가 들어오고 1분 뒤(같이 뜨는 것 묶기) ·
+    정해진 알림 앞뒤 3분 X · 다른 알림 보낸 지 90초 안 지났으면 X"""
+    if not _re_queue or time.time() - _re_queue[0]["t"] < 60 or _alert_quiet_now() or time.time() - _tg_last_sent["at"] < 90:
+        return
+    items = list(_re_queue)
+    _re_queue.clear()
+    lines = [f"🔁 꽃게 3번 후보 {len(items)}종목 (1번 → 2번 빠짐 → 다시 편입)"]
+    for r in items:
+        nm_q = requests.utils.quote(r["name"])
+        pct = r.get("pct")
+        lines.append(f"• {r['name']}" + (f" {pct:+.2f}%" if isinstance(pct, (int, float)) and pct else "")
+                     + f" · {r['first']}→{r['out']}→{r['re']}\n  https://jm-tracker.vercel.app/day-trading?code={r['code']}&name={nm_q}")
+    lines.append("👉 3-1번 안착 · 세력평단(돈의 중심) 확인")
+    threading.Thread(target=send_telegram, args=("\n".join(lines),), daemon=True).start()
+_gom_re_all = {k: {"day": "", "seen": {}, "out": {}, "re": {}, "last": 0.0, "n": 0, "saved": 0.0} for k in ("big", "kkot")}
+_gom_re = _gom_re_all["big"]
+
+
+def _gom_re_time(code: str, key: str = "big"):
+    S = _gom_re_all.get(key) or {}
+    r = S.get("re", {}).get(code) if S.get("day") == now_kst().strftime("%Y-%m-%d") else None
+    return r.get("re") if r else None
+
+
+def _gom_re_track(payload: dict):
+    for k in _gom_re_all:
+        _gom_re_track_one(payload, k)
+
+
+def _gom_re_track_one(payload: dict, key: str):
+    now = now_kst()
+    hm = now.hour * 100 + now.minute
+    if now.weekday() >= 5 or not (900 <= hm <= 1520) or key not in payload:
+        return
+    day = now.strftime("%Y-%m-%d")
+    S = _gom_re_all[key]
+    dbk = f"gom_re:{day}" if key == "big" else f"gom_re_{key}:{day}"
+    if S["day"] != day:
+        S.update({"day": day, "seen": {}, "out": {}, "re": {}, "last": 0.0, "n": 0, "saved": 0.0})
+        try:  # 서버 재시작 대비 — 오늘 기록 이어받기
+            r = supabase.table("brief_cache").select("data").eq("key", dbk).limit(1).execute().data
+            if r:
+                S["seen"] = dict((r[0]["data"] or {}).get("seen") or {})
+                S["re"] = dict((r[0]["data"] or {}).get("re") or {})
+        except Exception:
+            pass
+    t = time.time()
+    cur = {x["code"]: x.get("name") or x["code"] for x in payload.get(key) or [] if x.get("code")}
+    # PC가 1분 넘게 끊겼다 오면 그 사이는 모름 → 빠짐 기록 초기화 / 목록이 갑자기 1/3 밑으로 줄면(재시작 등) 이번 건 무시
+    if S["last"] and t - S["last"] > 60:
+        S["out"] = {}
+    if S["n"] >= 6 and len(cur) < S["n"] / 3:
+        return
+    S["last"], S["n"] = t, len(cur)
+    hhmm = now.strftime("%H:%M")
+    new = []
+    for c, nm in cur.items():
+        if c not in S["seen"]:
+            S["seen"][c] = hhmm  # 1번 (첫 편입)
+        elif c in S["out"]:
+            out_t, out_hm = S["out"].pop(c)
+            if t - out_t >= GOM_RE_MIN_OUT and c not in S["re"]:
+                S["re"][c] = {"name": nm, "first": S["seen"][c], "out": out_hm, "re": hhmm}
+                new.append(c)
+    for c in S["seen"]:
+        if c not in cur and c not in S["out"]:
+            S["out"][c] = (t, hhmm)  # 2번 (빠짐)
+    if new or t - S["saved"] > 600:
+        S["saved"] = t
+        try:
+            supabase.table("brief_cache").upsert({"key": dbk, "data": {"day": day, "seen": S["seen"], "re": S["re"]},
+                                                  "updated_at": now.isoformat()}).execute()
+        except Exception:
+            pass
+    if key not in GOM_RE_ALERT:
+        return
+    for c in new:
+        if _brief_already_sent(f"re_{key}", f"{day}:{c}"):
+            continue
+        _mark_brief_sent(f"re_{key}", f"{day}:{c}")
+        px = next((x for x in payload.get(key) or [] if x.get("code") == c), {})
+        _re_queue.append({**S["re"][c], "code": c, "pct": px.get("pct"), "t": t})
+
+
+@app.get("/api/gom-re")
+def gom_re_status():
+    """🔁 오늘 곰발 3번 후보 (빠졌다가 다시 편입) 목록"""
+    return {"ok": True, "alert": sorted(GOM_RE_ALERT), "queue": len(_re_queue), **{k: {"day": S["day"], "re": S["re"], "seen": len(S["seen"]), "out_now": len(S["out"])} for k, S in _gom_re_all.items()}}
+
+
 @app.post("/api/crab-pc")
 def crab_pc_post(payload: dict):
     # 🐻 곰발 편입 · TOP 5 알림은 끔 (2026-11-07 JM — 09:30 상승 랭킹에 곰발 표시로 대신)
@@ -12855,6 +12967,11 @@ def crab_pc_post(payload: dict):
         _hts_sig_save(payload)
     except Exception as e:
         print(f"[hts_sig] 저장 실패: {e}")
+    try:
+        _gom_re_track(payload)
+        _re_flush()
+    except Exception as e:
+        print(f"[gom_re] 실패: {e}")
     _crab_pc.update({"data": payload, "at": time.time()})
     _crab_pc_view["at"] = 0  # 다음 조회 때 새로 시세 붙이기
     if time.time() - _crab_pc.get("db_at", 0) > 30:  # ⚡ PC가 3초마다 보내니까 DB 저장은 30초에 한 번만 (2026-11-07)
@@ -14524,7 +14641,7 @@ def crab_pc_get():
             out.append({"code": x["code"], "name": x.get("name") or x["code"], "price": qq.get("price") or 0,
                         "pct": round(qq.get("pct") or 0, 2), "value_eok": round(qq.get("value_eok") or 0, 1), "volume": int(qq.get("volume") or 0),
                         "position": "—", "since": x.get("since"), "out": x.get("out") if gone else None,
-                        "gone": gone, "sig": (_sig_cache.get(x["code"]) or (0, None))[1],
+                        "gone": gone, "re": _gom_re_time(x["code"]), "sig": (_sig_cache.get(x["code"]) or (0, None))[1],
                         "in": sorted(member.get(x["code"], set())),
                         # 🎯 곰발+곰발 통합 · 🐻3 곰발+봉삼이 · ⬆ 완빨이 큰형님 자전거로 승격
                         "combo": [t for t, ks in (("🎯", {"big", "gomt"}), ("🐻3", {"big", "bong3"}), ("⬆", {"small", "crab"}))
@@ -14567,7 +14684,7 @@ def _crab_pc_fast(d: dict, alive: bool) -> dict:
             _crab_fill_px.setdefault(c, (time.time(), {}))  # 표시 먼저 (같은 걸 계속 맡기지 않게)
         threading.Thread(target=fill, args=(list(dict.fromkeys(need))[:30],), daemon=True).start()
 
-    def rows(lst, gone=False):
+    def rows(lst, gone=False, key="big"):
         out = []
         for x in lst or []:
             px = x
@@ -14577,15 +14694,15 @@ def _crab_pc_fast(d: dict, alive: bool) -> dict:
             out.append({"code": x["code"], "name": x.get("name") or x["code"], "price": px.get("price") or 0,
                         "pct": round(px.get("pct") or 0, 2), "value_eok": round(px.get("value_eok") or 0, 1),
                         "volume": int(px.get("volume") or 0), "since": x.get("since"), "out": x.get("out") if gone else None,
-                        "gone": gone, "in": sorted(m),
+                        "gone": gone, "in": sorted(m), "re": _gom_re_time(x["code"], key),
                         "combo": [t for t, ks in (("🎯", {"big", "gomt"}), ("🐻3", {"big", "bong3"}), ("⬆", {"small", "crab"})) if ks <= m]})
         return sorted(out, key=lambda r: -r["value_eok"])
 
     out = {"ok": True, "source": "pc", "fast": True, "at": str(d.get("at", ""))[11:19], "alive": alive, "names": d.get("names") or {},
            "note": "🖥 HTS 조건검색 + 키움 실시간 시세 그대로"}
     for k in CRAB_KEYS + ("kkot", "yeok"):  # 🦀 꽃게 · ▲ 역배정초 = 📈 데이 트레이딩 오른쪽 칸 (2026-11-22)
-        out[k] = rows(d.get(k, []))
-        out[f"{k}_removed"] = rows(d.get(f"{k}_removed", []), True)
+        out[k] = rows(d.get(k, []), key=k)
+        out[f"{k}_removed"] = rows(d.get(f"{k}_removed", []), True, key=k)
     return out
 
 
