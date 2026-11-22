@@ -12991,42 +12991,10 @@ _sig_busy = {"on": False}
 _sig_series_cache: dict = {}  # code → (시각, 결과)
 
 
-def _jm_signal_series(code: str) -> dict:
-    """일봉 전체에서 🐻 곰발 · ▲ 역배정초가 뜬 날짜들 (차트 표시 + 검색기 '오늘 신호'에 같이 씀)"""
-    c = _sig_series_cache.get(code)
-    ttl = 600 if 9 <= now_kst().hour < 16 else 6 * 3600
-    if c and time.time() - c[0] < ttl:
-        return c[1]
-    end = now_kst().strftime("%Y-%m-%d")
-    # ▲ 역배정초는 볼린저 300이라 신호 날짜보다 300봉(약 15개월) 앞 데이터가 필요 → 약 4년치 받기
-    #    (예전 760일이면 2025년 12월은 300봉이 안 돼서 계산 자체가 안 됐음 — 한미반도체 12월 미표시 원인, 2026-11-02)
-    start = (now_kst() - timedelta(days=1460)).strftime("%Y-%m-%d")
-    # 🕘 2026-11-22: 신호는 HTS 정규장 차트 기준 → 한투 J(KRX 정규장) 일봉
-    #    키움 opt10081 · pykrx는 NXT가 섞인 통합 종가(예: 인제니아 11/9 18,890 ≠ 정규장 20,000)라 안 씀
-    base = _regular_daily(code, start, end)
-    b = base.get("candles") or []
-    sig_src = base.get("source") or "한투"
+def _sig_compute(b: list, C: list, H: list, O: list, A: list) -> tuple:
+    """🐻 곰발 · 🦀 꽃게 · ▲ 역배정초 날짜 계산 (국내·해외 공용, 2026-11-22 분리) → (g, k, gi, y)
+    A = 원화 거래대금 (해외는 환율 곱해서 넣음)"""
     n = len(b)
-    C = [x["close"] for x in b]; H = [x["high"] for x in b]
-    O = [x["open"] for x in b]
-    A = [(x.get("amount") or 0) or x["close"] * x["volume"] for x in b]
-    # 💰 거래대금은 HTS 수식처럼 통합(KRX+NXT) 거래대금으로 (2026-11-22)
-    #    GST 9/18: 정규장 5일 평균 37억 → 역배정초 탈락 / 통합 67억 → HTS처럼 통과
-    try:
-        un = {}
-        for attempt in range(3):
-            try:
-                un = {x["date"]: x.get("amount") or 0 for x in _kis_daily_candles(code, start, end, "UN")}
-            except Exception as e:
-                print(f"[jm_signal] {code} 통합 거래대금 실패({attempt + 1}): {e}")
-            if un:
-                break
-            time.sleep(0.6 * (attempt + 1))
-        if un:
-            A = [max(un.get(x["date"], 0), A[i]) for i, x in enumerate(b)]
-    except Exception:
-        pass
-
     def sma_arr(arr, k):
         out, s_ = [None] * len(arr), 0.0
         for t in range(len(arr)):
@@ -13122,6 +13090,46 @@ def _jm_signal_series(code: str) -> dict:
             A11 = any(cu(t - k, m60) for k in range(5))
             if A1 and A2 and tr and A8 and m20[t] < m60[t] and C[t] > m20[t] and A11 and (a5[t] or 0) >= 5e9:
                 y_dates.append(b[t]["date"])
+    return g_dates, k_dates, gi_dates, y_dates
+
+
+def _jm_signal_series(code: str) -> dict:
+    """일봉 전체에서 🐻 곰발 · ▲ 역배정초가 뜬 날짜들 (차트 표시 + 검색기 '오늘 신호'에 같이 씀)"""
+    c = _sig_series_cache.get(code)
+    ttl = 600 if 9 <= now_kst().hour < 16 else 6 * 3600
+    if c and time.time() - c[0] < ttl:
+        return c[1]
+    end = now_kst().strftime("%Y-%m-%d")
+    # ▲ 역배정초는 볼린저 300이라 신호 날짜보다 300봉(약 15개월) 앞 데이터가 필요 → 약 4년치 받기
+    #    (예전 760일이면 2025년 12월은 300봉이 안 돼서 계산 자체가 안 됐음 — 한미반도체 12월 미표시 원인, 2026-11-02)
+    start = (now_kst() - timedelta(days=1460)).strftime("%Y-%m-%d")
+    # 🕘 2026-11-22: 신호는 HTS 정규장 차트 기준 → 한투 J(KRX 정규장) 일봉
+    #    키움 opt10081 · pykrx는 NXT가 섞인 통합 종가(예: 인제니아 11/9 18,890 ≠ 정규장 20,000)라 안 씀
+    base = _regular_daily(code, start, end)
+    b = base.get("candles") or []
+    sig_src = base.get("source") or "한투"
+    n = len(b)
+    C = [x["close"] for x in b]; H = [x["high"] for x in b]
+    O = [x["open"] for x in b]
+    A = [(x.get("amount") or 0) or x["close"] * x["volume"] for x in b]
+    # 💰 거래대금은 HTS 수식처럼 통합(KRX+NXT) 거래대금으로 (2026-11-22)
+    #    GST 9/18: 정규장 5일 평균 37억 → 역배정초 탈락 / 통합 67억 → HTS처럼 통과
+    try:
+        un = {}
+        for attempt in range(3):
+            try:
+                un = {x["date"]: x.get("amount") or 0 for x in _kis_daily_candles(code, start, end, "UN")}
+            except Exception as e:
+                print(f"[jm_signal] {code} 통합 거래대금 실패({attempt + 1}): {e}")
+            if un:
+                break
+            time.sleep(0.6 * (attempt + 1))
+        if un:
+            A = [max(un.get(x["date"], 0), A[i]) for i, x in enumerate(b)]
+    except Exception:
+        pass
+
+    g_dates, k_dates, gi_dates, y_dates = _sig_compute(b, C, H, O, A)
     last = b[-1]["date"] if b else ""
     # 🦀 검색기 '일봉 신호' = 사부님 점 구조 (11/2 마감 16종목 비교로 확인): 종가 > 5이평 · 전일보다 상승 마감 · 양봉
     res = {"ok": True, "code": code, "bars": n, "g": g_dates, "k": k_dates, "gi": gi_dates, "y": y_dates,
@@ -14547,6 +14555,65 @@ def gom_minute_multi(date: str = "", names: str = "", codes: str = ""):
         except Exception as e:
             rows.append({"종목": nmap.get(c, c), "오류": str(e)})
     return {"ok": True, "date": d, "rows": rows, "못찾은종목": unresolved}
+
+
+_fx_krw_cache: dict = {}
+
+
+def _fx_krw(cur: str) -> float:
+    """1 외화 = 몇 원 (야후 USDKRW=X 등) · 6시간 보관"""
+    cur = (cur or "USD").upper()
+    if cur == "KRW":
+        return 1.0
+    c = _fx_krw_cache.get(cur)
+    if c and time.time() - c[0] < 6 * 3600:
+        return c[1]
+    try:
+        p2 = int(time.time()) + 86400
+        r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{cur}KRW=X", params={"period1": p2 - 10 * 86400, "period2": p2, "interval": "1d"},
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=10).json()["chart"]["result"][0]
+        v = float((r.get("meta") or {}).get("regularMarketPrice") or 0)
+        if v > 0:
+            _fx_krw_cache[cur] = (time.time(), v)
+            return v
+    except Exception as e:
+        print(f"[fx] {cur} 실패: {e}")
+    return {"USD": 1400.0, "JPY": 9.3, "HKD": 180.0, "CNY": 195.0, "TWD": 44.0, "EUR": 1500.0}.get(cur, 1400.0)
+
+
+_gsig_cache: dict = {}
+
+
+@app.get("/api/global-signals")
+def global_signals_endpoint(symbol: str):
+    """🌎 해외 종목 🐻 곰발 · 🦀 꽃게 · ▲ 역배정초 (2026-11-22 JM) — 국내와 같은 공식 · 야후 일봉 4년 ·
+    거래대금 조건(500억 등)은 환율 곱한 원화 거래대금으로"""
+    c = _gsig_cache.get(symbol)
+    if c and time.time() - c[0] < 3600:
+        return c[1]
+    try:
+        p2 = int(time.time()) + 86400
+        res = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{requests.utils.quote(symbol)}",
+                           params={"period1": p2 - 1460 * 86400, "period2": p2, "interval": "1d", "events": "split"},
+                           headers={"User-Agent": "Mozilla/5.0"}, timeout=15).json()["chart"]["result"][0]
+        q = res["indicators"]["quote"][0]
+        cur = (res.get("meta") or {}).get("currency") or "USD"
+        b = []
+        for i, t in enumerate(res.get("timestamp") or []):
+            o, h, l, cl, v = (q.get(k2, [None])[i] for k2 in ("open", "high", "low", "close", "volume"))
+            if None in (o, h, l, cl):
+                continue
+            b.append({"date": datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%d"), "open": o, "high": h, "low": l, "close": cl, "volume": v or 0})
+        fx = _fx_krw(cur)
+        C = [x["close"] for x in b]; H = [x["high"] for x in b]; O = [x["open"] for x in b]
+        A = [x["close"] * x["volume"] * fx for x in b]
+        g, k, gi, y = _sig_compute(b, C, H, O, A)
+        out = {"ok": True, "symbol": symbol, "bars": len(b), "g": g, "k": k, "y": y, "currency": cur, "fx": fx,
+               "hg": [], "hk": [], "hy": [], "hts_from": "9999-12-31"}  # 해외는 HTS 확정이 없어서 전부 계산값(진하게)
+        _gsig_cache[symbol] = (time.time(), out)
+        return out
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/api/jm-signals")
