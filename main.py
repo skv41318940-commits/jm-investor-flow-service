@@ -12579,13 +12579,11 @@ def _jm_signal_series(code: str) -> dict:
     # ▲ 역배정초는 볼린저 300이라 신호 날짜보다 300봉(약 15개월) 앞 데이터가 필요 → 약 4년치 받기
     #    (예전 760일이면 2025년 12월은 300봉이 안 돼서 계산 자체가 안 됐음 — 한미반도체 12월 미표시 원인, 2026-11-02)
     start = (now_kst() - timedelta(days=1460)).strftime("%Y-%m-%d")
-    # 🕘 2026-11-22: 신호는 HTS 정규장 차트 기준 → KRX 공식(pykrx) 일봉 (안 되면 한투 J)
-    #    키움 opt10081 일봉은 시간외·NXT가 섞여서 HTS 정규장과 달라 안 씀
-    base = _stock_ohlcv_base(code, start, end)
+    # 🕘 2026-11-22: 신호는 HTS 정규장 차트 기준 → 한투 J(KRX 정규장) 일봉
+    #    키움 opt10081 · pykrx는 NXT가 섞인 통합 종가(예: 인제니아 11/9 18,890 ≠ 정규장 20,000)라 안 씀
+    base = _regular_daily(code, start, end)
     b = base.get("candles") or []
-    if not b:
-        b = _kis_daily_candles(code, start, end)
-    sig_src = base.get("source") or ("KRX" if base.get("candles") else "한투")
+    sig_src = base.get("source") or "한투"
     n = len(b)
     C = [x["close"] for x in b]; H = [x["high"] for x in b]
     O = [x["open"] for x in b]
@@ -15638,6 +15636,18 @@ def _kis_daily_candles(code: str, start: str, end: str, market: str = "J") -> li
     return [out[k] for k in sorted(out)]
 
 
+def _regular_daily(code: str, start: str, end: str) -> dict:
+    """🕘 정규장(KRX 09:00~15:30) 일봉 — 한투 J 먼저 (2026-11-22)
+    pykrx·키움 opt10081은 NXT 애프터마켓이 섞인 통합 종가가 나와서 HTS 정규장 차트와 다름 → 한투 J가 안 될 때만 pykrx"""
+    try:
+        cs = _kis_daily_candles(code, start, end, "J")
+        if cs:
+            return {"ok": True, "code": code, "candles": cs, "source": "한투J"}
+    except Exception as e:
+        print(f"[regular_daily] {code} 한투 J 실패: {e}")
+    return _stock_ohlcv_base(code, start, end)
+
+
 def _stock_ohlcv_base(code: str, start: str, end: str):
     """
     목표가 매핑(패턴분석) 캔들차트용 — 정밀 일봉 시가/고가/저가/종가/거래량.
@@ -15728,7 +15738,7 @@ def stock_ohlcv_endpoint(code: str, start: str, end: str, mode: str = "krx", wai
     """
     mode = "al" if mode == "al" else "krx"
     if mode == "krx":
-        base = _stock_ohlcv_base(code, start, end)
+        base = _regular_daily(code, start, end)
     else:
         try:
             cs = _kis_daily_candles(code, start, end, "UN")
@@ -15737,7 +15747,7 @@ def stock_ohlcv_endpoint(code: str, start: str, end: str, mode: str = "krx", wai
         except Exception as e:
             base = {"ok": False, "error": str(e)}
     # ⚠️ 2026-11-22: 키움 opt10081 일봉은 종목코드·_AL·_NX 모두 같은 값(시간외·NXT 섞임)이라
-    #    HTS 정규장/통합 캔들과 달라서 차트에는 안 씀 → 정규장 = KRX(pykrx)·한투 J, 통합 = 한투 UN
+    #    HTS 정규장/통합 캔들과 달라서 차트에는 안 씀 → 정규장 = 한투 J, 통합 = 한투 UN
     if not _OHLCV_CHART_USE_KIWOOM:
         base["mode"] = mode
         base["source"] = base.get("source") or ("KRX" if base.get("ok") else "한투")
