@@ -14749,7 +14749,7 @@ def _crab_pc_fast(d: dict, alive: bool) -> dict:
         for x in d.get(k, []) or []:
             member.setdefault(x["code"], set()).add(k)
     # 🦀 꽃게 · ▲ 역배정초도 시세 채우기 (2026-11-22 — 장 밖에선 PC 실시간 시세가 0이라 한투로)
-    need = [x["code"] for k in CRAB_KEYS + ("kkot", "yeok") for kk in (k, f"{k}_removed") for x in d.get(kk, []) or []
+    need = [x["code"] for k in CRAB_KEYS + ("kkot", "yeok", "newvol") for kk in (k, f"{k}_removed") for x in d.get(kk, []) or []
             if not x.get("pct") and not x.get("value_eok") and time.time() - _crab_fill_px.get(x["code"], (0, None))[0] > 300]
 
     def fill(codes):
@@ -14781,7 +14781,7 @@ def _crab_pc_fast(d: dict, alive: bool) -> dict:
 
     out = {"ok": True, "source": "pc", "fast": True, "at": str(d.get("at", ""))[11:19], "alive": alive, "names": d.get("names") or {},
            "note": "🖥 HTS 조건검색 + 키움 실시간 시세 그대로"}
-    for k in CRAB_KEYS + ("kkot", "yeok"):  # 🦀 꽃게 · ▲ 역배정초 = 📈 데이 트레이딩 오른쪽 칸 (2026-11-22)
+    for k in CRAB_KEYS + ("kkot", "yeok", "newvol"):  # 🦀 꽃게 · ▲ 역배정초 · 📊 신고거래량 = 📈 데이 트레이딩 오른쪽 칸 (2026-11-22)
         out[k] = rows(d.get(k, []), key=k)
         out[f"{k}_removed"] = rows(d.get(f"{k}_removed", []), True, key=k)
     return out
