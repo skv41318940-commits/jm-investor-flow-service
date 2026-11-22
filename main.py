@@ -14406,7 +14406,7 @@ def _crab_pc_fast(d: dict, alive: bool) -> dict:
 
     out = {"ok": True, "source": "pc", "fast": True, "at": str(d.get("at", ""))[11:19], "alive": alive, "names": d.get("names") or {},
            "note": "🖥 HTS 조건검색 + 키움 실시간 시세 그대로"}
-    for k in CRAB_KEYS:
+    for k in CRAB_KEYS + ("kkot", "yeok"):  # 🦀 꽃게 · ▲ 역배정초 = 📈 데이 트레이딩 오른쪽 칸 (2026-11-22)
         out[k] = rows(d.get(k, []))
         out[f"{k}_removed"] = rows(d.get(f"{k}_removed", []), True)
     return out
