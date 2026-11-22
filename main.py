@@ -12579,19 +12579,13 @@ def _jm_signal_series(code: str) -> dict:
     # ▲ 역배정초는 볼린저 300이라 신호 날짜보다 300봉(약 15개월) 앞 데이터가 필요 → 약 4년치 받기
     #    (예전 760일이면 2025년 12월은 300봉이 안 돼서 계산 자체가 안 됐음 — 한미반도체 12월 미표시 원인, 2026-11-02)
     start = (now_kst() - timedelta(days=1460)).strftime("%Y-%m-%d")
-    b = _kis_daily_candles(code, start, end)
-    # 🟢 PC 켜져 있으면 키움 정규장 일봉으로 최근 구간 덮어쓰기 (한투 J는 밤에 애프터마켓 가격이 섞임) — 2026-11-07
-    try:
-        _kiwoom_daily_ask(code, "krx")
-        kk = _kk_daily.get(code)
-        if kk and kk[1]:
-            mg = {x["date"]: x for x in b}
-            for x in kk[1]:
-                if start <= x["date"] <= end:
-                    mg[x["date"]] = x
-            b = [mg[k] for k in sorted(mg)]
-    except Exception:
-        pass
+    # 🕘 2026-11-22: 신호는 HTS 정규장 차트 기준 → KRX 공식(pykrx) 일봉 (안 되면 한투 J)
+    #    키움 opt10081 일봉은 시간외·NXT가 섞여서 HTS 정규장과 달라 안 씀
+    base = _stock_ohlcv_base(code, start, end)
+    b = base.get("candles") or []
+    if not b:
+        b = _kis_daily_candles(code, start, end)
+    sig_src = base.get("source") or ("KRX" if base.get("candles") else "한투")
     n = len(b)
     C = [x["close"] for x in b]; H = [x["high"] for x in b]
     O = [x["open"] for x in b]
@@ -12618,7 +12612,9 @@ def _jm_signal_series(code: str) -> dict:
     m5, m20, m60, a5 = sma_arr(C, 5), sma_arr(C, 20), sma_arr(C, 60), sma_arr(A, 5)
     u20 = bbu_arr(C, 20)
     u300 = bbu_arr(C, 300) if n >= 300 else [None] * n
-    g_dates, y_dates, gi_dates = [], [], []
+    g_dates, y_dates, gi_dates, k_dates = [], [], [], []
+    V = [x.get("volume") or 0 for x in b]
+    L5 = [x["low"] for x in b]
     CHG = [0.0] + [(C[j] / C[j - 1] - 1) * 100 if C[j - 1] else 0.0 for j in range(1, n)]
     OCHG = [(C[j] / O[j] - 1) * 100 if O[j] else 0.0 for j in range(n)]
 
@@ -12635,13 +12631,52 @@ def _jm_signal_series(code: str) -> dict:
     def cu(t, line):
         return line[t] is not None and line[t - 1] is not None and H[t] > line[t] and H[t - 1] <= line[t - 1]
 
+    def gom_new(t):
+        """🐻 곰발 (2026-11-21 확정 · HTS 수식관리 '곰발'과 같음)"""
+        if t < 45:
+            return False
+        gap = (O[t] / C[t - 1] - 1) * 100 if C[t - 1] else 0
+        A_ = max(A[t - 39:t + 1]) >= 5e10
+        BCD = C[t] >= C[t - 1] * 0.985 and C[t] >= C[t - 2] * 0.975 and C[t] >= C[t - 3] * 0.975
+        E_ = max(OCHG[t - 25:t + 1]) >= 8 or CHG[t] >= 15 or (CHG[t] >= 10 and V[t] >= V[t - 1] * 3)
+        F_ = min(CHG[t - 9:t + 1]) <= -2.5
+        GH = C[t] > O[t - 1] or C[t] > C[t - 1]
+        I_ = H[t] > m5[t]
+        J_ = A[t] >= 1e9
+        K_ = H[t] >= H[t - 1] * 0.97
+        M_ = CHG[t] >= 2
+        HOT = m5[t] > m5[t - 1] > m5[t - 2]
+        V1 = gap >= -1.5 and (V[t] > V[t - 1] or (V[t] >= V[t - 1] * 0.75 and OCHG[t] >= 7))
+        V2 = gap >= 4
+        V3 = CHG[t] >= 8 and V[t] > V[t - 1]
+        return A_ and BCD and E_ and F_ and GH and I_ and J_ and K_ and M_ and not HOT and (V1 or V2 or V3)
+
+    def crab_new(t):
+        """🦀 꽃게 (2026-11-21 확정 · HTS 검색기/수식관리 '꽃게' A~R과 같음)"""
+        if t < 45:
+            return False
+        gap = (O[t] / C[t - 1] - 1) * 100 if C[t - 1] else 0
+        if not (max(A[t - 39:t + 1]) >= 5e10):
+            return False
+        if not (C[t] >= C[t - 3] * 0.975 and C[t] >= C[t - 2] * 0.975 and C[t] >= C[t - 1] * 0.975):
+            return False
+        if not (m5[t - 1] < m5[t - 2] or m5[t - 2] < m5[t - 3] or m5[t - 3] < m5[t - 4]):
+            return False
+        if not (H[t] > m5[t] or H[t - 1] > m5[t - 1] or H[t - 2] > m5[t - 2]):
+            return False
+        if not (max(OCHG[t - 25:t + 1]) >= 8 and min(CHG[t - 9:t + 1]) <= -5):
+            return False
+        if not ((C[t] > C[t - 1] or C[t] > O[t - 1]) and H[t] >= H[t - 1] * 0.97 and V[t] >= V[t - 1] and gap < 4):
+            return False
+        return any(m20[j] is not None and m20[j - 1] is not None and C[j] > m20[j] and C[j - 1] <= m20[j - 1]
+                   for j in range(t - 9, t + 1))
+
     for t in range(6, n):
-        # 🐻 곰발 (●: 종가 > 전일 고가 · 양봉) / 곰발 통합 (○: 고가가 3봉 중 신고가) — 2026-11-07 확정
-        if gom_core(t):
-            if C[t] > H[t - 1] and C[t] > O[t]:
-                g_dates.append(b[t]["date"])
-            if H[t] >= max(H[t - 2:t + 1]):
-                gi_dates.append(b[t]["date"])
+        # 🐻 곰발 · 🦀 꽃게 (2026-11-22 교체 — 옛 곰발·곰발 통합 삭제)
+        if gom_new(t):
+            g_dates.append(b[t]["date"])
+        if crab_new(t):
+            k_dates.append(b[t]["date"])
         # ▲ 역배정초
         if t >= 305 and u300[t] is not None and u300[t - 2] is not None and m60[t] is not None and m20[t - 12] is not None:
             A1 = u300[t] > u300[t - 1] > u300[t - 2]
@@ -12653,10 +12688,10 @@ def _jm_signal_series(code: str) -> dict:
                 y_dates.append(b[t]["date"])
     last = b[-1]["date"] if b else ""
     # 🦀 검색기 '일봉 신호' = 사부님 점 구조 (11/2 마감 16종목 비교로 확인): 종가 > 5이평 · 전일보다 상승 마감 · 양봉
-    res = {"ok": True, "code": code, "bars": n, "g": g_dates, "gi": gi_dates, "y": y_dates,
-           "today": {"g": bool(g_dates and g_dates[-1] == last), "gi": bool(gi_dates and gi_dates[-1] == last),
-                     "y": bool(y_dates and y_dates[-1] == last)},
-           "last": last, "source": "키움" if _kk_daily.get(code) else "한투"}
+    res = {"ok": True, "code": code, "bars": n, "g": g_dates, "k": k_dates, "gi": gi_dates, "y": y_dates,
+           "today": {"g": bool(g_dates and g_dates[-1] == last), "k": bool(k_dates and k_dates[-1] == last),
+                     "gi": False, "y": bool(y_dates and y_dates[-1] == last)},
+           "last": last, "source": sig_src}
     _sig_series_cache[code] = (time.time(), res)
     return res
 
