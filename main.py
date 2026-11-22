@@ -12588,6 +12588,22 @@ def _jm_signal_series(code: str) -> dict:
     C = [x["close"] for x in b]; H = [x["high"] for x in b]
     O = [x["open"] for x in b]
     A = [(x.get("amount") or 0) or x["close"] * x["volume"] for x in b]
+    # 💰 거래대금은 HTS 수식처럼 통합(KRX+NXT) 거래대금으로 (2026-11-22)
+    #    GST 9/18: 정규장 5일 평균 37억 → 역배정초 탈락 / 통합 67억 → HTS처럼 통과
+    try:
+        un = {}
+        for attempt in range(3):
+            try:
+                un = {x["date"]: x.get("amount") or 0 for x in _kis_daily_candles(code, start, end, "UN")}
+            except Exception as e:
+                print(f"[jm_signal] {code} 통합 거래대금 실패({attempt + 1}): {e}")
+            if un:
+                break
+            time.sleep(0.6 * (attempt + 1))
+        if un:
+            A = [max(un.get(x["date"], 0), A[i]) for i, x in enumerate(b)]
+    except Exception:
+        pass
 
     def sma_arr(arr, k):
         out, s_ = [None] * len(arr), 0.0
