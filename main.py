@@ -12991,7 +12991,7 @@ _sig_busy = {"on": False}
 _sig_series_cache: dict = {}  # code → (시각, 결과)
 
 
-def _sig_compute(b: list, C: list, H: list, O: list, A: list) -> tuple:
+def _sig_compute(b: list, C: list, H: list, O: list, A: list, yeok_a1: bool = True) -> tuple:
     """🐻 곰발 · 🦀 꽃게 · ▲ 역배정초 날짜 계산 (국내·해외 공용, 2026-11-22 분리) → (g, k, gi, y)
     A = 원화 거래대금 (해외는 환율 곱해서 넣음)"""
     n = len(b)
@@ -13082,8 +13082,10 @@ def _sig_compute(b: list, C: list, H: list, O: list, A: list) -> tuple:
         if crab_new(t):
             k_dates.append(b[t]["date"])
         # ▲ 역배정초
-        if t >= 305 and u300[t] is not None and u300[t - 2] is not None and m60[t] is not None and m20[t - 12] is not None:
-            A1 = u300[t] > u300[t - 1] > u300[t - 2]
+        # 🌎 해외는 A1(BB300 상단 2일 연속 상승) 빼고 (2026-11-22 JM — 사부님 해외 역배정초가 더 느슨)
+        a1_ready = (t >= 305 and u300[t] is not None and u300[t - 2] is not None) if yeok_a1 else t >= 65
+        if a1_ready and m60[t] is not None and m20[t - 12] is not None:
+            A1 = (u300[t] > u300[t - 1] > u300[t - 2]) if yeok_a1 else True
             A2 = m20[t - 10] < m20[t - 11] < m20[t - 12]
             tr = any(m20[t - k - 1] > m20[t - k] and m20[t - k + 1] > m20[t - k] for k in range(1, 6))
             A8 = any(cu(t - k, u20) for k in range(5))
@@ -14607,7 +14609,7 @@ def global_signals_endpoint(symbol: str):
         fx = _fx_krw(cur)
         C = [x["close"] for x in b]; H = [x["high"] for x in b]; O = [x["open"] for x in b]
         A = [x["close"] * x["volume"] * fx for x in b]
-        g, k, gi, y = _sig_compute(b, C, H, O, A)
+        g, k, gi, y = _sig_compute(b, C, H, O, A, yeok_a1=False)
         out = {"ok": True, "symbol": symbol, "bars": len(b), "g": g, "k": k, "y": y, "currency": cur, "fx": fx,
                "hg": [], "hk": [], "hy": [], "hts_from": "9999-12-31"}  # 해외는 HTS 확정이 없어서 전부 계산값(진하게)
         _gsig_cache[symbol] = (time.time(), out)
