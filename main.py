@@ -14374,7 +14374,8 @@ def _crab_pc_fast(d: dict, alive: bool) -> dict:
     for k in CRAB_KEYS:
         for x in d.get(k, []) or []:
             member.setdefault(x["code"], set()).add(k)
-    need = [x["code"] for k in CRAB_KEYS for kk in (k, f"{k}_removed") for x in d.get(kk, []) or []
+    # 🦀 꽃게 · ▲ 역배정초도 시세 채우기 (2026-11-22 — 장 밖에선 PC 실시간 시세가 0이라 한투로)
+    need = [x["code"] for k in CRAB_KEYS + ("kkot", "yeok") for kk in (k, f"{k}_removed") for x in d.get(kk, []) or []
             if not x.get("pct") and not x.get("value_eok") and time.time() - _crab_fill_px.get(x["code"], (0, None))[0] > 300]
 
     def fill(codes):
