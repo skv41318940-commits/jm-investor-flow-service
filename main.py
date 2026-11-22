@@ -10929,13 +10929,30 @@ def new_highs_endpoint(raw: bool = False):
 _minute_mem: dict = {}
 
 
+def _minute_complete(candles: list) -> bool:
+    """하루치 정규장 분봉이 온전한가 — 9:05 전에 시작 · 300봉 이상 · 15:15 전 중간에 5분 넘게 빈 곳 없음 (2026-11-22)
+    (한투 페이지가 하나 빠지면 09:03→09:33처럼 30분이 통째로 비어서 세력평단·빨간선이 틀어짐)"""
+    if not candles or len(candles) < 300 or candles[0].get("time", "99:99") > "09:05":
+        return False
+    prev = None
+    for c in candles:
+        t = c.get("time") or ""
+        if len(t) < 5:
+            return False
+        m = int(t[:2]) * 60 + int(t[3:5])
+        if prev is not None and m < 915 and m - prev > 5:
+            return False
+        prev = m
+    return True
+
+
 def _minute_day_cached(code: str, day: str, market: str = "J") -> dict:
     """⚡ 지난 날짜 1분봉은 한 번 받으면 보관 (메모리 → DB → 한투 순서). 오늘은 장중에 바뀌니 짧게만 (2026-10-28)
     — 분봉 화면이 느리던 가장 큰 이유가 매번 날짜마다 한투에 여러 번씩 물어보던 것"""
     key = (code, day) if market == "J" else (code, day, market)
     today = now_kst().strftime("%Y-%m-%d")
     hit = _minute_mem.get(key)
-    if hit and (day < today or time.time() - hit[0] < 60):
+    if hit and ((day < today and (market != "J" or _minute_complete(hit[1].get("candles") or []))) or time.time() - hit[0] < 60):
         return hit[1]
     if market != "J":  # 🌙 통합은 DB 보관 없이 메모리에만
         out = stock_minute_by_date_endpoint(code, day, market)
@@ -10945,7 +10962,7 @@ def _minute_day_cached(code: str, day: str, market: str = "J") -> dict:
     if day < today:
         try:
             r = supabase.table("minute_candles_cache").select("candles").eq("code", code).eq("day", day).limit(1).execute().data
-            if r and r[0]["candles"]:
+            if r and r[0]["candles"] and _minute_complete(r[0]["candles"]):  # 빈 곳 있는 옛 저장분은 무시하고 다시 받음
                 out = {"ok": True, "candles": r[0]["candles"], "cached": True}
                 _minute_mem[key] = (time.time(), out)
                 return out
@@ -10953,8 +10970,10 @@ def _minute_day_cached(code: str, day: str, market: str = "J") -> dict:
             pass
     out = stock_minute_by_date_endpoint(code, day)
     if out.get("ok") and out.get("candles"):
+        full = _minute_complete(out["candles"])
+        # 지난 날짜인데 빈 곳이 있으면 메모리에 60초만 (위 hit 검사) → 다음에 다시 받아 봄
         _minute_mem[key] = (time.time(), out)
-        if day < today and len(out["candles"]) >= 300 and out["candles"][0]["time"] <= "09:05":  # 하루치가 다 찼을 때만 보관 (앞 시간 잘린 건 X)
+        if day < today and full:  # 하루치가 온전할 때만 보관 (앞 시간 잘림 · 중간 빈 곳 X)
             try:
                 supabase.table("minute_candles_cache").upsert({"code": code, "day": day, "candles": out["candles"]}).execute()
             except Exception:
