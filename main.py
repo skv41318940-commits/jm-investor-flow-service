@@ -13017,7 +13017,7 @@ def _sig_compute(b: list, C: list, H: list, O: list, A: list, yeok_a1: bool = Tr
     u20 = bbu_arr(C, 20)
     u300 = bbu_arr(C, 300) if n >= 300 else [None] * n
     g_dates, y_dates, gi_dates, k_dates = [], [], [], []
-    yt = [[], [], []]  # 🧪 역배정초 테스트1~3
+    yt = [[]]  # ◆ 역배정초2 (예전 공식, A1 포함)
     V = [x.get("volume") or 0 for x in b]
     L5 = [x["low"] for x in b]
     CHG = [0.0] + [(C[j] / C[j - 1] - 1) * 100 if C[j - 1] else 0.0 for j in range(1, n)]
@@ -13083,25 +13083,18 @@ def _sig_compute(b: list, C: list, H: list, O: list, A: list, yeok_a1: bool = Tr
         if crab_new(t):
             k_dates.append(b[t]["date"])
         # ▲ 역배정초
-        # 🧪 테스트1 = A1(BB300 상단 2일 연속 상승) 뺌 · 테스트2 = A2(20이평 10~12봉 전 하락) 뺌 · 테스트3 = 둘 다 뺌 (2026-11-22 JM)
+        # ▲ 역배정초 확정 (2026-11-22 JM): A1(BB300 상단 2일 연속 상승)을 뺀 공식 = 사부님과 같음 (테스트1이 정답)
+        #   ◆ 역배정초2 = 예전 공식 (A1 포함) — 진한 보라로 같이 표시
         if t >= 65 and m60[t] is not None and m20[t - 12] is not None:
             A1 = t >= 305 and u300[t] is not None and u300[t - 2] is not None and u300[t] > u300[t - 1] > u300[t - 2]
-            if not yeok_a1:
-                A1 = True
             A2 = m20[t - 10] < m20[t - 11] < m20[t - 12]
             tr = any(m20[t - k - 1] > m20[t - k] and m20[t - k + 1] > m20[t - k] for k in range(1, 6))
             A8 = any(cu(t - k, u20) for k in range(5))
             A11 = any(cu(t - k, m60) for k in range(5))
-            rest = tr and A8 and m20[t] < m60[t] and C[t] > m20[t] and A11 and (a5[t] or 0) >= 5e9
-            if rest:
-                d = b[t]["date"]
-                if A1 and A2:
-                    y_dates.append(d)
-                if A2:
-                    yt[0].append(d)
+            if A2 and tr and A8 and m20[t] < m60[t] and C[t] > m20[t] and A11 and (a5[t] or 0) >= 5e9:
+                y_dates.append(b[t]["date"])
                 if A1:
-                    yt[1].append(d)
-                yt[2].append(d)
+                    yt[0].append(b[t]["date"])
     if tests is not None:
         tests.extend(yt)
     return g_dates, k_dates, gi_dates, y_dates
@@ -13143,10 +13136,11 @@ def _jm_signal_series(code: str) -> dict:
     except Exception:
         pass
 
-    g_dates, k_dates, gi_dates, y_dates = _sig_compute(b, C, H, O, A)
+    _y2: list = []
+    g_dates, k_dates, gi_dates, y_dates = _sig_compute(b, C, H, O, A, tests=_y2)
     last = b[-1]["date"] if b else ""
     # 🦀 검색기 '일봉 신호' = 사부님 점 구조 (11/2 마감 16종목 비교로 확인): 종가 > 5이평 · 전일보다 상승 마감 · 양봉
-    res = {"ok": True, "code": code, "bars": n, "g": g_dates, "k": k_dates, "gi": gi_dates, "y": y_dates,
+    res = {"ok": True, "code": code, "bars": n, "g": g_dates, "k": k_dates, "gi": gi_dates, "y": y_dates, "y2": _y2[0] if _y2 else [],
            "today": {"g": bool(g_dates and g_dates[-1] == last), "k": bool(k_dates and k_dates[-1] == last),
                      "gi": False, "y": bool(y_dates and y_dates[-1] == last)},
            "last": last, "source": sig_src}
@@ -14622,8 +14616,8 @@ def global_signals_endpoint(symbol: str):
         C = [x["close"] for x in b]; H = [x["high"] for x in b]; O = [x["open"] for x in b]
         A = [x["close"] * x["volume"] * fx for x in b]
         tests: list = []
-        g, k, gi, y = _sig_compute(b, C, H, O, A, tests=tests)  # ▲ 역배정초는 국내와 같은 원래 공식 · 🧪 테스트1~3 따로
-        out = {"ok": True, "symbol": symbol, "bars": len(b), "g": g, "k": k, "y": y, "t1": tests[0], "t2": tests[1], "t3": tests[2],
+        g, k, gi, y = _sig_compute(b, C, H, O, A, tests=tests)  # ▲ 역배정초 (A1 뺀 확정 공식) · ◆ 역배정초2 (예전 공식)
+        out = {"ok": True, "symbol": symbol, "bars": len(b), "g": g, "k": k, "y": y, "y2": tests[0],
                "currency": cur, "fx": fx,
                "hg": [], "hk": [], "hy": [], "hts_from": "9999-12-31"}  # 해외는 HTS 확정이 없어서 전부 계산값(진하게)
         _gsig_cache[symbol] = (time.time(), out)
