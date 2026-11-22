@@ -2839,7 +2839,8 @@ def _alert_clock_loop():
     _alert_clock_state["started"] = now_kst().strftime("%m-%d %H:%M:%S")
     # 🌅 NXT를 맨 앞에 — 다른 브리핑 만드느라 늦어지지 않게
     fns = (("nxt", _run_nxt_premarket), ("briefs", _run_telegram_briefs), ("us", _run_us_briefs),
-           ("health", _ensure_health_report_sent_today), ("jm_report", _run_report_digest))
+           ("health_close", _ensure_close_check_sent_today), ("health", _ensure_health_report_sent_today),
+           ("jm_report", _run_report_digest))
     while True:
         if now_kst().weekday() >= 5:  # 🛑 주말엔 알림 시계 쉼 (토요일 00:00 미국 개장·일요일 22:25 미국 장전 포함)
             time.sleep(60)
@@ -5625,7 +5626,116 @@ def format_health_message(rep: dict) -> str:
     return "\n".join(lines)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 🩺 서버 점검 하루 2번 → JM 전용 (2026-11-22 JM)
+#   ① 16:05 장 마감 점검: HTS 신호 저장(15:31~15:59) · 실시간 체결 · PC · 사이트 API
+#   ② 18:45 데이터 점검: 기존(시장 수급·랭킹·NXT·재무제표·체결) + HTS 신호 · 사이트 API
+# ══════════════════════════════════════════════════════════════════════════
+CLOSE_CHECK_HOUR, CLOSE_CHECK_MINUTE = 16, 5
+
+
+def _api_selfcheck() -> list:
+    """사이트가 쓰는 주요 API를 서버 안에서 직접 불러 봄 → [(이름, 정상?, 이유)]"""
+    import concurrent.futures as cf
+    d1 = now_kst().strftime("%Y-%m-%d")
+    d0 = (now_kst() - timedelta(days=20)).strftime("%Y-%m-%d")
+    tests = [
+        ("일봉(한투)", lambda: stock_ohlcv_endpoint(code="005930", start=d0, end=d1, mode="krx", wait=0)),
+        ("분봉", lambda: stock_minute_multi_endpoint(code="005930", days=2, end="", start="", mode="krx")),
+        ("곰발·꽃게 신호", lambda: jm_signals(code="005930")),
+        ("검색기(PC)", lambda: crab_pc_get()),
+        ("KRX 랭킹", lambda: krx_ranking_endpoint(date="")),
+        ("NXT 랭킹", lambda: nxt_ranking_endpoint(date="")),
+        ("테마", lambda: naver_theme_list_endpoint()),
+        ("시장 심리", lambda: market_sentiment_endpoint()),
+        ("선물 수급", lambda: futures_investor_endpoint()),
+        ("ETF 수급", lambda: etf_flow_top_endpoint(who="foreign", side="buy", n=10)),
+        ("매크로 지표", lambda: macro_indicators_endpoint(refresh=False)),
+        ("미국 지표", lambda: us_indicators_endpoint()),
+        ("美 2년물(FRED)", lambda: fred_history_endpoint(series_id="DGS2", weekly=False)),
+        ("美 섹터 자금", lambda: us_sector_flow_endpoint()),
+        ("해외 일봉", lambda: global_ohlcv_endpoint(symbol="AAPL", start=d0, end="")),
+        ("세계 뉴스", lambda: world_news_endpoint(country="us", topic="top", limit=5)),
+        ("리서치", lambda: research_list_endpoint(category="strategy", page=1, refresh=False)),
+    ]
+
+    def run(t):
+        name, fn = t
+        try:
+            r = fn()
+            if isinstance(r, dict) and (r.get("ok") is False):
+                return (name, False, str(r.get("error") or "ok=false")[:60])
+            if r is None:
+                return (name, False, "응답 없음")
+            return (name, True, "")
+        except Exception as e:
+            return (name, False, f"{type(e).__name__}: {e}"[:60])
+
+    out = []
+    with cf.ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {ex.submit(run, t): t[0] for t in tests}
+        done, pending = cf.wait(futs, timeout=120)
+        for f in done:
+            out.append(f.result())
+        for f in pending:
+            out.append((futs[f], False, "2분 넘게 응답 없음"))
+    order = [t[0] for t in tests]
+    return sorted(out, key=lambda x: order.index(x[0]))
+
+
+def _hts_sig_check(today: str) -> tuple:
+    """오늘 HTS 신호(15:31~15:59 저장)가 들어왔나 → (정상?, 내용)"""
+    try:
+        r = supabase.table("brief_cache").select("data,updated_at").eq("key", f"hts_sig:{today}").limit(1).execute().data
+        if not r:
+            return False, "저장 없음"
+        d = r[0]["data"] or {}
+        at = str(r[0].get("updated_at") or "")[11:16]
+        return True, f"{at} 저장 · 곰발 {len(d.get('g') or [])}/{len(d.get('big') or [])} · 꽃게 {len(d.get('k') or [])} · 역배정초 {len(d.get('y') or [])}"
+    except Exception as e:
+        return False, f"조회 실패 {e}"[:60]
+
+
+def _extra_checks(rep: dict, with_hts: bool = True) -> dict:
+    """기존 점검에 HTS 신호 + 사이트 API 점검을 붙임"""
+    if with_hts and rep.get("trading_day"):
+        ok, txt = _hts_sig_check(rep["date"])
+        rep["checks"].append({"name": "HTS 신호 저장", "latest": txt, "ok": ok, "hint": "15:31~15:59 PC 세력트래커·HTS 켜져 있었나 확인"})
+    api = _api_selfcheck()
+    bad = [a for a in api if not a[1]]
+    rep["checks"].append({"name": "사이트 API", "latest": f"{len(api) - len(bad)}/{len(api)} 정상" + ("" if not bad else " · " + ", ".join(f"{n}({e})" for n, _, e in bad[:4])),
+                          "ok": not bad, "hint": "Render 로그 확인"})
+    rep["ok"] = all(c["ok"] for c in rep["checks"])
+    return rep
+
+
+def _ensure_close_check_sent_today():
+    """① 16:05 장 마감 점검"""
+    now = now_kst()
+    today = now.strftime("%Y-%m-%d")
+    if now.weekday() >= 5 or (now.hour, now.minute) < (CLOSE_CHECK_HOUR, CLOSE_CHECK_MINUTE) or now.hour >= 18:
+        return
+    if _brief_already_sent("health_close", today):
+        return
+    _mark_brief_sent("health_close", today)  # 실패해도 하루 1번만
+
+    def work():
+        base = build_health_report()
+        if not base["trading_day"]:
+            print(f"[health_close] {today} 휴장일 — 생략")
+            return
+        keep = [c for c in base["checks"] if c["name"].startswith("실시간 체결")]
+        rep = {**base, "checks": keep}
+        rep["checks"].append({"name": "PC 세력트래커", "latest": "🟢 켜짐" if _pc_alive() else "⚪ 꺼짐", "ok": _pc_alive(), "hint": "PC 확인"})
+        rep = _extra_checks(rep)
+        msg = format_health_message(rep).replace("JM 데이터 점검", "JM 장 마감 점검", 1)
+        send_telegram(msg)
+
+    threading.Thread(target=work, daemon=True).start()
+
+
 def _ensure_health_report_sent_today():
+    """② 18:45 데이터 점검"""
     now = now_kst()
     today = now.strftime("%Y-%m-%d")
     if now.weekday() >= 5 or _health_sent["date"] == today:
@@ -5633,17 +5743,26 @@ def _ensure_health_report_sent_today():
     if (now.hour, now.minute) < (HEALTH_REPORT_HOUR, HEALTH_REPORT_MINUTE):
         return
     _health_sent["date"] = today  # 실패해도 하루 1번만 (알림 폭탄 방지)
-    rep = build_health_report()
-    if not rep["trading_day"]:
-        print(f"[health] {today} 휴장일 — 점검 알림 생략")
+    if _brief_already_sent("health_evening", today):
         return
-    send_telegram(format_health_message(rep))
+    _mark_brief_sent("health_evening", today)
+
+    def work():
+        rep = build_health_report()
+        if not rep["trading_day"]:
+            print(f"[health] {today} 휴장일 — 점검 알림 생략")
+            return
+        send_telegram(format_health_message(_extra_checks(rep)))
+
+    threading.Thread(target=work, daemon=True).start()
 
 
 @app.get("/api/health")
-def health_endpoint(send: bool = False):
-    """데이터 상태 점검 결과 — send=true면 텔레그램으로도 바로 보냄 (설정 확인용)"""
+def health_endpoint(send: bool = False, full: bool = False):
+    """데이터 상태 점검 결과 — send=true면 텔레그램으로도 바로 보냄 · full=true면 HTS 신호·사이트 API 점검까지 (설정 확인용)"""
     rep = build_health_report()
+    if full:
+        rep = _extra_checks(rep)
     rep["telegram_configured"] = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
     if send:
         rep["telegram_sent"] = send_telegram(format_health_message(rep))
@@ -9061,7 +9180,7 @@ def futures_investor_debug():
 @app.get("/api/fred-history")
 def fred_history_endpoint(series_id: str = "DGS2", weekly: bool = False):
     try:
-        obs = list(reversed(_fred_obs(series_id, limit=900)))  # 오래된 순
+        obs = list(reversed(_fred_obs(series_id, 900)))  # 오래된 순 · ⚠️ 2026-11-22: 같은 이름 함수가 아래에 또 있어서 limit= 이 오류났음
         pts, seen_week = [], {}
         for d, v in obs:
             dt = datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -9615,10 +9734,12 @@ def us_sector_flow_endpoint():
     c = _etf_flow_cache
     if c["data"] and time.time() - c["at"] < 600:
         return c["data"]
-    out = []
+    out, errs = [], []
     for sym, kr in SECTOR_ETFS:
         try:
-            res = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}", params={"range": "1mo", "interval": "1d"},
+            # ⚠️ 2026-11-22: range=1mo 로 받으면 14개 전부 실패 → 시작~끝(period1/2) 방식으로 (global-ohlcv와 같음)
+            _p2 = int(time.time()) + 86400
+            res = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}", params={"period1": _p2 - 45 * 86400, "period2": _p2, "interval": "1d"},
                                headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
             r = res.json()["chart"]["result"][0]
             q = r["indicators"]["quote"][0]
@@ -9632,8 +9753,9 @@ def us_sector_flow_endpoint():
                         "pct5": round((pts[-1][0] / pts[-6][0] - 1) * 100, 2) if len(pts) >= 6 else None})
         except Exception as e:
             print(f"[sector-flow] {sym} 실패: {e}")
+            errs.append(f"{sym}: {str(e)[:80]}")
         time.sleep(0.1)
-    data = {"ok": bool(out), "rows": sorted(out, key=lambda x: -(x["pct"] or 0))}
+    data = {"ok": bool(out), "rows": sorted(out, key=lambda x: -(x["pct"] or 0)), "errors": errs[:3]}
     if out:
         c.update({"at": time.time(), "data": data})
     return data
@@ -15712,8 +15834,9 @@ def _run_pc_off_alert():
 # ══════════════════════════════════════════════════════════════════════════
 def _week_change(sym: str, monday: datetime):
     """이번 주 등락: (지난주 마지막 종가 → 지금)"""
+    _p2 = int(time.time()) + 86400  # range=1mo 대신 시작~끝 (2026-11-22, 섹터 자금 흐름과 같은 이유)
     j = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{requests.utils.quote(sym)}",
-                     params={"range": "1mo", "interval": "1d"}, headers={"User-Agent": "Mozilla/5.0"}, timeout=10).json()
+                     params={"period1": _p2 - 45 * 86400, "period2": _p2, "interval": "1d"}, headers={"User-Agent": "Mozilla/5.0"}, timeout=10).json()
     res = j["chart"]["result"][0]
     ts = res.get("timestamp") or []
     cl = res["indicators"]["quote"][0].get("close") or []
