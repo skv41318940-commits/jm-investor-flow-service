@@ -6950,8 +6950,10 @@ def build_theme_brief(top_n: int = 5, title: str = "🔥 오늘의 테마 이슈
         tp = t.get("change_pct")
         lines = [f"📌 {rank}. {t['theme_name']}" + (f" {tp:+.2f}%" if isinstance(tp, (int, float)) else "")
                  + f" · 오른 종목 거래대금 {_fmt_eok(sc['money'], signed=False)}"]
+        top_amt = max(sc["stocks"], key=lambda z: z["eok"]) if sc["stocks"] else None
         for x in sc["stocks"]:
-            tags = (" 🦀" if x is lead else "") + (" 🔥" if x["change_pct"] >= 29 else "") + _gom_mark(x["stock_code"])
+            # ⭐ 테마 1등 · 🔥 테마 안 거래대금 1위 · 🦀 오늘 꽃게 (2026-11-22 JM)
+            tags = (" ⭐" if x is lead else "") + (" 🔥" if x is top_amt else "") + _gom_mark(x["stock_code"])
             lines.append(f" {x['stock_name']} {x['change_pct']:+.2f}% · {_fmt_eok(x['eok'], signed=False)}{tags}")
         news = _theme_news([x["stock_name"] for x in sc["stocks"]], limit=2)
         if news:
@@ -6960,7 +6962,7 @@ def build_theme_brief(top_n: int = 5, title: str = "🔥 오늘의 테마 이슈
         else:
             lines.append("   ↳ 관련 뉴스 없음 — 수급·테마 순환 가능성")
         parts.append("\n".join(lines))
-    parts.append("※ 우리 시장분석(네이버 테마 순위) TOP 5 · 🦀 = 테마 1등 · ●곰발 · ○곰발 통합 · 🎯 둘 다 · 거래대금 10억 미만 종목 제외 · ↳는 관련 뉴스(원인이 아닐 수도)")
+    parts.append("※ 우리 시장분석(네이버 테마 순위) TOP 5 · ⭐ = 테마 1등 · 🔥 = 테마 안 거래대금 1위 · 🦀 = 오늘 꽃게 · 거래대금 10억 미만 종목 제외 · ↳는 관련 뉴스(원인이 아닐 수도)")
     return "\n\n".join(parts), now.strftime("%Y-%m-%d")
 
 
@@ -7143,12 +7145,15 @@ def _build_watch_candidates() -> str:
             r = supabase.table("brief_cache").select("data").eq("key", "theme_top_prevday").limit(1).execute().data
             snap = r[0]["data"] if r else None
         tl = []
+        _sd, _sg, _sk = _prev_sig_sets()  # 🐻 곰발 · 🦀 꽃게 = 전 거래일 HTS 확정 (2026-11-22 JM)
+        sm = lambda c: (" 🐻" if c in _sg else "") + (" 🦀" if c in _sk else "")
         for t in (snap or {}).get("themes") or _theme_top_now():
             tl.append(f"· {t['name']} {t['pct']:+.1f}%")
             for x in t["stocks"]:
-                tl.append(f"   {x['name']} {x['pct']:+.1f}% 🔗 {_stock_link(x['code'])}")
+                tl.append(f"   {x['name']}{sm(x['code'])} {x['pct']:+.1f}% 🔗 {_stock_link(x['code'])}")
         if tl:
-            lines.append("🔥 전일 강세 테마" + (f" ({snap.get('date')} 마감)" if snap else "") + "\n" + "\n".join(tl))
+            lines.append("🔥 전일 강세 테마" + (f" ({snap.get('date')} 마감)" if snap else "") + "\n" + "\n".join(tl)
+                         + "\n   🐻 곰발 · 🦀 꽃게 = 전일 HTS 신호")
     except Exception as e:
         print(f"[brief:candidates] 테마 실패: {e}")
     # ③ 전일 장 마감 후 ~ 오늘 아침 실적 공시 — 뺌 (11:00 공시 총정리에서)
@@ -7396,20 +7401,14 @@ def build_rally_brief(top_n: int = 20, min_value_eok: float = 50):
     pc_gom = {x["code"] for x in (_pcd.get("big") or [])}
     pc_gomt = {x["code"] for x in (_pcd.get("gomt") or [])}  # HTS 곰발 통합 (PC)
 
-    def gom_mark(code):
-        g = code in pc_gom
-        gi = code in pc_gomt
-        try:
-            t = _jm_signal_series(code).get("today") or {}
-            g = g or bool(t.get("g"))
-            gi = gi or bool(t.get("gi"))
-        except Exception:
-            pass
-        return " 🎯" if (g and gi) else " ●곰발" if g else " ○통합" if gi else ""
+    pc_kkot = {x["code"] for x in (_pcd.get("kkot") or []) if x.get("code")}  # ⚪ 흰색(지금 만족)만 — 빠진 회색은 뺌
+
+    def gom_mark(code):  # 🦀 오늘 꽃게 검색기에 있으면 (2026-11-22 JM: 곰발 대신 꽃게만)
+        return " 🦀" if code in pc_kkot else ""
 
     lines = [f"🚀 아침 상승 랭킹 ({now.month}/{now.day} 09:00~{now.strftime('%H:%M')} 기준)\n━━━━━━━━━━━━",
              "등락률 TOP 12 + 거래대금 TOP 12 종합 순위 (두 순위 합) · 거래대금 50억 이상 · ETF·스팩·우선주 제외",
-             "● 곰발 · ○ 곰발 통합 · 🎯 둘 다"]
+             "🦀 = 오늘 꽃게 검색기 (HTS)"]
     try:
         reasons = _rally_reasons(rows)
     except Exception as e:
@@ -12351,25 +12350,46 @@ def _crab_big_alert(payload: dict):
                 break
 
 
-def _gom_mark(code: str) -> str:
-    """🐻 곰발 겹침 표시 (2026-11-09) — ' ●곰발' · ' ○통합' · ' 🎯' · '' (PC 곰발/곰발 통합 목록 + 서버 일봉 신호)"""
+def _kkot_today_set() -> set:
+    """🦀 오늘 꽃게 종목 — 15:31~ 저장된 HTS 확정(꽃게 검색기)이 있으면 그것, 없으면 지금 PC 꽃게 검색기 목록 (2026-11-22)"""
+    today = now_kst().strftime("%Y-%m-%d")
+    if _hts_sig.get("day") == today and (_hts_sig.get("k") or _hts_sig.get("saved")):
+        return set(_hts_sig.get("k") or [])
     d = _crab_pc.get("data") or {}
-    g = any(x.get("code") == code for x in (d.get("big") or []))
-    gi = any(x.get("code") == code for x in (d.get("gomt") or []))
+    return {x.get("code") for x in (d.get("kkot") or []) if x.get("code")}
+
+
+def _gom_mark(code: str) -> str:
+    """🦀 꽃게 표시 (2026-11-22 JM: 곰발 대신 꽃게만) — 오늘 꽃게 검색기에 있으면 ' 🦀'"""
     try:
-        t = _jm_signal_series(code).get("today") or {}
-        g = g or bool(t.get("g"))
-        gi = gi or bool(t.get("gi"))
+        return " 🦀" if code in _kkot_today_set() else ""
+    except Exception:
+        return ""
+
+
+def _prev_sig_sets() -> tuple:
+    """☀️ 장전 리포트용 — 전 거래일 HTS 확정 곰발·꽃게 → (날짜, 곰발 set, 꽃게 set)"""
+    today = now_kst().strftime("%Y-%m-%d")
+    try:
+        rows = supabase.table("brief_cache").select("key,data").like("key", "hts_sig:%").order("key", desc=True).limit(5).execute().data or []
+        for r in rows:
+            d = r["data"] or {}
+            day = d.get("day") or r["key"].split(":", 1)[-1]
+            if day < today:
+                return day, set(d.get("g") or []), set(d.get("k") or [])
     except Exception:
         pass
-    return " 🎯" if (g and gi) else " ●곰발" if g else " ○통합" if gi else ""
+    pday, items = _gom_prev_day_items()  # HTS 확정 저장 전이면 어제 꽃게 포착이라도
+    return pday, set(), set(items)
 
 
 # ⚡ 단타 검색기 5종 키 (2026-11-07) — crab 큰형님 자전거 · small 완빨 · bong3 봉삼이 · gomt 곰발 통합 · big 곰발
 CRAB_KEYS = ("crab", "small", "bong3", "gomt", "big")
 
 
-# 🐻 오늘 곰발에 한 번이라도 잡힌 종목 (편입 + 이탈) — 다음 날 08:40 NXT 프리마켓에 씀 (2026-11-07)
+# 🦀 오늘 꽃게에 한 번이라도 잡힌 종목 (편입 + 이탈) — 다음 날 08:40 NXT 프리마켓에 씀
+#    (2026-11-07 곰발로 시작 → 2026-11-22 JM: 꽃게로 바꿈, 저장 키 kkot_day · kkot_snap)
+_DAY_KEY, _SNAP_KEY, _DAY_SRC = "kkot_day", "kkot_snap", ("kkot", "kkot_removed")
 _gom_day = {"day": "", "items": {}, "saved": 0}
 
 
@@ -12381,19 +12401,21 @@ def _gom_day_save(payload: dict):
     if _gom_day["day"] != day:
         _gom_day.update({"day": day, "items": {}, "saved": 0})
         try:  # 서버 재시작 대비 — 오늘 저장분 이어받기
-            r = supabase.table("brief_cache").select("data").eq("key", f"gom_day:{day}").limit(1).execute().data
+            r = supabase.table("brief_cache").select("data").eq("key", f"{_DAY_KEY}:{day}").limit(1).execute().data
             if r:
                 _gom_day["items"] = dict(r[0]["data"].get("items") or {})
         except Exception:
             pass
     n0 = len(_gom_day["items"])
-    for k in ("big", "big_removed"):
+    if not any(k in payload for k in _DAY_SRC):
+        return
+    for k in _DAY_SRC:
         for x in payload.get(k, []) or []:
             if x.get("code"):
                 _gom_day["items"].setdefault(x["code"], x.get("name") or x["code"])
     if len(_gom_day["items"]) != n0 or time.time() - _gom_day["saved"] > 600:
         _gom_day["saved"] = time.time()
-        supabase.table("brief_cache").upsert({"key": f"gom_day:{day}", "data": {"day": day, "items": _gom_day["items"]},
+        supabase.table("brief_cache").upsert({"key": f"{_DAY_KEY}:{day}", "data": {"day": day, "items": _gom_day["items"]},
                                               "updated_at": now.isoformat()}).execute()
 
 
@@ -12402,7 +12424,7 @@ def gom_day_status():
     """🐾 곰발 포착 저장 상태 확인 — 오늘 몇 종목 저장됐나 · 내일 08:40에 쓸 '어제' 목록"""
     today = now_kst().strftime("%Y-%m-%d")
     try:
-        rows = supabase.table("brief_cache").select("key,data,updated_at").like("key", "gom_day:%").order("key", desc=True).limit(5).execute().data or []
+        rows = supabase.table("brief_cache").select("key,data,updated_at").like("key", f"{_DAY_KEY}:%").order("key", desc=True).limit(5).execute().data or []
     except Exception as e:
         return {"ok": False, "error": str(e)}
     d, items = _gom_prev_day_items()
@@ -12411,17 +12433,32 @@ def gom_day_status():
             "saved_days": [{"day": r["key"].split(":", 1)[1], "count": len((r["data"] or {}).get("items") or {}), "updated_at": r.get("updated_at")} for r in rows]}
 
 
+def _white_only(day: str, items: dict) -> dict:
+    """⚪ 흰색만 (2026-11-22 JM) — 그날 정규장 마감(15:31~) HTS 확정 꽃게에 남은 종목만. 확정 기록이 없으면 그대로"""
+    try:
+        if _hts_sig.get("day") == day and _hts_sig.get("saved"):
+            k = set(_hts_sig.get("k") or [])
+        else:
+            r = supabase.table("brief_cache").select("data").eq("key", f"hts_sig:{day}").limit(1).execute().data
+            if not r:
+                return items
+            k = set((r[0]["data"] or {}).get("k") or [])
+        return {c: n for c, n in items.items() if c in k}
+    except Exception:
+        return items
+
+
 def _gom_prev_day_items() -> tuple:
-    """오늘 이전 가장 최근 거래일의 곰발 포착 종목 → (날짜, {code: name})"""
+    """오늘 이전 가장 최근 거래일의 꽃게 포착 종목(⚪ 흰색만) → (날짜, {code: name})"""
     today = now_kst().strftime("%Y-%m-%d")
     try:
-        rows = supabase.table("brief_cache").select("key,data").like("key", "gom_day:%").order("key", desc=True).limit(5).execute().data or []
+        rows = supabase.table("brief_cache").select("key,data").like("key", f"{_DAY_KEY}:%").order("key", desc=True).limit(5).execute().data or []
     except Exception:
         return "", {}
     for r in rows:
         d = r["key"].split(":", 1)[1]
         if d < today and (r["data"] or {}).get("items"):
-            return d, dict(r["data"]["items"])
+            return d, _white_only(d, dict(r["data"]["items"]))
     return "", {}
 
 
@@ -12430,14 +12467,14 @@ _nxt_gom_info: dict = {"day": "", "rows": {}}
 
 def _gom_snap_load(day: str) -> dict:
     try:
-        r = supabase.table("brief_cache").select("data").eq("key", f"gom_snap:{day}").limit(1).execute().data
+        r = supabase.table("brief_cache").select("data").eq("key", f"{_SNAP_KEY}:{day}").limit(1).execute().data
         return dict((r[0]["data"] or {}).get("rows") or {}) if r else {}
     except Exception:
         return {}
 
 
 def _gom_snap_save(day: str, rows: dict):
-    supabase.table("brief_cache").upsert({"key": f"gom_snap:{day}", "data": {"day": day, "rows": rows},
+    supabase.table("brief_cache").upsert({"key": f"{_SNAP_KEY}:{day}", "data": {"day": day, "rows": rows},
                                           "updated_at": now_kst().isoformat()}).execute()
 
 
@@ -12452,10 +12489,13 @@ def _gom_snapshot_job():
     items = dict(_gom_day["items"]) if _gom_day["day"] == day else {}
     if not items:
         try:
-            r = supabase.table("brief_cache").select("data").eq("key", f"gom_day:{day}").limit(1).execute().data
+            r = supabase.table("brief_cache").select("data").eq("key", f"{_DAY_KEY}:{day}").limit(1).execute().data
             items = dict((r[0]["data"] or {}).get("items") or {}) if r else {}
         except Exception:
             items = {}
+    if not items:
+        return
+    items = _white_only(day, items)  # ⚪ 흰색만 (15:31~ HTS 확정 꽃게)
     if not items:
         return
 
@@ -15448,22 +15488,23 @@ def _run_nxt_premarket():
         dn = sorted(rows, key=lambda x: x["pct"])[:3]
         link = lambda c: f"https://jm-tracker.vercel.app/stock-analysis?code={c}"
         lines = ([f"🌅 NXT 프리마켓 ({r.get('at', '')[:5]} 기준 · {len(rows)}종목)"] + ([f"📊 {mood}"] if mood else []) + ["▲ 강한 종목"]) if rows else \
-                ["🌅 NXT 프리마켓 — 오늘은 NXT 시세가 비어서 왔어요 (키움이 프리마켓 시세를 0으로 줌). 🐾 어제 곰발만 보내요"]
-        lines += [f"· {x.get('name') or x['code']} {x['pct']:+.2f}% · {x['price']:,}원 · {x['volume']:,}주\n  🔗 {link(x['code'])}" for x in up if x["pct"] > 0]
+                ["🌅 NXT 프리마켓 — 오늘은 NXT 시세가 비어서 왔어요 (키움이 프리마켓 시세를 0으로 줌). 🦀 어제 꽃게만 보내요"]
+        gday, gitems = _gom_prev_day_items()  # 🦀 어제 꽃게 포착 (2026-11-22: 곰발 → 꽃게)
+        km = lambda c: " 🦀" if c in gitems else ""
+        lines += [f"· {x.get('name') or x['code']}{km(x['code'])} {x['pct']:+.2f}% · {x['price']:,}원 · {x['volume']:,}주\n  🔗 {link(x['code'])}" for x in up if x["pct"] > 0]
         weak = [x for x in dn if x["pct"] < 0]
         if weak:
             lines.append("▼ 약한 종목")
-            lines += [f"· {x.get('name') or x['code']} {x['pct']:+.2f}%" for x in weak]
+            lines += [f"· {x.get('name') or x['code']}{km(x['code'])} {x['pct']:+.2f}%" for x in weak]
         if rows:
-            lines.append("※ 대형주 30 + 관심종목·검색기·52주 신고가 후보 (NXT 프리마켓은 거래가 적어 방향 참고용 — 매매는 KRX 정규장)")
-        # 🐻 어제 곰발 포착 종목 (2026-11-07 JM) — NXT와 관계없이 어제 통합 종가 기준 · 거래대금 순
-        gday, gitems = _gom_prev_day_items()
+            lines.append("※ 대형주 30 + 관심종목·검색기·52주 신고가 후보 · 🦀 = 어제 꽃게 (NXT 프리마켓은 거래가 적어 방향 참고용 — 매매는 KRX 정규장)")
+        # 🦀 어제 꽃게 포착 종목 (2026-11-07 곰발 → 2026-11-22 꽃게) — 어제 정규장 종가 기준 · 거래대금+거래량 순
         info = dict(_nxt_gom_info["rows"]) if _nxt_gom_info.get("day") == day else {}
         snap = _gom_snap_load(gday) if gday else {}
         for c, v in snap.items():  # 🐾 어제 저녁에 저장한 값이 먼저 (2026-11-10)
             info[c] = {**info.get(c, {}), **{k: x for k, x in v.items() if x not in (None, "")}}
         if gitems:
-            lines.append(f"\n🐾 어제({gday[5:].replace('-', '/')}) 곰발 포착 {len(gitems)}종목 (어제 정규장 종가 · 거래대금+거래량 순위)")
+            lines.append(f"\n🦀 어제({gday[5:].replace('-', '/')}) 꽃게 포착 {len(gitems)}종목 (어제 정규장 종가 · 거래대금+거래량 순위)")
             # 🏆 2026-11-10 JM: 거래대금 순위 + 거래량 순위 → 두 순위 합이 작은 순
             ra = {c: i for i, c in enumerate(sorted(gitems, key=lambda c: -(info.get(c, {}).get("amount") or 0)), 1)}
             rv = {c: i for i, c in enumerate(sorted(gitems, key=lambda c: -(info.get(c, {}).get("volume") or 0)), 1)}
@@ -15486,13 +15527,13 @@ def _run_nxt_premarket():
                     lines.append(f"{i}. {nm} · {ftxt} · {ptxt}\n   🔗 {link(c)}")
             lines.append("※ 가격·등락률·거래대금 = 어제 정규장 마감(15:45 저장) · 외국인 = 어제 순매수(18:10 저장) · 흑자/적자 = 최근 분기 영업이익")
         else:
-            lines.append("\n🐾 어제 곰발 포착 기록이 없어요 — 세력트래커가 어제 장중에 곰발 목록을 못 올렸거나, 저장을 시작한 첫날이에요")
+            lines.append("\n🦀 어제 꽃게 포착 기록이 없어요 — 세력트래커가 어제 장중에 꽃게 목록을 못 올렸거나, 저장을 시작한 첫날이에요")
         if send_telegram("\n".join(lines)):
             _mark_brief_sent("nxt_premarket", day)
             if rows:
-                _alert_clock_state["nxt_status"] = f"{now_kst().strftime('%H:%M')} 보냄 · NXT {len(rows)}종목 · 🐾 곰발 {len(gitems)}종목"
+                _alert_clock_state["nxt_status"] = f"{now_kst().strftime('%H:%M')} 보냄 · NXT {len(rows)}종목 · 🦀 꽃게 {len(gitems)}종목"
             else:
-                _alert_clock_state["nxt_status"] += f" → 안내 + 🐾 곰발 {len(gitems)}종목 보냄"
+                _alert_clock_state["nxt_status"] += f" → 안내 + 🦀 꽃게 {len(gitems)}종목 보냄"
         else:
             _alert_clock_state["nxt_status"] = f"{now_kst().strftime('%H:%M')} 텔레그램 전송 실패 — 다음 확인 때 다시"
 
