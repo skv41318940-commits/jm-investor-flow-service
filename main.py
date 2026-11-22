@@ -15861,8 +15861,9 @@ def pc_task_result(payload: dict):
                 store[code] = (time.time(), sorted(rows, key=lambda x: x["date"]))
     if kind == "vp20" and payload.get("code"):
         _vp20[payload["code"]] = {"day": now_kst().strftime("%Y-%m-%d"), "rows": payload.get("rows", []), "asked": time.time()}
-    if kind == "hold" and payload.get("code"):  # 📦 창구별 보유 잔량 (2026-11-22)
+    if kind == "hold" and payload.get("code"):  # 📦 창구별 보유 잔량 (2026-11-22) — 중간 결과(partial)도 바로 저장
         _bhold[(payload["code"], payload.get("start") or "")] = {**payload, "got": time.time()}
+        _bpc["alive_at"] = time.time()  # 계산 중엔 PC가 /next를 못 물어봐서 → 중간 결과 = 살아있음
         if len(_bhold) > 300:
             _bhold.clear()
     return {"ok": True}
@@ -15871,14 +15872,16 @@ def pc_task_result(payload: dict):
 # 📦 창구별 보유 잔량 (2026-11-22 JM 아이디어) — 기준일(구간1 등)부터 오늘까지 창구마다 '지금 몇 주 들고 있나'
 #   PC가 키움 opt10038(기간 순위) + opt10043(창구별 날짜별 순매수 × 종가)로 계산 → 산 건 더하고 판 만큼 뺀 잔량 · 그 평단
 _bhold: dict = {}   # (code, start) → 결과
+_bhold_req: dict = {}  # (code, start) → 요청 시각 (계산 중엔 'PC 꺼짐' 대신 '계산 중')
 
 
 @app.post("/api/broker-hold/request")
 def broker_hold_request(code: str, start: str = ""):
     code, start = (code or "").strip(), (start or "").strip()
     r = _bhold.get((code, start))
-    if r and time.time() - r.get("got", 0) < 600:
+    if r and not r.get("partial") and time.time() - r.get("got", 0) < 600:
         return {"ok": True, "queued": False}
+    _bhold_req[(code, start)] = time.time()
     with _bpc_lock:
         if not any(t.get("kind") == "hold" and t.get("code") == code and t.get("start") == start for t in _bpc["tasks"]):
             _bpc["tasks"].append({"kind": "hold", "code": code, "start": start})
@@ -15889,9 +15892,10 @@ def broker_hold_request(code: str, start: str = ""):
 def broker_hold_get(code: str, start: str = ""):
     code, start = (code or "").strip(), (start or "").strip()
     alive = time.time() - _bpc["alive_at"] < 20
+    waiting = time.time() - _bhold_req.get((code, start), 0) < 240
     r = _bhold.get((code, start))
     if not r:
-        return {"ok": False, "pc_alive": alive}
+        return {"ok": False, "pc_alive": alive or waiting, "waiting": waiting}
     if r.get("error"):
         return {"ok": False, "pc_alive": alive, "error": r["error"]}
     try:
@@ -15901,11 +15905,12 @@ def broker_hold_get(code: str, start: str = ""):
     rows = []
     for x in r.get("rows") or []:
         av = x.get("avg_hold")
-        rows.append({**x, "hold_eok": round(x["hold"] * price / 1e8, 1) if price else None,
+        rows.append({**x, "hold_eok": round(x["hold"] * price / 1e8, 1) if price and x.get("hold") is not None else None,
                      "pnl": round((price / av - 1) * 100, 1) if price and av else None})
-    rows.sort(key=lambda x: -(x.get("hold") or 0))
-    return {"ok": True, "pc_alive": alive, "price": price, "st": r.get("st"), "en": r.get("en"), "at": r.get("at"),
-            "rows": rows, "foreign_hold": sum(x["hold"] for x in rows if x.get("foreign"))}
+    rows.sort(key=lambda x: -(x["hold"] if x.get("hold") is not None else max(0, x.get("net") or 0)))
+    return {"ok": True, "pc_alive": alive or waiting, "price": price, "st": r.get("st"), "en": r.get("en"), "at": r.get("at"),
+            "partial": bool(r.get("partial")), "done": r.get("done", 0), "total": r.get("total", 0),
+            "rows": rows, "foreign_hold": sum(x["hold"] or 0 for x in rows if x.get("foreign"))}
 
 
 @app.get("/api/pc-probe")
