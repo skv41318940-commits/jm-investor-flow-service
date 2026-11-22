@@ -15680,6 +15680,9 @@ def data_source_status():
             "label": "🟢 키움" if _pc_alive() else "⚪ 한투", "pc_seen_sec": round(time.time() - _bpc.get("alive_at", 0))}
 
 
+_OHLCV_CHART_USE_KIWOOM = False  # 차트 일봉에 키움 opt10081 덮어쓰기 (2026-11-22 끔 — HTS와 캔들이 달라서)
+
+
 @app.get("/api/stock-ohlcv")
 def stock_ohlcv_endpoint(code: str, start: str, end: str, mode: str = "krx", wait: int = 0):
     """
@@ -15698,6 +15701,12 @@ def stock_ohlcv_endpoint(code: str, start: str, end: str, mode: str = "krx", wai
                     **({} if cs else {"error": "통합 일봉을 못 받았어요"})}
         except Exception as e:
             base = {"ok": False, "error": str(e)}
+    # ⚠️ 2026-11-22: 키움 opt10081 일봉은 종목코드·_AL·_NX 모두 같은 값(시간외·NXT 섞임)이라
+    #    HTS 정규장/통합 캔들과 달라서 차트에는 안 씀 → 정규장 = KRX(pykrx)·한투 J, 통합 = 한투 UN
+    if not _OHLCV_CHART_USE_KIWOOM:
+        base["mode"] = mode
+        base["source"] = base.get("source") or ("KRX" if base.get("ok") else "한투")
+        return base
     store = _kk_daily if mode == "krx" else _kw_daily
     hit = store.get(code)
     if _pc_alive() and (not hit or time.time() - hit[0] > _kw_daily_fresh_sec()):
@@ -15913,4 +15922,3 @@ def naver_industry_debug(no: str = "", path: str = "stocks/industry"):
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
-
