@@ -12543,6 +12543,91 @@ def _nxt_gom_prefetch():
     _nxt_gom_info.update({"day": day, "rows": out})
 
 
+# 🟢 HTS 확정 신호 저장 (2026-11-22 키움+한투 결합)
+#   영웅문 조건검색엔 '내 신호(수식관리)'를 넣을 수 없어서 기존 HTS 조건식을 그대로 씀:
+#     🦀 꽃게 = PC "꽃게"(kkot) 검색기 = 꽃게 신호와 같은 A~R
+#     ▲ 역배정초 = PC "역배정초"(yeok) 조건식
+#     🐻 곰발 = PC "곰발"(big, A~K) 편입 종목 중 오늘 봉이 +2%↑ · 당일 10억↑ · 과열(5이평 3일 상승) 아님 · V(갭/거래량) 통과
+#   정규장 마감 직후(15:31~15:59) 그 순간 종목을 오늘 날짜 'HTS 확정'으로 Supabase에 저장 → 차트 진한 점
+_hts_sig = {"day": "", "g": [], "k": [], "y": [], "saved": 0, "busy": False}
+_hts_sig_cache = {"at": 0, "map": {}, "from": ""}
+
+
+def _gom_today_ok(code: str) -> bool:
+    """곰발 신호 중 HTS 곰발 검색기(A~K)에 없는 조건만 오늘 한투 J 일봉으로 확인 (M · J · !HOT · V)"""
+    end = now_kst().strftime("%Y-%m-%d")
+    start = (now_kst() - timedelta(days=20)).strftime("%Y-%m-%d")
+    b = (_regular_daily(code, start, end).get("candles") or [])
+    if len(b) < 8 or b[-1]["date"] != end:
+        return False
+    C = [x["close"] for x in b]; O = [x["open"] for x in b]; V = [x.get("volume") or 0 for x in b]
+    m5 = lambda i: sum(C[i - 4:i + 1]) / 5
+    t = len(b) - 1
+    chg = (C[t] / C[t - 1] - 1) * 100 if C[t - 1] else 0
+    gap = (O[t] / C[t - 1] - 1) * 100 if C[t - 1] else 0
+    ochg = (C[t] / O[t] - 1) * 100 if O[t] else 0
+    amt = b[t].get("amount") or C[t] * V[t]
+    hot = m5(t) > m5(t - 1) > m5(t - 2)
+    v_ok = (gap >= -1.5 and (V[t] > V[t - 1] or (V[t] >= V[t - 1] * 0.75 and ochg >= 7))) or gap >= 4 or (chg >= 8 and V[t] > V[t - 1])
+    return chg >= 2 and amt >= 1e9 and not hot and v_ok
+
+
+def _hts_sig_save(payload: dict):
+    now = now_kst()
+    hm = now.hour * 100 + now.minute
+    if now.weekday() >= 5 or not (1531 <= hm <= 1559) or _hts_sig["busy"]:
+        return
+    if time.time() - _hts_sig["saved"] < 180 and _hts_sig["day"] == now.strftime("%Y-%m-%d"):
+        return  # 3분에 한 번만 (마지막 저장이 16:00 직전 값)
+    big = sorted({x["code"] for x in (payload.get("big") or []) if x.get("code")})
+    k = sorted({x["code"] for x in (payload.get("kkot") or []) if x.get("code")})
+    y = sorted({x["code"] for x in (payload.get("yeok") or []) if x.get("code")})
+    day = now.strftime("%Y-%m-%d")
+
+    def work():
+        _hts_sig["busy"] = True
+        try:
+            g = []
+            for c in big:
+                try:
+                    if _gom_today_ok(c):
+                        g.append(c)
+                except Exception:
+                    pass
+                time.sleep(0.15)
+            _hts_sig.update({"day": day, "g": g, "k": k, "y": y, "saved": time.time()})
+            supabase.table("brief_cache").upsert({"key": f"hts_sig:{day}", "data": {"day": day, "g": g, "k": k, "y": y,
+                                                  "big": big}, "updated_at": now_kst().isoformat()}).execute()
+            _hts_sig_cache["at"] = 0
+            print(f"[hts_sig] {day} 저장 — 곰발 {len(g)}/{len(big)} · 꽃게 {len(k)} · 역배정초 {len(y)}")
+        except Exception as e:
+            print(f"[hts_sig] 저장 실패: {e}")
+        finally:
+            _hts_sig["busy"] = False
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def _hts_sig_map() -> dict:
+    """code → {"g": set(날짜), "k": set(날짜)} + 저장 시작일 (10분 캐시)"""
+    if time.time() - _hts_sig_cache["at"] < 600:
+        return _hts_sig_cache
+    m, days = {}, []
+    try:
+        rows = supabase.table("brief_cache").select("key,data").like("key", "hts_sig:%").limit(2000).execute().data or []
+        for r in rows:
+            d = (r.get("data") or {})
+            day = d.get("day") or r["key"].split(":", 1)[-1]
+            days.append(day)
+            for kind in ("g", "k", "y"):
+                for c in d.get(kind) or []:
+                    m.setdefault(c, {"g": set(), "k": set(), "y": set()})[kind].add(day)
+    except Exception as e:
+        print(f"[hts_sig] 읽기 실패: {e}")
+    _hts_sig_cache.update({"at": time.time(), "map": m, "from": min(days) if days else ""})
+    return _hts_sig_cache
+
+
 @app.post("/api/crab-pc")
 def crab_pc_post(payload: dict):
     # 🐻 곰발 편입 · TOP 5 알림은 끔 (2026-11-07 JM — 09:30 상승 랭킹에 곰발 표시로 대신)
@@ -12550,6 +12635,10 @@ def crab_pc_post(payload: dict):
         _gom_day_save(payload)
     except Exception as e:
         print(f"[gom_day] 저장 실패: {e}")
+    try:
+        _hts_sig_save(payload)
+    except Exception as e:
+        print(f"[hts_sig] 저장 실패: {e}")
     _crab_pc.update({"data": payload, "at": time.time()})
     _crab_pc_view["at"] = 0  # 다음 조회 때 새로 시세 붙이기
     if time.time() - _crab_pc.get("db_at", 0) > 30:  # ⚡ PC가 3초마다 보내니까 DB 저장은 30초에 한 번만 (2026-11-07)
@@ -14131,7 +14220,13 @@ def gom_minute_multi(date: str = "", names: str = "", codes: str = ""):
 def jm_signals(code: str):
     """🐻 곰발 · ▲ 역배정초 날짜 목록 (차트에 점 찍기용)"""
     try:
-        return _jm_signal_series((code or "").strip().upper())
+        code = (code or "").strip().upper()
+        res = dict(_jm_signal_series(code))
+        # 🟢 HTS 확정 날짜 (PC 조건검색 저장분) — 차트에서 진한 점, 한투 계산만 있는 날은 연한 점
+        h = _hts_sig_map()
+        mine = h["map"].get(code) or {"g": set(), "k": set(), "y": set()}
+        res.update({"hg": sorted(mine["g"]), "hk": sorted(mine["k"]), "hy": sorted(mine["y"]), "hts_from": h.get("from") or ""})
+        return res
     except Exception as e:
         return {"ok": False, "error": str(e), "g": [], "y": []}
 
