@@ -12631,13 +12631,13 @@ def _jm_signal_series(code: str) -> dict:
 
     def gom_new(t):
         """🐻 곰발 (2026-11-21 확정 · HTS 수식관리 '곰발'과 같음)"""
-        if t < 45:
+        if t < 39 or m5[t - 4] is None:  # HTS처럼 40봉(Highest 40)이 쌓인 날부터 — 신규 상장주 10/16 확인 (2026-11-22)
             return False
         gap = (O[t] / C[t - 1] - 1) * 100 if C[t - 1] else 0
-        A_ = max(A[t - 39:t + 1]) >= 5e10
+        A_ = max(A[max(0, t - 39):t + 1]) >= 5e10
         BCD = C[t] >= C[t - 1] * 0.985 and C[t] >= C[t - 2] * 0.975 and C[t] >= C[t - 3] * 0.975
-        E_ = max(OCHG[t - 25:t + 1]) >= 8 or CHG[t] >= 15 or (CHG[t] >= 10 and V[t] >= V[t - 1] * 3)
-        F_ = min(CHG[t - 9:t + 1]) <= -2.5
+        E_ = max(OCHG[max(0, t - 25):t + 1]) >= 8 or CHG[t] >= 15 or (CHG[t] >= 10 and V[t] >= V[t - 1] * 3)
+        F_ = min(CHG[max(1, t - 9):t + 1]) <= -2.5
         GH = C[t] > O[t - 1] or C[t] > C[t - 1]
         I_ = H[t] > m5[t]
         J_ = A[t] >= 1e9
@@ -12651,10 +12651,10 @@ def _jm_signal_series(code: str) -> dict:
 
     def crab_new(t):
         """🦀 꽃게 (2026-11-21 확정 · HTS 검색기/수식관리 '꽃게' A~R과 같음)"""
-        if t < 45:
+        if t < 39 or m5[t - 4] is None:
             return False
         gap = (O[t] / C[t - 1] - 1) * 100 if C[t - 1] else 0
-        if not (max(A[t - 39:t + 1]) >= 5e10):
+        if not (max(A[max(0, t - 39):t + 1]) >= 5e10):
             return False
         if not (C[t] >= C[t - 3] * 0.975 and C[t] >= C[t - 2] * 0.975 and C[t] >= C[t - 1] * 0.975):
             return False
@@ -12662,12 +12662,12 @@ def _jm_signal_series(code: str) -> dict:
             return False
         if not (H[t] > m5[t] or H[t - 1] > m5[t - 1] or H[t - 2] > m5[t - 2]):
             return False
-        if not (max(OCHG[t - 25:t + 1]) >= 8 and min(CHG[t - 9:t + 1]) <= -5):
+        if not (max(OCHG[max(0, t - 25):t + 1]) >= 8 and min(CHG[max(1, t - 9):t + 1]) <= -5):
             return False
         if not ((C[t] > C[t - 1] or C[t] > O[t - 1]) and H[t] >= H[t - 1] * 0.97 and V[t] >= V[t - 1] and gap < 4):
             return False
         return any(m20[j] is not None and m20[j - 1] is not None and C[j] > m20[j] and C[j - 1] <= m20[j - 1]
-                   for j in range(t - 9, t + 1))
+                   for j in range(max(1, t - 9), t + 1))
 
     for t in range(6, n):
         # 🐻 곰발 · 🦀 꽃게 (2026-11-22 교체 — 옛 곰발·곰발 통합 삭제)
@@ -12690,7 +12690,8 @@ def _jm_signal_series(code: str) -> dict:
            "today": {"g": bool(g_dates and g_dates[-1] == last), "k": bool(k_dates and k_dates[-1] == last),
                      "gi": False, "y": bool(y_dates and y_dates[-1] == last)},
            "last": last, "source": sig_src}
-    _sig_series_cache[code] = (time.time(), res)
+    # 한투 J가 실패해서 통합 섞인 데이터로 계산했으면 1분만 기억 (다음에 다시 한투 J로)
+    _sig_series_cache[code] = (time.time() - (ttl - 60 if "통합" in sig_src else 0), res)
     return res
 
 
@@ -15639,13 +15640,17 @@ def _kis_daily_candles(code: str, start: str, end: str, market: str = "J") -> li
 def _regular_daily(code: str, start: str, end: str) -> dict:
     """🕘 정규장(KRX 09:00~15:30) 일봉 — 한투 J 먼저 (2026-11-22)
     pykrx·키움 opt10081은 NXT 애프터마켓이 섞인 통합 종가가 나와서 HTS 정규장 차트와 다름 → 한투 J가 안 될 때만 pykrx"""
-    try:
-        cs = _kis_daily_candles(code, start, end, "J")
-        if cs:
-            return {"ok": True, "code": code, "candles": cs, "source": "한투J"}
-    except Exception as e:
-        print(f"[regular_daily] {code} 한투 J 실패: {e}")
-    return _stock_ohlcv_base(code, start, end)
+    for attempt in range(3):  # 차트·신호가 동시에 부르면 한투 초당 한도에 걸려 빈 값이 올 때가 있어서 다시 시도
+        try:
+            cs = _kis_daily_candles(code, start, end, "J")
+            if cs:
+                return {"ok": True, "code": code, "candles": cs, "source": "한투J"}
+        except Exception as e:
+            print(f"[regular_daily] {code} 한투 J 실패({attempt + 1}): {e}")
+        time.sleep(0.6 * (attempt + 1))
+    base = _stock_ohlcv_base(code, start, end)
+    base["source"] = "pykrx(통합 섞임)"
+    return base
 
 
 def _stock_ohlcv_base(code: str, start: str, end: str):
