@@ -9420,6 +9420,22 @@ def stock_minute_by_date_endpoint(code: str, date: str, market: str = "J"):
             t = datetime.strptime(earliest, "%H%M%S") - timedelta(minutes=1)
             cursor = t.strftime("%H%M%S")
             time.sleep(0.12)
+        # 📝 수능날처럼 10시에 열면 16:30에 닫음 → 15:30 뒤 1시간을 더 받기 (2026-11-22)
+        if market == "J" and rows and min(r["stck_cntg_hour"] for r in rows) >= "095500":
+            try:
+                data = kis_get(
+                    "/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice",
+                    "FHKST03010230",
+                    {"FID_COND_MRKT_DIV_CODE": market, "FID_INPUT_ISCD": code, "FID_INPUT_HOUR_1": "163000",
+                     "FID_INPUT_DATE_1": ymd, "FID_PW_DATA_INCU_YN": "Y", "FID_FAKE_TICK_INCU_YN": ""},
+                )
+                for r in data.get("output2") or []:
+                    h = r.get("stck_cntg_hour") or ""
+                    if r.get("stck_bsop_date") == ymd and "153000" < h <= "163000" and h not in seen:
+                        seen.add(h)
+                        rows.append(r)
+            except Exception:
+                pass
         candles = sorted(
             [{"time": f"{r['stck_cntg_hour'][:2]}:{r['stck_cntg_hour'][2:4]}", "open": float(r["stck_oprc"]),
               "high": float(r["stck_hgpr"]), "low": float(r["stck_lwpr"]), "close": float(r["stck_prpr"]),
@@ -10930,17 +10946,21 @@ _minute_mem: dict = {}
 
 
 def _minute_complete(candles: list) -> bool:
-    """하루치 정규장 분봉이 온전한가 — 9:05 전에 시작 · 300봉 이상 · 15:15 전 중간에 5분 넘게 빈 곳 없음 (2026-11-22)
-    (한투 페이지가 하나 빠지면 09:03→09:33처럼 30분이 통째로 비어서 세력평단·빨간선이 틀어짐)"""
-    if not candles or len(candles) < 300 or candles[0].get("time", "99:99") > "09:05":
+    """하루치 정규장 분봉이 온전한가 — 9:05 전에 시작 · 300봉 이상 · 중간에 5분 넘게 빈 곳 없음 (2026-11-22)
+    (한투 페이지가 하나 빠지면 09:03→09:33처럼 30분이 통째로 비어서 세력평단·빨간선이 틀어짐)
+    📝 수능날처럼 1시간 늦게 여는 날(10:00~16:30)은 10:05 전에 시작 + 16:20 넘어 끝나면 온전한 걸로"""
+    if not candles or len(candles) < 300:
+        return False
+    first, last = candles[0].get("time", "99:99"), candles[-1].get("time", "00:00")
+    if not (first <= "09:05" or (first <= "10:05" and last >= "16:20")):
         return False
     prev = None
-    for c in candles:
+    for i, c in enumerate(candles):
         t = c.get("time") or ""
         if len(t) < 5:
             return False
         m = int(t[:2]) * 60 + int(t[3:5])
-        if prev is not None and m < 915 and m - prev > 5:
+        if prev is not None and i < len(candles) - 1 and m - prev > 5:  # 마지막 봉(종가 단일가) 앞 빈 곳은 정상
             return False
         prev = m
     return True
