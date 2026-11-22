@@ -10945,6 +10945,9 @@ def new_highs_endpoint(raw: bool = False):
 _minute_mem: dict = {}
 
 
+_minute_sig: dict = {}  # 빈 곳 있는 날 직전 모양 (두 번 똑같으면 진짜 빈 시간)
+
+
 def _minute_complete(candles: list) -> bool:
     """하루치 정규장 분봉이 온전한가 — 9:05 전에 시작 · 300봉 이상 · 중간에 5분 넘게 빈 곳 없음 (2026-11-22)
     (한투 페이지가 하나 빠지면 09:03→09:33처럼 30분이 통째로 비어서 세력평단·빨간선이 틀어짐)
@@ -10991,6 +10994,13 @@ def _minute_day_cached(code: str, day: str, market: str = "J") -> dict:
     out = stock_minute_by_date_endpoint(code, day)
     if out.get("ok") and out.get("candles"):
         full = _minute_complete(out["candles"])
+        if not full and day < today and market == "J":
+            # ⚡ 서킷브레이커·VI처럼 진짜로 거래가 멈춘 날(예: 11/06 코스피 09:03~09:33)은 다시 받아도 똑같이 비어 있음
+            #    → 두 번 받아서 봉 수·시간이 똑같으면 '진짜 빈 시간'으로 보고 저장 (페이지가 빠진 건 다시 받으면 채워짐)
+            sig = (len(out["candles"]), out["candles"][0]["time"], out["candles"][-1]["time"])
+            if _minute_sig.get(key) == sig:
+                full = True
+            _minute_sig[key] = sig
         # 지난 날짜인데 빈 곳이 있으면 메모리에 60초만 (위 hit 검사) → 다음에 다시 받아 봄
         _minute_mem[key] = (time.time(), out)
         if day < today and full:  # 하루치가 온전할 때만 보관 (앞 시간 잘림 · 중간 빈 곳 X)
