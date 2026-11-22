@@ -12991,7 +12991,7 @@ _sig_busy = {"on": False}
 _sig_series_cache: dict = {}  # code → (시각, 결과)
 
 
-def _sig_compute(b: list, C: list, H: list, O: list, A: list, yeok_a1: bool = True, tests: list = None, yeok_v: int = 5, y2_a1: bool = True) -> tuple:
+def _sig_compute(b: list, C: list, H: list, O: list, A: list, yeok_a1: bool = True, tests: list = None, yeok_v: int = 5, y2_a1: bool = True, last_only: bool = False) -> tuple:
     """🐻 곰발 · 🦀 꽃게 · ▲ 역배정초 날짜 계산 (국내·해외 공용, 2026-11-22 분리) → (g, k, gi, y)
     A = 원화 거래대금 (해외는 환율 곱해서 넣음)"""
     n = len(b)
@@ -13076,7 +13076,7 @@ def _sig_compute(b: list, C: list, H: list, O: list, A: list, yeok_a1: bool = Tr
         return any(m20[j] is not None and m20[j - 1] is not None and C[j] > m20[j] and C[j - 1] <= m20[j - 1]
                    for j in range(max(1, t - 9), t + 1))
 
-    for t in range(6, n):
+    for t in range(max(6, n - 1) if last_only else 6, n):  # last_only = 마지막 봉만 (분봉 신호 시각 찾기용, 2026-11-22)
         # 🐻 곰발 · 🦀 꽃게 (2026-11-22 교체 — 옛 곰발·곰발 통합 삭제)
         if gom_new(t):
             g_dates.append(b[t]["date"])
@@ -13155,6 +13155,99 @@ def _jm_signal_series(code: str) -> dict:
 
 def _jm_signals_today(code: str) -> dict:
     return _jm_signal_series(code)["today"]
+
+
+# ⏱ 분봉에 일봉 신호 뜬 시각 (2026-11-22 JM) — 그날 분봉을 3분마다 일봉 캔들로 합쳐서
+#    🐻 곰발 · 🦀 꽃게 · ▲ 역배정초 (일봉 공식 그대로)를 처음 만족한 시각 → 📈 데이 트레이딩 분봉에 표시
+#    빠졌다 다시 만족하면 그 시각도 (사부님 1번 · 3번 자리) · End = 장 마감까지 유지됐는지
+_msig_daily: dict = {}   # code → (시각, b, A)
+_msig_day: dict = {}     # (code, day) → (시각, 결과)
+
+
+def _msig_daily_base(code: str):
+    hit = _msig_daily.get(code)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1], hit[2]
+    end = now_kst().strftime("%Y-%m-%d")
+    start = (now_kst() - timedelta(days=560)).strftime("%Y-%m-%d")
+    b = _regular_daily(code, start, end).get("candles") or []
+    A = [(x.get("amount") or 0) or x["close"] * x["volume"] for x in b]
+    try:
+        un = {x["date"]: x.get("amount") or 0 for x in _kis_daily_candles(code, start, end, "UN")}
+        if un:
+            A = [max(un.get(x["date"], 0), A[i]) for i, x in enumerate(b)]
+    except Exception:
+        pass
+    _msig_daily[code] = (time.time(), b, A)
+    return b, A
+
+
+def _msig_one(code: str, day: str, b: list, A: list) -> dict:
+    today = now_kst().strftime("%Y-%m-%d")
+    key = (code, day)
+    hit = _msig_day.get(key)
+    if hit and (day < today or time.time() - hit[0] < 60):
+        return hit[1]
+    cs = (_minute_day_cached(code, day, "J").get("candles") or [])
+    cs = [c for c in cs if "09:00" <= str(c.get("time", ""))[:5] <= "16:30"]
+    res = {"g": [], "k": [], "y": [], "gEnd": False, "kEnd": False, "yEnd": False}
+    if not cs or not b:
+        return res
+    idx = next((i for i, x in enumerate(b) if x["date"] >= day), len(b))
+    hist, histA = b[max(0, idx - 230):idx], A[max(0, idx - 230):idx]
+    if len(hist) < 70:
+        return res
+    S = sum(c["close"] * c["volume"] for c in cs) or 1
+    ratio = 1.0
+    if idx < len(b) and b[idx]["date"] == day and A[idx] > 0:
+        ratio = min(3.0, max(1.0, A[idx] / S))  # 통합(KRX+NXT) 거래대금 비율 (HTS 수식과 같게)
+    hi, lo, vol, amt = 0.0, float("inf"), 0.0, 0.0
+    prev = {"g": False, "k": False, "y": False}
+    o0 = cs[0]["open"]
+    for i, c in enumerate(cs):
+        hi, lo = max(hi, c["high"]), min(lo, c["low"])
+        vol += c["volume"]
+        amt += c["close"] * c["volume"]
+        if (i + 1) % 3 and i != len(cs) - 1:
+            continue  # 3분마다 (+ 마지막 봉)
+        p = {"date": day, "open": o0, "high": hi, "low": lo, "close": c["close"], "volume": vol}
+        bb = hist + [p]
+        C = [x["close"] for x in bb]; H = [x["high"] for x in bb]; O = [x["open"] for x in bb]
+        AA = histA + [amt * ratio]
+        try:
+            g, k, _gi, y = _sig_compute(bb, C, H, O, AA, yeok_v=6, y2_a1=False, last_only=True)
+        except Exception:
+            continue
+        cur = {"g": bool(g), "k": bool(k), "y": bool(y)}
+        t3 = cs[max(0, i - 2) if (i + 1) % 3 == 0 else i]["time"][:5]  # 그 3분봉 첫 1분 시각
+        for s_ in ("g", "k", "y"):
+            if cur[s_] and not prev[s_]:
+                res[s_].append(t3)
+        prev = cur
+    res.update({"gEnd": prev["g"], "kEnd": prev["k"], "yEnd": prev["y"]})
+    _msig_day[key] = (time.time(), res)
+    if len(_msig_day) > 5000:
+        _msig_day.clear()
+    return res
+
+
+@app.get("/api/minute-jm-sig")
+def minute_jm_sig(code: str, dates: str):
+    """예: /api/minute-jm-sig?code=005930&dates=2026-11-20,2026-11-21 → 날짜별 {g:[시각], k, y, gEnd, kEnd, yEnd}"""
+    code = (code or "").strip()
+    ds = [d.strip() for d in (dates or "").split(",") if d.strip()][-20:]
+    try:
+        b, A = _msig_daily_base(code)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    out = {}
+    for d in ds:
+        try:
+            out[d] = _msig_one(code, d, b, A)
+        except Exception as e:
+            out[d] = {"error": str(e)}
+    return {"ok": True, "code": code, "days": out}
+
 
 
 @app.get("/api/gom-debug")
@@ -15768,7 +15861,51 @@ def pc_task_result(payload: dict):
                 store[code] = (time.time(), sorted(rows, key=lambda x: x["date"]))
     if kind == "vp20" and payload.get("code"):
         _vp20[payload["code"]] = {"day": now_kst().strftime("%Y-%m-%d"), "rows": payload.get("rows", []), "asked": time.time()}
+    if kind == "hold" and payload.get("code"):  # 📦 창구별 보유 잔량 (2026-11-22)
+        _bhold[(payload["code"], payload.get("start") or "")] = {**payload, "got": time.time()}
+        if len(_bhold) > 300:
+            _bhold.clear()
     return {"ok": True}
+
+
+# 📦 창구별 보유 잔량 (2026-11-22 JM 아이디어) — 기준일(구간1 등)부터 오늘까지 창구마다 '지금 몇 주 들고 있나'
+#   PC가 키움 opt10038(기간 순위) + opt10043(창구별 날짜별 순매수 × 종가)로 계산 → 산 건 더하고 판 만큼 뺀 잔량 · 그 평단
+_bhold: dict = {}   # (code, start) → 결과
+
+
+@app.post("/api/broker-hold/request")
+def broker_hold_request(code: str, start: str = ""):
+    code, start = (code or "").strip(), (start or "").strip()
+    r = _bhold.get((code, start))
+    if r and time.time() - r.get("got", 0) < 600:
+        return {"ok": True, "queued": False}
+    with _bpc_lock:
+        if not any(t.get("kind") == "hold" and t.get("code") == code and t.get("start") == start for t in _bpc["tasks"]):
+            _bpc["tasks"].append({"kind": "hold", "code": code, "start": start})
+    return {"ok": True, "queued": True, "pc_alive": time.time() - _bpc["alive_at"] < 20}
+
+
+@app.get("/api/broker-hold")
+def broker_hold_get(code: str, start: str = ""):
+    code, start = (code or "").strip(), (start or "").strip()
+    alive = time.time() - _bpc["alive_at"] < 20
+    r = _bhold.get((code, start))
+    if not r:
+        return {"ok": False, "pc_alive": alive}
+    if r.get("error"):
+        return {"ok": False, "pc_alive": alive, "error": r["error"]}
+    try:
+        price = _kis_quote(code).get("price") or 0
+    except Exception:
+        price = 0
+    rows = []
+    for x in r.get("rows") or []:
+        av = x.get("avg_hold")
+        rows.append({**x, "hold_eok": round(x["hold"] * price / 1e8, 1) if price else None,
+                     "pnl": round((price / av - 1) * 100, 1) if price and av else None})
+    rows.sort(key=lambda x: -(x.get("hold") or 0))
+    return {"ok": True, "pc_alive": alive, "price": price, "st": r.get("st"), "en": r.get("en"), "at": r.get("at"),
+            "rows": rows, "foreign_hold": sum(x["hold"] for x in rows if x.get("foreign"))}
 
 
 @app.get("/api/pc-probe")
