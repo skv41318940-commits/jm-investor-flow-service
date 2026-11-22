@@ -15862,7 +15862,11 @@ def pc_task_result(payload: dict):
     if kind == "vp20" and payload.get("code"):
         _vp20[payload["code"]] = {"day": now_kst().strftime("%Y-%m-%d"), "rows": payload.get("rows", []), "asked": time.time()}
     if kind == "hold" and payload.get("code"):  # 📦 창구별 보유 잔량 (2026-11-22) — 중간 결과(partial)도 바로 저장
-        _bhold[(payload["code"], payload.get("start") or "")] = {**payload, "got": time.time()}
+        hk = (payload["code"], payload.get("start") or "")
+        old = _bhold.get(hk)
+        # 중간 결과가 최종보다 늦게 도착하면(스레드 순서) 최종을 덮지 않음
+        if not (payload.get("partial") and old and not old.get("partial") and time.time() - old.get("got", 0) < 120):
+            _bhold[hk] = {**payload, "got": time.time()}
         _bpc["alive_at"] = time.time()  # 계산 중엔 PC가 /next를 못 물어봐서 → 중간 결과 = 살아있음
         if len(_bhold) > 300:
             _bhold.clear()
