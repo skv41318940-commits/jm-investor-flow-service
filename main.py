@@ -12991,7 +12991,7 @@ _sig_busy = {"on": False}
 _sig_series_cache: dict = {}  # code → (시각, 결과)
 
 
-def _sig_compute(b: list, C: list, H: list, O: list, A: list, yeok_a1: bool = True) -> tuple:
+def _sig_compute(b: list, C: list, H: list, O: list, A: list, yeok_a1: bool = True, tests: list = None) -> tuple:
     """🐻 곰발 · 🦀 꽃게 · ▲ 역배정초 날짜 계산 (국내·해외 공용, 2026-11-22 분리) → (g, k, gi, y)
     A = 원화 거래대금 (해외는 환율 곱해서 넣음)"""
     n = len(b)
@@ -13017,6 +13017,7 @@ def _sig_compute(b: list, C: list, H: list, O: list, A: list, yeok_a1: bool = Tr
     u20 = bbu_arr(C, 20)
     u300 = bbu_arr(C, 300) if n >= 300 else [None] * n
     g_dates, y_dates, gi_dates, k_dates = [], [], [], []
+    yt = [[], [], []]  # 🧪 역배정초 테스트1~3
     V = [x.get("volume") or 0 for x in b]
     L5 = [x["low"] for x in b]
     CHG = [0.0] + [(C[j] / C[j - 1] - 1) * 100 if C[j - 1] else 0.0 for j in range(1, n)]
@@ -13082,16 +13083,27 @@ def _sig_compute(b: list, C: list, H: list, O: list, A: list, yeok_a1: bool = Tr
         if crab_new(t):
             k_dates.append(b[t]["date"])
         # ▲ 역배정초
-        # 🌎 해외는 A1(BB300 상단 2일 연속 상승) 빼고 (2026-11-22 JM — 사부님 해외 역배정초가 더 느슨)
-        a1_ready = (t >= 305 and u300[t] is not None and u300[t - 2] is not None) if yeok_a1 else t >= 65
-        if a1_ready and m60[t] is not None and m20[t - 12] is not None:
-            A1 = (u300[t] > u300[t - 1] > u300[t - 2]) if yeok_a1 else True
+        # 🧪 테스트1 = A1(BB300 상단 2일 연속 상승) 뺌 · 테스트2 = A2(20이평 10~12봉 전 하락) 뺌 · 테스트3 = 둘 다 뺌 (2026-11-22 JM)
+        if t >= 65 and m60[t] is not None and m20[t - 12] is not None:
+            A1 = t >= 305 and u300[t] is not None and u300[t - 2] is not None and u300[t] > u300[t - 1] > u300[t - 2]
+            if not yeok_a1:
+                A1 = True
             A2 = m20[t - 10] < m20[t - 11] < m20[t - 12]
             tr = any(m20[t - k - 1] > m20[t - k] and m20[t - k + 1] > m20[t - k] for k in range(1, 6))
             A8 = any(cu(t - k, u20) for k in range(5))
             A11 = any(cu(t - k, m60) for k in range(5))
-            if A1 and A2 and tr and A8 and m20[t] < m60[t] and C[t] > m20[t] and A11 and (a5[t] or 0) >= 5e9:
-                y_dates.append(b[t]["date"])
+            rest = tr and A8 and m20[t] < m60[t] and C[t] > m20[t] and A11 and (a5[t] or 0) >= 5e9
+            if rest:
+                d = b[t]["date"]
+                if A1 and A2:
+                    y_dates.append(d)
+                if A2:
+                    yt[0].append(d)
+                if A1:
+                    yt[1].append(d)
+                yt[2].append(d)
+    if tests is not None:
+        tests.extend(yt)
     return g_dates, k_dates, gi_dates, y_dates
 
 
@@ -14609,8 +14621,10 @@ def global_signals_endpoint(symbol: str):
         fx = _fx_krw(cur)
         C = [x["close"] for x in b]; H = [x["high"] for x in b]; O = [x["open"] for x in b]
         A = [x["close"] * x["volume"] * fx for x in b]
-        g, k, gi, y = _sig_compute(b, C, H, O, A, yeok_a1=False)
-        out = {"ok": True, "symbol": symbol, "bars": len(b), "g": g, "k": k, "y": y, "currency": cur, "fx": fx,
+        tests: list = []
+        g, k, gi, y = _sig_compute(b, C, H, O, A, tests=tests)  # ▲ 역배정초는 국내와 같은 원래 공식 · 🧪 테스트1~3 따로
+        out = {"ok": True, "symbol": symbol, "bars": len(b), "g": g, "k": k, "y": y, "t1": tests[0], "t2": tests[1], "t3": tests[2],
+               "currency": cur, "fx": fx,
                "hg": [], "hk": [], "hy": [], "hts_from": "9999-12-31"}  # 해외는 HTS 확정이 없어서 전부 계산값(진하게)
         _gsig_cache[symbol] = (time.time(), out)
         return out
