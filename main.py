@@ -12563,7 +12563,7 @@ def _prev_sig_sets() -> tuple:
 
 
 # ⚡ 단타 검색기 5종 키 (2026-11-07) — crab 큰형님 자전거 · small 완빨 · bong3 봉삼이 · gomt 곰발 통합 · big 곰발
-CRAB_KEYS = ("crab", "small", "bong3", "gomt", "big")
+CRAB_KEYS = ("big",)  # 🗑 2026-11-23 JM: 단타 검색기(crab·small·bong3·gomt) 삭제 → 곰발만 (꽃게·역배정초·신고거래량은 따로)
 
 
 # 🦀 오늘 꽃게에 한 번이라도 잡힌 종목 (편입 + 이탈) — 다음 날 08:40 NXT 프리마켓에 씀
@@ -14881,7 +14881,7 @@ def _crab_pc_fast(d: dict, alive: bool) -> dict:
 
 
 # 🌙 스윙 검색기 (2026-10-31 JM) — 정규장 마감 후 PC가 조건식 8개를 한 번씩 검색해서 올림
-SWING_NAMES = ["양산w", "거래대금 기준봉", "황금맥", "기준v", "노랑등대", "이제가나", "역배정초", "꽃열매"]
+SWING_NAMES = ["양산w", "거래대금 기준봉", "황금맥", "기준v", "노랑등대", "역배정초", "꽃열매"]  # 2026-11-23: 이제가나 삭제
 _swing = {"data": None, "at": 0.0}
 _swing_view: dict = {}
 
@@ -14907,10 +14907,11 @@ def swing_run():
 
 def _run_swing_after_close():
     now = now_kst()
-    if now.weekday() >= 5 or not ((15, 45) <= (now.hour, now.minute) <= (17, 0)):
+    # ⏰ 2026-11-23: 15:45~17:00이던 걸 20:00까지 (11/20처럼 그 시간에 PC가 잠깐 바쁘거나 꺼져 있으면 하루를 통째로 놓쳤음)
+    if now.weekday() >= 5 or not ((15, 45) <= (now.hour, now.minute) <= (20, 0)):
         return
     day = now.strftime("%Y-%m-%d")
-    if _brief_already_sent("job_swing", day) or time.time() - _bpc["alive_at"] > 20:
+    if _brief_already_sent("job_swing", day) or time.time() - _bpc["alive_at"] > 60:
         return
     with _bpc_lock:
         _bpc["tasks"].append({"kind": "swing"})
@@ -14972,7 +14973,9 @@ def swing_screeners(name: str = ""):
 # ⭐ 관심종목 리뉴얼 (2026-10-31 JM) — 당일매매 + 차트의 정석 + 파동 12칸 · 빨간선(볼린저 300, 2 상단) 자동 추천
 # ══════════════════════════════════════════════════════════════════════════
 DAYTRADE_CATS = ["당일 JM", "당일 눌림"]  # 🎯 당일매매 두 가지 (2026-11-01 JM)
-JMW_CATS = ["당일 JM", "당일 눌림", "1번", "2번", "3번", "3-1번", "3-2번", "상승1파", "하락2파", "상승3파", "하락4파", "상승5파", "하락abc"]
+# ⭐ 2026-11-23 JM: 🌟 특급 관종 + 📊 일봉 검색기 이름 그대로 칸 (예전 정석·파동 칸은 데이터 보존용으로 남김)
+JMW_SCREENER_CATS = ["곰발", "꽃게", "역배정초", "양산w", "거래대금 기준봉", "황금맥", "기준v", "노랑등대", "꽃열매"]
+JMW_CATS = ["특급 관종", "당일 JM", "당일 눌림"] + JMW_SCREENER_CATS + ["1번", "2번", "3번", "3-1번", "3-2번", "상승1파", "하락2파", "상승3파", "하락4파", "상승5파", "하락abc"]
 _redline_cache: dict = {}  # code → (day, 결과)
 
 
@@ -15775,7 +15778,7 @@ def _run_broker_pc_track():
     _bpc["track_at"] = time.time()
     # ⭐ 관심종목 '당일매매' 칸은 열어보지 않아도 장 내내 자동 추적 (2026-10-31)
     try:
-        for r in supabase.table("jm_watchlist").select("code").in_("category", DAYTRADE_CATS).limit(20).execute().data or []:
+        for r in supabase.table("jm_watchlist").select("code").in_("category", DAYTRADE_CATS + ["특급 관종"]).limit(30).execute().data or []:  # 🌟 특급 관종도 창구 평단 추적
             _bpc["tracked"][r["code"]] = time.time()
     except Exception:
         pass
