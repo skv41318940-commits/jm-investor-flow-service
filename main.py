@@ -14600,7 +14600,7 @@ _gsig_cache: dict = {}
 
 @app.get("/api/global-signals")
 def global_signals_endpoint(symbol: str):
-    """🌎 해외 종목 🐻 곰발 · 🦀 꽃게 · ▲ 역배정초 (2026-11-22 JM) — 국내와 같은 공식 · 야후 일봉 4년 ·
+    """🌎 해외 종목 🐻 곰발 · 🦀 꽃게 · ▲ 역배정초 (2026-11-22 JM) — 국내와 같은 공식 · 야후 일봉 10년 ·
     거래대금 조건(500억 등)은 환율 곱한 원화 거래대금으로"""
     c = _gsig_cache.get(symbol)
     if c and time.time() - c[0] < 3600:
@@ -14608,7 +14608,7 @@ def global_signals_endpoint(symbol: str):
     try:
         p2 = int(time.time()) + 86400
         res = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{requests.utils.quote(symbol)}",
-                           params={"period1": p2 - 1460 * 86400, "period2": p2, "interval": "1d", "events": "split"},
+                           params={"period1": p2 - 3660 * 86400, "period2": p2, "interval": "1d", "events": "split"},  # 10년 (2026-11-22 JM, 4년 → 10년)
                            headers={"User-Agent": "Mozilla/5.0"}, timeout=15).json()["chart"]["result"][0]
         q = res["indicators"]["quote"][0]
         cur = (res.get("meta") or {}).get("currency") or "USD"
