@@ -14621,8 +14621,7 @@ def global_signals_endpoint(symbol: str):
         A = [x["close"] * x["volume"] * fx for x in b]
         tests: list = []
         g, k, gi, y = _sig_compute(b, C, H, O, A, tests=tests)  # ▲ 역배정초 (A1 뺀 확정 공식) · ◆ 역배정초2 (예전 공식)
-        y6 = _sig_compute(b, C, H, O, A, yeok_v=6)[3]  # 🧪 테스트: 국내처럼 바닥 6봉 (2026-11-22 JM)
-        out = {"ok": True, "symbol": symbol, "bars": len(b), "g": g, "k": k, "y": y, "y2": tests[0], "y6": y6,
+        out = {"ok": True, "symbol": symbol, "bars": len(b), "g": g, "k": k, "y": y, "y2": tests[0],
                "currency": cur, "fx": fx,
                "hg": [], "hk": [], "hy": [], "hts_from": "9999-12-31"}  # 해외는 HTS 확정이 없어서 전부 계산값(진하게)
         _gsig_cache[symbol] = (time.time(), out)
