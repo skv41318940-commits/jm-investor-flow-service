@@ -12991,7 +12991,7 @@ _sig_busy = {"on": False}
 _sig_series_cache: dict = {}  # code → (시각, 결과)
 
 
-def _sig_compute(b: list, C: list, H: list, O: list, A: list, yeok_a1: bool = True, tests: list = None) -> tuple:
+def _sig_compute(b: list, C: list, H: list, O: list, A: list, yeok_a1: bool = True, tests: list = None, yeok_v: int = 5) -> tuple:
     """🐻 곰발 · 🦀 꽃게 · ▲ 역배정초 날짜 계산 (국내·해외 공용, 2026-11-22 분리) → (g, k, gi, y)
     A = 원화 거래대금 (해외는 환율 곱해서 넣음)"""
     n = len(b)
@@ -13088,13 +13088,17 @@ def _sig_compute(b: list, C: list, H: list, O: list, A: list, yeok_a1: bool = Tr
         if t >= 65 and m60[t] is not None and m20[t - 12] is not None:
             A1 = t >= 305 and u300[t] is not None and u300[t - 2] is not None and u300[t] > u300[t - 1] > u300[t - 2]
             A2 = m20[t - 10] < m20[t - 11] < m20[t - 12]
-            tr = any(m20[t - k - 1] > m20[t - k] and m20[t - k + 1] > m20[t - k] for k in range(1, 6))
+            # 20이평 바닥(V자) 몇 봉 전까지 볼지 — 🇰🇷 국내 6봉 (V1~V6, 2026-11-22 JM 사부님 GST 25.05.14 확인) · 🌎 해외 5봉
+            #   ◆ 역배정초2(예전 공식)는 항상 A1 포함 + 5봉 (A3~A7)
+            trv = any(m20[t - k - 1] > m20[t - k] and m20[t - k + 1] > m20[t - k] for k in range(1, yeok_v + 1))
+            tr5 = any(m20[t - k - 1] > m20[t - k] and m20[t - k + 1] > m20[t - k] for k in range(1, 6))
             A8 = any(cu(t - k, u20) for k in range(5))
             A11 = any(cu(t - k, m60) for k in range(5))
-            if A2 and tr and A8 and m20[t] < m60[t] and C[t] > m20[t] and A11 and (a5[t] or 0) >= 5e9:
+            rest = A2 and A8 and m20[t] < m60[t] and C[t] > m20[t] and A11 and (a5[t] or 0) >= 5e9
+            if rest and trv:
                 y_dates.append(b[t]["date"])
-                if A1:
-                    yt[0].append(b[t]["date"])
+            if rest and tr5 and A1:
+                yt[0].append(b[t]["date"])
     if tests is not None:
         tests.extend(yt)
     return g_dates, k_dates, gi_dates, y_dates
@@ -13137,7 +13141,7 @@ def _jm_signal_series(code: str) -> dict:
         pass
 
     _y2: list = []
-    g_dates, k_dates, gi_dates, y_dates = _sig_compute(b, C, H, O, A, tests=_y2)
+    g_dates, k_dates, gi_dates, y_dates = _sig_compute(b, C, H, O, A, tests=_y2, yeok_v=6)  # 🇰🇷 국내 역배정초 = A1 제외 + 바닥 6봉
     last = b[-1]["date"] if b else ""
     # 🦀 검색기 '일봉 신호' = 사부님 점 구조 (11/2 마감 16종목 비교로 확인): 종가 > 5이평 · 전일보다 상승 마감 · 양봉
     res = {"ok": True, "code": code, "bars": n, "g": g_dates, "k": k_dates, "gi": gi_dates, "y": y_dates, "y2": _y2[0] if _y2 else [],
@@ -14617,7 +14621,8 @@ def global_signals_endpoint(symbol: str):
         A = [x["close"] * x["volume"] * fx for x in b]
         tests: list = []
         g, k, gi, y = _sig_compute(b, C, H, O, A, tests=tests)  # ▲ 역배정초 (A1 뺀 확정 공식) · ◆ 역배정초2 (예전 공식)
-        out = {"ok": True, "symbol": symbol, "bars": len(b), "g": g, "k": k, "y": y, "y2": tests[0],
+        y6 = _sig_compute(b, C, H, O, A, yeok_v=6)[3]  # 🧪 테스트: 국내처럼 바닥 6봉 (2026-11-22 JM)
+        out = {"ok": True, "symbol": symbol, "bars": len(b), "g": g, "k": k, "y": y, "y2": tests[0], "y6": y6,
                "currency": cur, "fx": fx,
                "hg": [], "hk": [], "hy": [], "hts_from": "9999-12-31"}  # 해외는 HTS 확정이 없어서 전부 계산값(진하게)
         _gsig_cache[symbol] = (time.time(), out)
