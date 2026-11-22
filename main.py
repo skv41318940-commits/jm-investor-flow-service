@@ -9395,15 +9395,20 @@ def stock_minute_by_date_endpoint(code: str, date: str, market: str = "J"):
     first_hm = "090000" if market == "J" else "080000"
     rows, cursor, seen = [], ("153000" if market == "J" else "200000"), set()
     try:
-        for _ in range(6 if market == "J" else 16):
-            data = kis_get(
-                "/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice",
-                "FHKST03010230",
-                {"FID_COND_MRKT_DIV_CODE": market, "FID_INPUT_ISCD": code, "FID_INPUT_HOUR_1": cursor,
-                 "FID_INPUT_DATE_1": ymd, "FID_PW_DATA_INCU_YN": "Y", "FID_FAKE_TICK_INCU_YN": ""},
-            )
-            batch = [r for r in (data.get("output2") or []) if r.get("stck_bsop_date") == ymd]
-            new = [r for r in batch if r.get("stck_cntg_hour") not in seen]
+        for _ in range(8 if market == "J" else 16):
+            new = []
+            for attempt in range(3):  # 🔁 2026-11-22: 여러 날을 동시에 받으면 한투 초당 한도로 빈 값이 와서 앞 시간(09:00~)이 잘렸음 → 다시 시도
+                data = kis_get(
+                    "/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice",
+                    "FHKST03010230",
+                    {"FID_COND_MRKT_DIV_CODE": market, "FID_INPUT_ISCD": code, "FID_INPUT_HOUR_1": cursor,
+                     "FID_INPUT_DATE_1": ymd, "FID_PW_DATA_INCU_YN": "Y", "FID_FAKE_TICK_INCU_YN": ""},
+                )
+                batch = [r for r in (data.get("output2") or []) if r.get("stck_bsop_date") == ymd]
+                new = [r for r in batch if r.get("stck_cntg_hour") not in seen]
+                if new or data.get("rt_cd") == "0" and batch:
+                    break
+                time.sleep(0.5 * (attempt + 1))
             if not new:
                 break
             for r in new:
@@ -10949,7 +10954,7 @@ def _minute_day_cached(code: str, day: str, market: str = "J") -> dict:
     out = stock_minute_by_date_endpoint(code, day)
     if out.get("ok") and out.get("candles"):
         _minute_mem[key] = (time.time(), out)
-        if day < today and len(out["candles"]) >= 300:  # 하루치가 다 찼을 때만 보관
+        if day < today and len(out["candles"]) >= 300 and out["candles"][0]["time"] <= "09:05":  # 하루치가 다 찼을 때만 보관 (앞 시간 잘린 건 X)
             try:
                 supabase.table("minute_candles_cache").upsert({"code": code, "day": day, "candles": out["candles"]}).execute()
             except Exception:
