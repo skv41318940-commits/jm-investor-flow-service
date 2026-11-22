@@ -9721,7 +9721,7 @@ def us_ranking_endpoint(sort: str = "value", min_cap_b: float = 1.0, min_price: 
 
 
 # 섹터 ETF 자금 흐름 — 오늘 거래대금이 최근 20일 평균보다 얼마나 많은지 + 등락 (돈이 어느 섹터로 가나)
-SECTOR_ETFS = [
+US_SECTOR_ETFS = [  # ⚠️ 2026-11-22: 국내 ETF 목록과 이름이 같아(SECTOR_ETFS) 덮어써져서 미국 섹터가 비었음 → 이름 분리
     ("XLK", "기술"), ("SMH", "반도체"), ("XLC", "통신서비스"), ("XLY", "경기소비재"), ("XLF", "금융"),
     ("XLV", "헬스케어"), ("XLI", "산업재"), ("XLE", "에너지"), ("XLB", "소재"), ("XLP", "필수소비재"),
     ("XLU", "유틸리티"), ("XLRE", "부동산"), ("ARKK", "혁신성장"), ("IWM", "중소형주"),
@@ -9735,7 +9735,7 @@ def us_sector_flow_endpoint():
     if c["data"] and time.time() - c["at"] < 600:
         return c["data"]
     out, errs = [], []
-    for sym, kr in SECTOR_ETFS:
+    for sym, kr in US_SECTOR_ETFS:
         try:
             # ⚠️ 2026-11-22: range=1mo 로 받으면 14개 전부 실패 → 시작~끝(period1/2) 방식으로 (global-ohlcv와 같음)
             _p2 = int(time.time()) + 86400
