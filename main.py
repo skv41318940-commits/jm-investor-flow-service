@@ -14975,7 +14975,7 @@ def swing_screeners(name: str = ""):
 DAYTRADE_CATS = ["당일 JM", "당일 눌림"]  # 🎯 당일매매 두 가지 (2026-11-01 JM)
 # ⭐ 2026-11-23 JM: 🌟 특급 관종 + 📊 일봉 검색기 이름 그대로 칸 (예전 정석·파동 칸은 데이터 보존용으로 남김)
 JMW_SCREENER_CATS = ["곰발", "꽃게", "역배정초", "양산w", "거래대금 기준봉", "황금맥", "기준v", "노랑등대", "꽃열매"]
-JMW_CATS = ["특급 관종", "당일 JM", "당일 눌림"] + JMW_SCREENER_CATS + ["1번", "2번", "3번", "3-1번", "3-2번", "상승1파", "하락2파", "상승3파", "하락4파", "상승5파", "하락abc"]
+JMW_CATS = ["특급 관종", "분봉 눌림", "당일 JM", "당일 눌림"] + JMW_SCREENER_CATS + ["1번", "2번", "3번", "3-1번", "3-2번", "상승1파", "하락2파", "상승3파", "하락4파", "상승5파", "하락abc"]
 _redline_cache: dict = {}  # code → (day, 결과)
 
 
@@ -15222,7 +15222,7 @@ def jmw_list(cat: str = "", with_redline: bool = True):
 
 @app.post("/api/jmw/add")
 def jmw_add(payload: dict):
-    code, cat = (payload.get("code") or "").strip(), payload.get("category") or "당일 눌림"
+    code, cat = (payload.get("code") or "").strip(), payload.get("category") or "특급 관종"  # 2026-11-23: 기본 칸 = 🌟 특급 관종
     if not code or cat not in JMW_CATS:
         return {"ok": False, "error": "종목코드·칸 확인"}
     if cat in DAYTRADE_CATS:
@@ -15778,7 +15778,7 @@ def _run_broker_pc_track():
     _bpc["track_at"] = time.time()
     # ⭐ 관심종목 '당일매매' 칸은 열어보지 않아도 장 내내 자동 추적 (2026-10-31)
     try:
-        for r in supabase.table("jm_watchlist").select("code").in_("category", DAYTRADE_CATS + ["특급 관종"]).limit(30).execute().data or []:  # 🌟 특급 관종도 창구 평단 추적
+        for r in supabase.table("jm_watchlist").select("code").in_("category", DAYTRADE_CATS + ["특급 관종", "분봉 눌림"]).limit(30).execute().data or []:  # 🌟 특급 관종도 창구 평단 추적
             _bpc["tracked"][r["code"]] = time.time()
     except Exception:
         pass
