@@ -9871,6 +9871,232 @@ def us_stock_detail_endpoint(symbol: str):
     _us_detail_cache[symbol] = (time.time(), out)
     return out
 
+# ══════════════════════════════════════════════════════════════════════════
+# 🏠 미국판 주인 찾기 · 종합 분석 (2026-11-24 JM) — 국내 종목분석 "주인 찾기 · 주체별"을 미국 자료로
+#   ① 재료(뉴스·실적일) ② 프리장 갭 ③ 상대 거래량 ④ 발행주식·기관 지분 ⑤ 기술 자리(20·60일선·52주)
+#   ⑥ 공매도 잔고 + 🏠 지분구조 · 👑 메인 세력(기관 Top) · 🚀 최근 주도(분기 증가) · 💣 이탈 · 🆕 신규
+#   · 🧑‍💼 내부자 매매(Form 4) · 📑 5% 대량보유(13D/G)
+#   자료: 나스닥 공개 API(13F 집계·내부자·공매도) · SEC EDGAR · 야후 차트 — 미국은 매일 주체별 수급이 없어서 13F(분기·45일 늦음)가 한계
+# ══════════════════════════════════════════════════════════════════════════
+_us_owner_cache: dict = {}
+_NQ_H = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+         "Accept": "application/json, text/plain, */*", "Origin": "https://www.nasdaq.com", "Referer": "https://www.nasdaq.com/"}
+US_INST_KR = {"VANGUARD": "뱅가드", "BLACKROCK": "블랙록", "STATE STREET": "스테이트스트리트", "FMR": "피델리티", "FIDELITY": "피델리티",
+              "GEODE": "지오드", "MORGAN STANLEY": "모건스탠리", "GOLDMAN": "골드만삭스", "JPMORGAN": "JP모건", "JP MORGAN": "JP모건",
+              "CAPITAL RESEARCH": "캐피털그룹", "CAPITAL WORLD": "캐피털그룹", "T. ROWE": "T.로우프라이스", "NORTHERN TRUST": "노던트러스트",
+              "BANK OF AMERICA": "뱅크오브아메리카", "WELLINGTON": "웰링턴", "INVESCO": "인베스코", "CITADEL": "시타델", "SUSQUEHANNA": "서스퀘하나",
+              "RENAISSANCE": "르네상스", "NORGES": "노르웨이 국부펀드", "JANE STREET": "제인스트리트", "TWO SIGMA": "투시그마",
+              "UBS": "UBS", "BARCLAYS": "바클레이스", "DEUTSCHE": "도이체", "NUVEEN": "누빈", "CHARLES SCHWAB": "찰스슈왑", "SCHWAB": "찰스슈왑",
+              "DIMENSIONAL": "디멘셔널", "LEGAL & GENERAL": "리걸앤제너럴", "AMUNDI": "아문디", "BERKSHIRE": "버크셔해서웨이", "ARK ": "아크(캐시우드)"}
+
+
+def _nq_num(v):
+    """나스닥 문자열 숫자 → float ('1,234' '$12.5' '12.3%' '(1,234)' 'N/A')"""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    t = str(v).strip().replace(",", "").replace("$", "").replace("%", "")
+    neg = t.startswith("(") and t.endswith(")")
+    t = t.strip("()")
+    try:
+        x = float(t)
+        return -x if neg else x
+    except Exception:
+        return None
+
+
+def _nq_get(path, params=None):
+    r = requests.get(f"https://api.nasdaq.com/api/{path}", params=params or {}, headers=_NQ_H, timeout=12)
+    return (r.json() or {}).get("data") or {}
+
+
+def _inst_kr(name: str):
+    u = (name or "").upper()
+    for k, v in US_INST_KR.items():
+        if k in u:
+            return v
+    return ""
+
+
+def _nq_holders(sym, typ, sort_col, order, limit):
+    d = _nq_get(f"company/{sym}/institutional-holdings", {"limit": limit, "type": typ, "sortColumn": sort_col, "sortOrder": order})
+    rows = (((d.get("holdingsTransactions") or {}).get("table") or {}).get("rows")) or []
+    out = []
+    for r in rows:
+        nm = r.get("ownerName") or ""
+        out.append({"name": nm, "kr": _inst_kr(nm), "date": r.get("date"), "shares": _nq_num(r.get("sharesHeld")),
+                    "change": _nq_num(r.get("sharesChange")), "change_pct": _nq_num(r.get("sharesChangePCT")), "value": _nq_num(r.get("marketValue"))})
+    return d, out
+
+
+def _pos_rows(block):
+    out = {}
+    for r in ((block or {}).get("rows") or []):
+        lab = (r.get("positions") or "").lower()
+        k = "increased" if "increased" in lab else "decreased" if "decreased" in lab else "held" if "held" in lab else \
+            "new" if "new" in lab else "soldout" if "sold" in lab else "total" if "total" in lab else None
+        if k:
+            out[k] = {"holders": _nq_num(r.get("holders")), "shares": _nq_num(r.get("shares"))}
+    return out
+
+
+@app.get("/api/us-owner")
+def us_owner_endpoint(symbol: str):
+    sym = (symbol or "").strip().upper()
+    c = _us_owner_cache.get(sym)
+    if c and time.time() - c[0] < 900:
+        return c[1]
+    out = {"ok": True, "symbol": sym, "errors": {}}
+
+    # ④ 지분구조 + 👑 메인 세력 (평가액 순)
+    try:
+        d, top = _nq_holders(sym, "TOTAL", "marketValue", "DESC", 20)
+        summ = d.get("ownershipSummary") or {}
+        inst_pct = _nq_num((summ.get("SharesOutstandingPCT") or {}).get("value"))
+        sh_out = _nq_num((summ.get("ShareoutstandingTotal") or {}).get("value"))
+        if sh_out and sh_out < 1e6:  # 나스닥은 백만 주 단위로 줌
+            sh_out *= 1e6
+        tot_val = _nq_num((summ.get("TotalHoldingsValue") or {}).get("value"))
+        if tot_val and tot_val < 1e7:
+            tot_val *= 1e6
+        pos = _pos_rows(d.get("activePositions"))
+        pos.update(_pos_rows(d.get("newSoldOutPositions")))
+        for t in top:
+            t["pct_out"] = (t["shares"] / sh_out * 100) if (sh_out and t["shares"]) else None
+        out["own"] = {"inst_pct": inst_pct, "shares_out": sh_out, "inst_value": tot_val, "pos": pos,
+                      "holders_total": _nq_num((d.get("holdingsTransactions") or {}).get("totalRecords"))}
+        out["top"] = top[:15]
+    except Exception as e:
+        out["errors"]["own"] = str(e)
+        sh_out = None
+
+    # 🚀 최근 주도(분기 증가) · 🆕 신규 · 💣 이탈
+    for key, typ, order in (("movers_up", "INCREASED", "DESC"), ("movers_new", "NEW", "DESC"), ("movers_down", "DECREASED", "ASC")):
+        try:
+            _, rows = _nq_holders(sym, typ, "sharesChange", order, 10)
+            if typ == "DECREASED":
+                rows.sort(key=lambda r: r["change"] or 0)
+            else:
+                rows.sort(key=lambda r: -(r["change"] or 0))
+            for t in rows:
+                t["pct_out"] = (t["shares"] / sh_out * 100) if (sh_out and t["shares"]) else None
+                t["chg_pct_out"] = (t["change"] / sh_out * 100) if (sh_out and t["change"]) else None
+            out[key] = rows[:8]
+        except Exception as e:
+            out["errors"][key] = str(e)
+
+    # 🧑‍💼 내부자 매매 (Form 4)
+    try:
+        d = _nq_get(f"company/{sym}/insider-trades", {"limit": 15, "type": "ALL", "sortColumn": "lastDate", "sortOrder": "DESC"})
+        summ = {}
+        for blk, unit in (("numberOfTrades", "trades"), ("numberOfSharesTraded", "shares")):
+            for r in ((d.get(blk) or {}).get("rows") or []):
+                lab = (r.get("insiderTrade") or "").lower()
+                k = "buy" if ("buy" in lab or "bought" in lab) else "sell" if ("sell" in lab or "sold" in lab) else None
+                if k:
+                    summ[f"{k}_{unit}_3m"] = _nq_num(r.get("months3"))
+                    summ[f"{k}_{unit}_12m"] = _nq_num(r.get("months12"))
+        rows = []
+        for r in (((d.get("transactionTable") or {}).get("table") or {}).get("rows") or []):
+            rows.append({"name": r.get("insider"), "rel": r.get("relation"), "date": r.get("lastDate"), "type": r.get("transactionType"),
+                         "own": r.get("ownType"), "shares": _nq_num(r.get("sharesTraded")), "price": _nq_num(r.get("lastPrice")), "held": _nq_num(r.get("sharesHeld"))})
+        out["insider"] = {"summary": summ, "rows": rows}
+    except Exception as e:
+        out["errors"]["insider"] = str(e)
+
+    # ⑥ 공매도 잔고 (월 2회)
+    try:
+        d = _nq_get(f"quote/{sym}/short-interest", {"assetClass": "stocks"})
+        rows = [{"date": r.get("settlementDate"), "interest": _nq_num(r.get("interest")), "avgvol": _nq_num(r.get("avgDailyShareVolume")),
+                 "days": _nq_num(r.get("daysToCover"))} for r in (((d.get("shortInterestTable") or {}).get("rows")) or [])]
+        for r in rows:
+            r["pct_out"] = (r["interest"] / sh_out * 100) if (sh_out and r["interest"]) else None
+        out["short"] = rows[:8]
+    except Exception as e:
+        out["errors"]["short"] = str(e)
+
+    # ① 실적 발표일
+    try:
+        d = _nq_get(f"analyst/{sym}/earnings-date")
+        out["earnings"] = d.get("announcement") or d.get("reportText")
+    except Exception as e:
+        out["errors"]["earnings"] = str(e)
+
+    # ② 프리장 갭 · ③ 상대 거래량 · ⑤ 기술 자리 (야후)
+    try:
+        yh = {"User-Agent": "Mozilla/5.0"}
+        r1 = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{requests.utils.quote(sym)}",
+                          params={"range": "1d", "interval": "1m", "includePrePost": "true"}, headers=yh, timeout=12).json()["chart"]["result"][0]
+        meta = r1.get("meta") or {}
+        per = (meta.get("currentTradingPeriod") or {})
+        reg_s, reg_e = (per.get("regular") or {}).get("start"), (per.get("regular") or {}).get("end")
+        q = r1["indicators"]["quote"][0]
+        ts = r1.get("timestamp") or []
+        pre = [(t, q["high"][i], q["low"][i], q["close"][i], q["volume"][i] or 0) for i, t in enumerate(ts) if q["close"][i] is not None and reg_s and t < reg_s]
+        reg = [(t, q["close"][i], q["volume"][i] or 0) for i, t in enumerate(ts) if q["close"][i] is not None and reg_s and reg_s <= t < reg_e]
+        prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+        pre_last = pre[-1][3] if pre else None
+        g = {"prev_close": prev, "pre_last": pre_last, "pre_high": max((x[1] for x in pre), default=None), "pre_low": min((x[2] for x in pre), default=None),
+             "pre_vol": sum(x[4] for x in pre), "gap_pct": ((pre_last / prev - 1) * 100) if (pre_last and prev) else None,
+             "price": meta.get("regularMarketPrice"), "reg_vol": sum(x[2] for x in reg), "reg_min": len(reg)}
+        r2 = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{requests.utils.quote(sym)}",
+                          params={"range": "1y", "interval": "1d"}, headers=yh, timeout=12).json()["chart"]["result"][0]
+        q2 = r2["indicators"]["quote"][0]
+        cl = [x for x in q2["close"] if x is not None]
+        vols = [v for v in q2["volume"] if v]
+        hist = vols[:-1] if g["reg_vol"] else vols  # 오늘 봉 제외하고 평균
+        avg20 = sum(hist[-20:]) / min(20, len(hist)) if hist else None
+        g["avg20_vol"] = avg20
+        g["rvol"] = (g["reg_vol"] / avg20) if (avg20 and g["reg_vol"]) else None
+        g["rvol_pace"] = (g["reg_vol"] / (avg20 * min(1.0, g["reg_min"] / 390))) if (avg20 and g["reg_vol"] and g["reg_min"]) else None
+        sma = lambda n: (sum(cl[-n:]) / n) if len(cl) >= n else None
+        last = g["price"] or (cl[-1] if cl else None)
+        hi52, lo52 = (max(cl), min(cl)) if cl else (None, None)
+        out["tech"] = {"last": last, "sma20": sma(20), "sma60": sma(60), "sma200": sma(200), "hi52": hi52, "lo52": lo52,
+                       "from_hi": ((last / hi52 - 1) * 100) if (last and hi52) else None, "from_lo": ((last / lo52 - 1) * 100) if (last and lo52) else None}
+        out["gap"] = g
+    except Exception as e:
+        out["errors"]["gap"] = str(e)
+
+    # 📑 5% 대량보유 13D/13G (SEC) + 📰 뉴스·목표가 (기존 상세 재사용)
+    try:
+        cik = _sec_cik_of(sym)
+        if cik:
+            sub = requests.get(f"https://data.sec.gov/submissions/CIK{cik}.json", headers=SEC_HEADERS, timeout=15).json()
+            rec = (sub.get("filings") or {}).get("recent") or {}
+            fl = []
+            for i, form in enumerate(rec.get("form") or []):
+                f = form.upper()
+                if not (f.startswith("SC 13") or f.startswith("SCHEDULE 13")):
+                    continue
+                acc = rec["accessionNumber"][i].replace("-", "")
+                fl.append({"date": rec["filingDate"][i], "form": form, "kind": "13D 적극(경영참여)" if "13D" in f else "13G 단순투자",
+                           "link": f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc}/{rec['primaryDocument'][i]}"})
+                if len(fl) >= 15:
+                    break
+            out["big5"] = fl
+    except Exception as e:
+        out["errors"]["big5"] = str(e)
+    try:
+        det = us_stock_detail_endpoint(sym)
+        out["news"] = (det.get("news") or [])[:8]
+        out["target"] = det.get("target")
+    except Exception as e:
+        out["errors"]["news"] = str(e)
+
+    # 🧭 한 줄 판단 재료
+    try:
+        pos = (out.get("own") or {}).get("pos") or {}
+        inc, dec = (pos.get("increased") or {}).get("shares") or 0, (pos.get("decreased") or {}).get("shares") or 0
+        new, so = (pos.get("new") or {}).get("shares") or 0, (pos.get("soldout") or {}).get("shares") or 0
+        net = inc + new - dec - so
+        out["inst_net"] = {"shares": net, "pct_out": (net / sh_out * 100) if sh_out else None}
+    except Exception:
+        pass
+    _us_owner_cache[sym] = (time.time(), out)
+    return out
+
 
 @app.get("/api/global-minute")
 def global_minute_endpoint(symbol: str, interval: str = "1m", prepost: int = 0):
