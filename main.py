@@ -15998,6 +15998,51 @@ def _foreign_cum(code: str, st: str) -> dict:
     return out
 
 
+# 🏦 주체별 순매수 5·20·60·120일 한 표 (2026-11-23 JM) — 한투 종목별 투자자 일별 (공식 수급) · PC 필요 없음
+_invp_cache: dict = {}
+
+
+@app.get("/api/inv-periods")
+def inv_periods(code: str):
+    code = (code or "").strip()
+    hit = _invp_cache.get(code)
+    if hit and time.time() - hit[0] < 1800:
+        return hit[1]
+    try:
+        end = _krx_ready_end(now_kst().strftime("%Y%m%d"), 16)
+        raw, cur, seen = [], end, set()
+        for _ in range(8):  # 한 번에 30일 안팎 → 120일까지
+            rs = _kis_inst_rows(code, cur)
+            if not rs:
+                break
+            for r in rs:
+                if r["stck_bsop_date"] not in seen:
+                    seen.add(r["stck_bsop_date"])
+                    raw.append(r)
+            if len(raw) >= 120:
+                break
+            oldest = min(r["stck_bsop_date"] for r in rs)
+            cur = (datetime.strptime(oldest, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+        if not raw:
+            return {"ok": False, "error": "한투 투자자 데이터 없음"}
+        keys = set(raw[0].keys())
+        amt_keys = {}
+        for inst, prefixes in _KIS_INST_MAP.items():
+            k = next((f"{p}{suf}" for p in prefixes for suf in ("_ntby_tr_pbmn", "_ntby_pbmn") if f"{p}{suf}" in keys), None)
+            if k:
+                amt_keys[inst] = k
+        raw.sort(key=lambda r: r["stck_bsop_date"], reverse=True)  # 최근 먼저
+        out = {}
+        for n in (5, 20, 60, 120):
+            part = raw[:n]
+            out[str(n)] = {inst: round(sum(float(str(r.get(k) or 0).replace(",", "") or 0) for r in part) / 100, 1) for inst, k in amt_keys.items()}
+        res = {"ok": True, "code": code, "days": len(raw), "last": raw[0]["stck_bsop_date"], "periods": out}
+        _invp_cache[code] = (time.time(), res)
+        return res
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/broker-hold")
 def broker_hold_get(code: str, start: str = ""):
     code, start = (code or "").strip(), (start or "").strip()
