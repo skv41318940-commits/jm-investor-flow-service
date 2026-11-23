@@ -9873,12 +9873,16 @@ def us_stock_detail_endpoint(symbol: str):
 
 
 @app.get("/api/global-minute")
-def global_minute_endpoint(symbol: str, interval: str = "1m"):
-    """해외 종목 분봉 (야후, 최근 7일 1분봉 / 60일 5분봉) — 현지 시각으로 날짜별 묶음"""
+def global_minute_endpoint(symbol: str, interval: str = "1m", prepost: int = 0):
+    """해외 종목 분봉 (야후, 최근 7일 1분봉 / 60일 5분봉) — 현지 시각으로 날짜별 묶음
+    prepost=1 → 🌅 프리마켓 · 🌙 애프터마켓 포함 (2026-11-23 해외 데이 트레이딩) · 봉마다 sess = pre / reg / post"""
     try:
         rng = "7d" if interval == "1m" else "60d"
+        params = {"range": rng, "interval": interval}
+        if prepost:
+            params["includePrePost"] = "true"
         res = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{requests.utils.quote(symbol)}",
-                           params={"range": rng, "interval": interval}, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+                           params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
         r = res.json()["chart"]["result"][0]
         off = (r.get("meta") or {}).get("gmtoffset") or 0
         q = r["indicators"]["quote"][0]
@@ -9888,8 +9892,10 @@ def global_minute_endpoint(symbol: str, interval: str = "1m"):
             if None in (o, h, l, c):
                 continue
             local = datetime.fromtimestamp(t + off, tz=timezone.utc)
+            hm = local.strftime("%H:%M")
+            sess = "pre" if hm < "09:30" else "post" if hm >= "16:00" else "reg"
             days.setdefault(local.strftime("%Y-%m-%d"), []).append(
-                {"time": local.strftime("%H:%M"), "ts": int(t), "open": o, "high": h, "low": l, "close": c, "volume": v or 0})
+                {"time": hm, "ts": int(t), "open": o, "high": h, "low": l, "close": c, "volume": v or 0, "sess": sess})
         return {"ok": bool(days), "symbol": symbol, "currency": (r.get("meta") or {}).get("currency"), "gmtoffset": off, "gmtoffset": off,
                 "days": [{"date": d, "candles": days[d]} for d in sorted(days)], "error": None if days else "분봉 데이터가 없어요"}
     except Exception as e:
