@@ -15966,8 +15966,22 @@ def _foreign_cum(code: str, st: str) -> dict:
             break
         cur = (datetime.strptime(oldest, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
     out, s, seen = {}, 0.0, set()
+    inv: dict = {}  # 🏦 같은 기간 주체별 순매수 (억) — 투신·연기금·외국인·개인 등 (2026-11-23)
     if raw:
         keys = set(raw[0].keys())
+        amt_keys = {}
+        for inst, prefixes in _KIS_INST_MAP.items():
+            k = next((f"{p}{suf}" for p in prefixes for suf in ("_ntby_tr_pbmn", "_ntby_pbmn") if f"{p}{suf}" in keys), None)
+            if k:
+                amt_keys[inst] = k
+        seen_inv = set()
+        for r in raw:
+            d = r["stck_bsop_date"]
+            if d in seen_inv or d < st:
+                continue
+            seen_inv.add(d)
+            for inst, k in amt_keys.items():
+                inv[inst] = inv.get(inst, 0.0) + float(str(r.get(k) or 0).replace(",", "") or 0) / 100  # 백만원 → 억
         if "frgn_ntby_qty" in keys:
             ks = ["frgn_ntby_qty"]
         else:
@@ -15979,6 +15993,7 @@ def _foreign_cum(code: str, st: str) -> dict:
             seen.add(d)
             s += sum(float(str(r.get(k) or 0).replace(",", "") or 0) for k in ks)
             out[d] = s
+    out = {"fcum": out, "inv": {k: round(v, 1) for k, v in inv.items()}, "days": len(seen)}
     _fcum_cache[key] = (time.time(), out)
     return out
 
@@ -16007,9 +16022,12 @@ def broker_hold_get(code: str, start: str = ""):
     fc: dict = {}
     if not r.get("partial") and any(x.get("series") for x in rows):
         try:
-            fc = _foreign_cum(code, r.get("st") or "")
+            _fx = _foreign_cum(code, r.get("st") or "")
+            fc, inv_sum, inv_days = _fx["fcum"], _fx["inv"], _fx["days"]
         except Exception:
-            fc = {}
+            fc, inv_sum, inv_days = {}, {}, 0
+    else:
+        inv_sum, inv_days = {}, 0
     fdates = sorted(fc)
     for x in rows:
         sr = x.pop("series", None)
@@ -16024,7 +16042,7 @@ def broker_hold_get(code: str, start: str = ""):
         x["entry"] = en
     out_f = [[d, round(fc[d])] for d in fdates]
     return {"ok": True, "pc_alive": alive or waiting, "price": price, "st": r.get("st"), "en": r.get("en"), "at": r.get("at"),
-            "partial": bool(r.get("partial")), "done": r.get("done", 0), "total": r.get("total", 0), "frgn": out_f,
+            "partial": bool(r.get("partial")), "done": r.get("done", 0), "total": r.get("total", 0), "frgn": out_f, "inv": inv_sum, "inv_days": inv_days,
             "rows": rows, "foreign_hold": sum(x["hold"] or 0 for x in rows if x.get("foreign"))}
 
 
