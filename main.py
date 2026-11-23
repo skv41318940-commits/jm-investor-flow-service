@@ -15895,6 +15895,94 @@ def broker_hold_request(code: str, start: str = ""):
     return {"ok": True, "queued": True, "pc_alive": time.time() - _bpc["alive_at"] < 20}
 
 
+# 🌐 창구 진입일 (2026-11-23 JM 아이디어) — 창구별 날짜별 순매수를 쌓은 누적 곡선에서
+#   진입일 = 누적 바닥 이후 처음 의미 있게 산 날 (그날 순매수 ≥ 지금 잔량의 10%)
+#   이탈 = 진입 후 최고 누적 대비 30%↓ ⚠️ · 50%↓ 🔴 · 속도 = 최근 5일 ÷ 진입 후 전체 · 버틴 손실 = 진입 후 평단 대비 최저
+def _hold_entry(series: list) -> dict:
+    if not series or len(series) < 3:
+        return {}
+    ds = [x[0] for x in series]
+    net = [float(x[1] or 0) for x in series]
+    px = [float(x[2] or 0) for x in series]
+    cum, s = [], 0.0
+    for n in net:
+        s += n
+        cum.append(s)
+    lo = min(cum)
+    if lo >= 0:  # 기간 내내 판 것보다 산 게 많음 → 0에서 시작
+        b, base = -1, 0.0
+    else:
+        b = max(i for i, v in enumerate(cum) if v == lo)  # 마지막 바닥
+        base = lo
+    total = cum[-1] - base
+    if total <= 0:
+        return {"entry": None, "state": "없음", "cum": [round(v - base) for v in cum]}
+    thr = max(1.0, total * 0.10)
+    e = next((i for i in range(b + 1, len(net)) if net[i] >= thr), None)
+    if e is None:
+        e = next((i for i in range(b + 1, len(net)) if net[i] > 0), None)
+    if e is None:
+        return {"entry": None, "state": "없음", "cum": [round(v - base) for v in cum]}
+    peak = max(cum[e:]) - base
+    now = cum[-1] - base
+    drop = (peak - now) / peak if peak > 0 else 0
+    state = "이탈" if drop >= 0.5 else "경고" if drop >= 0.3 else "보유"
+    last5 = sum(net[-5:])
+    ratio = last5 / total if total else 0
+    speed = "매도중" if last5 < -total * 0.05 else "가속" if ratio >= 0.3 else "멈춤" if abs(ratio) < 0.05 else "둔화"
+    pos, cost, worst = 0.0, 0.0, 0.0
+    for i in range(e, len(net)):  # 진입 후 평단 기준 최저 손익 (= 버틴 손실)
+        if net[i] > 0:
+            pos += net[i]
+            cost += net[i] * px[i]
+        elif net[i] < 0 and pos > 0:
+            sell = min(pos, -net[i])
+            cost -= cost / pos * sell
+            pos -= sell
+        if pos > 0 and px[i] > 0:
+            worst = min(worst, px[i] / (cost / pos) - 1)
+    return {"entry": ds[e], "entry_px": px[e], "peak": round(peak), "now": round(now), "drop": round(drop * 100, 1), "state": state,
+            "speed": speed, "last5": round(last5), "worst": round(worst * 100, 1), "dates": ds, "cum": [round(v - base) for v in cum], "px": px}
+
+
+_fcum_cache: dict = {}
+
+
+def _foreign_cum(code: str, st: str) -> dict:
+    """📊 외국인 공식 수급 (한투 종목별 투자자 일별) — 기준일부터 날짜별 순매수 누적 {날짜: 누적}"""
+    key = (code, st)
+    hit = _fcum_cache.get(key)
+    if hit and time.time() - hit[0] < 1800:
+        return hit[1]
+    end = _krx_ready_end(now_kst().strftime("%Y%m%d"), 16)
+    raw, cur = [], end
+    for _ in range(4):
+        rs = _kis_inst_rows(code, cur)
+        if not rs:
+            break
+        raw += rs
+        oldest = min(r["stck_bsop_date"] for r in rs)
+        if oldest <= st:
+            break
+        cur = (datetime.strptime(oldest, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+    out, s, seen = {}, 0.0, set()
+    if raw:
+        keys = set(raw[0].keys())
+        if "frgn_ntby_qty" in keys:
+            ks = ["frgn_ntby_qty"]
+        else:
+            ks = [k for k in ("frgn_reg_ntby_qty", "frgn_nreg_ntby_qty") if k in keys] or [k for k in keys if k.startswith("frgn") and k.endswith("ntby_qty")]
+        for r in sorted(raw, key=lambda x: x["stck_bsop_date"]):
+            d = r["stck_bsop_date"]
+            if d in seen or d < st:
+                continue
+            seen.add(d)
+            s += sum(float(str(r.get(k) or 0).replace(",", "") or 0) for k in ks)
+            out[d] = s
+    _fcum_cache[key] = (time.time(), out)
+    return out
+
+
 @app.get("/api/broker-hold")
 def broker_hold_get(code: str, start: str = ""):
     code, start = (code or "").strip(), (start or "").strip()
@@ -15915,8 +16003,28 @@ def broker_hold_get(code: str, start: str = ""):
         rows.append({**x, "hold_eok": round(x["hold"] * price / 1e8, 1) if price and x.get("hold") is not None else None,
                      "pnl": round((price / av - 1) * 100, 1) if price and av else None})
     rows.sort(key=lambda x: -(x["hold"] if x.get("hold") is not None else max(0, x.get("net") or 0)))
+    # 🌐 진입일 · 이탈 · 속도 · 버틴 손실 + 📊 외국인 공식 수급 교차확인 (2026-11-23)
+    fc: dict = {}
+    if not r.get("partial") and any(x.get("series") for x in rows):
+        try:
+            fc = _foreign_cum(code, r.get("st") or "")
+        except Exception:
+            fc = {}
+    fdates = sorted(fc)
+    for x in rows:
+        sr = x.pop("series", None)
+        if not sr:
+            continue
+        en = _hold_entry(sr)
+        if en.get("entry") and fdates:
+            e = en["entry"]
+            before = [fc[d] for d in fdates if d < e]
+            f0 = before[-1] if before else 0.0
+            en["frgn_ok"] = fc[fdates[-1]] - f0 > 0  # ✅ 진입 뒤 외국인(공식)도 순매수 늘었나
+        x["entry"] = en
+    out_f = [[d, round(fc[d])] for d in fdates]
     return {"ok": True, "pc_alive": alive or waiting, "price": price, "st": r.get("st"), "en": r.get("en"), "at": r.get("at"),
-            "partial": bool(r.get("partial")), "done": r.get("done", 0), "total": r.get("total", 0),
+            "partial": bool(r.get("partial")), "done": r.get("done", 0), "total": r.get("total", 0), "frgn": out_f,
             "rows": rows, "foreign_hold": sum(x["hold"] or 0 for x in rows if x.get("foreign"))}
 
 
