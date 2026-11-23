@@ -9944,13 +9944,77 @@ def _pos_rows(block):
     return out
 
 
+_us_gap_cache: dict = {}
+
+
+def _us_gap(sym: str):
+    """② 프리장 갭 · ③ 상대 거래량 · ⑤ 기술 자리 (야후) — 장중에 바뀌니까 60초만 저장 (2026-11-24)
+    + 지금 장 구분(sess) · 정규장 등락 · 🌙 애프터 가격"""
+    c = _us_gap_cache.get(sym)
+    if c and time.time() - c[0] < 60:
+        return c[1]
+    yh = {"User-Agent": "Mozilla/5.0"}
+    r1 = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{requests.utils.quote(sym)}",
+                      params={"range": "1d", "interval": "1m", "includePrePost": "true"}, headers=yh, timeout=12).json()["chart"]["result"][0]
+    meta = r1.get("meta") or {}
+    per = (meta.get("currentTradingPeriod") or {})
+    reg_s, reg_e = (per.get("regular") or {}).get("start"), (per.get("regular") or {}).get("end")
+    pre_s, post_e = (per.get("pre") or {}).get("start"), (per.get("post") or {}).get("end")
+    q = r1["indicators"]["quote"][0]
+    ts = r1.get("timestamp") or []
+    pre = [(t, q["high"][i], q["low"][i], q["close"][i], q["volume"][i] or 0) for i, t in enumerate(ts) if q["close"][i] is not None and reg_s and t < reg_s]
+    reg = [(t, q["close"][i], q["volume"][i] or 0) for i, t in enumerate(ts) if q["close"][i] is not None and reg_s and reg_s <= t < reg_e]
+    post = [(t, q["high"][i], q["low"][i], q["close"][i]) for i, t in enumerate(ts) if q["close"][i] is not None and reg_e and t >= reg_e]
+    prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+    now = time.time()
+    sess = "pre" if (pre_s and reg_s and pre_s <= now < reg_s) else "reg" if (reg_s and reg_e and reg_s <= now < reg_e) else \
+        "post" if (reg_e and post_e and reg_e <= now < post_e) else "closed"
+    pre_last = pre[-1][3] if pre else None
+    reg_close = reg[-1][1] if reg else None
+    g = {"sess": sess, "asof": int(now), "prev_close": prev, "pre_last": pre_last,
+         "pre_high": max((x[1] for x in pre), default=None), "pre_low": min((x[2] for x in pre), default=None),
+         "pre_vol": sum(x[4] for x in pre), "gap_pct": ((pre_last / prev - 1) * 100) if (pre_last and prev) else None,
+         "price": meta.get("regularMarketPrice"), "reg_vol": sum(x[2] for x in reg), "reg_min": len(reg),
+         "reg_close": reg_close, "day_pct": ((reg_close / prev - 1) * 100) if (reg_close and prev) else None,
+         "day_high": meta.get("regularMarketDayHigh"), "day_low": meta.get("regularMarketDayLow"),
+         "post_last": post[-1][3] if post else None, "post_high": max((x[1] for x in post), default=None), "post_low": min((x[2] for x in post), default=None)}
+    g["post_pct"] = ((g["post_last"] / reg_close - 1) * 100) if (g["post_last"] and reg_close) else None
+    r2 = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{requests.utils.quote(sym)}",
+                      params={"range": "1y", "interval": "1d"}, headers=yh, timeout=12).json()["chart"]["result"][0]
+    q2 = r2["indicators"]["quote"][0]
+    cl = [x for x in q2["close"] if x is not None]
+    vols = [v for v in q2["volume"] if v]
+    hist = vols[:-1] if g["reg_vol"] else vols  # 오늘 봉 제외하고 평균
+    avg20 = sum(hist[-20:]) / min(20, len(hist)) if hist else None
+    g["avg20_vol"] = avg20
+    g["rvol"] = (g["reg_vol"] / avg20) if (avg20 and g["reg_vol"]) else None
+    g["rvol_pace"] = (g["reg_vol"] / (avg20 * min(1.0, g["reg_min"] / 390))) if (avg20 and g["reg_vol"] and g["reg_min"]) else None
+    sma = lambda n: (sum(cl[-n:]) / n) if len(cl) >= n else None
+    last = g["price"] or (cl[-1] if cl else None)
+    hi52, lo52 = (max(cl), min(cl)) if cl else (None, None)
+    tech = {"last": last, "sma20": sma(20), "sma60": sma(60), "sma200": sma(200), "hi52": hi52, "lo52": lo52,
+            "from_hi": ((last / hi52 - 1) * 100) if (last and hi52) else None, "from_lo": ((last / lo52 - 1) * 100) if (last and lo52) else None}
+    res = (g, tech)
+    _us_gap_cache[sym] = (time.time(), res)
+    return res
+
+
 @app.get("/api/us-owner")
-def us_owner_endpoint(symbol: str):
+def us_owner_endpoint(symbol: str, fresh: int = 0):
     sym = (symbol or "").strip().upper()
     c = _us_owner_cache.get(sym)
-    if c and time.time() - c[0] < 900:
-        return c[1]
+    if c and time.time() - c[0] < 900 and not fresh:
+        out = c[1]
+        try:  # 기관·공매도는 15분 저장 · 갭/거래량/가격은 60초마다 새로
+            out["gap"], out["tech"] = _us_gap(sym)
+        except Exception:
+            pass
+        return out
     out = {"ok": True, "symbol": sym, "errors": {}}
+    try:
+        out["gap"], out["tech"] = _us_gap(sym)
+    except Exception as e:
+        out["errors"]["gap"] = str(e)
 
     # ④ 지분구조 + 👑 메인 세력 (평가액 순)
     try:
@@ -10026,41 +10090,6 @@ def us_owner_endpoint(symbol: str):
     except Exception as e:
         out["errors"]["earnings"] = str(e)
 
-    # ② 프리장 갭 · ③ 상대 거래량 · ⑤ 기술 자리 (야후)
-    try:
-        yh = {"User-Agent": "Mozilla/5.0"}
-        r1 = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{requests.utils.quote(sym)}",
-                          params={"range": "1d", "interval": "1m", "includePrePost": "true"}, headers=yh, timeout=12).json()["chart"]["result"][0]
-        meta = r1.get("meta") or {}
-        per = (meta.get("currentTradingPeriod") or {})
-        reg_s, reg_e = (per.get("regular") or {}).get("start"), (per.get("regular") or {}).get("end")
-        q = r1["indicators"]["quote"][0]
-        ts = r1.get("timestamp") or []
-        pre = [(t, q["high"][i], q["low"][i], q["close"][i], q["volume"][i] or 0) for i, t in enumerate(ts) if q["close"][i] is not None and reg_s and t < reg_s]
-        reg = [(t, q["close"][i], q["volume"][i] or 0) for i, t in enumerate(ts) if q["close"][i] is not None and reg_s and reg_s <= t < reg_e]
-        prev = meta.get("chartPreviousClose") or meta.get("previousClose")
-        pre_last = pre[-1][3] if pre else None
-        g = {"prev_close": prev, "pre_last": pre_last, "pre_high": max((x[1] for x in pre), default=None), "pre_low": min((x[2] for x in pre), default=None),
-             "pre_vol": sum(x[4] for x in pre), "gap_pct": ((pre_last / prev - 1) * 100) if (pre_last and prev) else None,
-             "price": meta.get("regularMarketPrice"), "reg_vol": sum(x[2] for x in reg), "reg_min": len(reg)}
-        r2 = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{requests.utils.quote(sym)}",
-                          params={"range": "1y", "interval": "1d"}, headers=yh, timeout=12).json()["chart"]["result"][0]
-        q2 = r2["indicators"]["quote"][0]
-        cl = [x for x in q2["close"] if x is not None]
-        vols = [v for v in q2["volume"] if v]
-        hist = vols[:-1] if g["reg_vol"] else vols  # 오늘 봉 제외하고 평균
-        avg20 = sum(hist[-20:]) / min(20, len(hist)) if hist else None
-        g["avg20_vol"] = avg20
-        g["rvol"] = (g["reg_vol"] / avg20) if (avg20 and g["reg_vol"]) else None
-        g["rvol_pace"] = (g["reg_vol"] / (avg20 * min(1.0, g["reg_min"] / 390))) if (avg20 and g["reg_vol"] and g["reg_min"]) else None
-        sma = lambda n: (sum(cl[-n:]) / n) if len(cl) >= n else None
-        last = g["price"] or (cl[-1] if cl else None)
-        hi52, lo52 = (max(cl), min(cl)) if cl else (None, None)
-        out["tech"] = {"last": last, "sma20": sma(20), "sma60": sma(60), "sma200": sma(200), "hi52": hi52, "lo52": lo52,
-                       "from_hi": ((last / hi52 - 1) * 100) if (last and hi52) else None, "from_lo": ((last / lo52 - 1) * 100) if (last and lo52) else None}
-        out["gap"] = g
-    except Exception as e:
-        out["errors"]["gap"] = str(e)
 
     # 📑 5% 대량보유 13D/13G (SEC) + 📰 뉴스·목표가 (기존 상세 재사용)
     try:
