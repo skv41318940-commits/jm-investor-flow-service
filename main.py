@@ -9699,10 +9699,51 @@ def fetch_us_screener() -> list:
     return rows
 
 
+_us_live_cache: dict = {}  # sym → (at, price, pct)
+
+
+def _us_live_pct(syms: list) -> dict:
+    """⚠️ 2026-11-24 JM: 나스닥 스크리너 등락률이 하루 늦게 나옴 (NVDA 실제 +31% 날 지도엔 -12%)
+    → 야후 일봉 마지막 두 종가로 등락률 다시 계산 (3분 저장 · 병렬)"""
+    now = time.time()
+    out, need = {}, []
+    for s_ in syms:
+        c = _us_live_cache.get(s_)
+        if c and now - c[0] < 180:
+            out[s_] = c[1:]
+        else:
+            need.append(s_)
+
+    def one(sym):
+        try:
+            r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{requests.utils.quote(sym.replace('/', '-'))}",
+                             params={"range": "5d", "interval": "1d"}, headers={"User-Agent": "Mozilla/5.0"}, timeout=8).json()["chart"]["result"][0]
+            cl = [x for x in (r["indicators"]["quote"][0].get("close") or []) if x is not None]
+            price = (r.get("meta") or {}).get("regularMarketPrice") or (cl[-1] if cl else None)
+            if price and len(cl) >= 2:
+                return sym, price, (price / cl[-2] - 1) * 100
+        except Exception:
+            pass
+        return sym, None, None
+
+    if need:
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            for sym, price, pct in ex.map(one, need):
+                if price is not None:
+                    _us_live_cache[sym] = (now, price, pct)
+                    out[sym] = (price, pct)
+    return out
+
+
 @app.get("/api/us-market-map")
 def us_market_map_endpoint(top: int = 300):
     """미국 시장 지도 — 시가총액 상위 N개를 섹터별로 (등락률·시총·거래대금)"""
     rows = sorted([r for r in fetch_us_screener() if r["cap"] > 0], key=lambda r: -r["cap"])[: max(50, min(top, 600))]
+    try:  # 등락률·가격을 야후 실시간 값으로 덮어쓰기 (원본 rows는 건드리지 않게 복사)
+        live = _us_live_pct([r["symbol"] for r in rows])
+        rows = [dict(r, price=live[r["symbol"]][0], pct=round(live[r["symbol"]][1], 2)) if r["symbol"] in live else r for r in rows]
+    except Exception as e:
+        print(f"[us-market-map] 야후 보정 실패: {e}")
     sectors = {}
     for r in rows:
         sectors.setdefault(r["sector"], []).append(r)
