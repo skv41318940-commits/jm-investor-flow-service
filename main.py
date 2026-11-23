@@ -9927,6 +9927,9 @@ def _nq_holders(sym, typ, sort_col, order, limit):
         nm = r.get("ownerName") or ""
         out.append({"name": nm, "kr": _inst_kr(nm), "date": r.get("date"), "shares": _nq_num(r.get("sharesHeld")),
                     "change": _nq_num(r.get("sharesChange")), "change_pct": _nq_num(r.get("sharesChangePCT")), "value": _nq_num(r.get("marketValue"))})
+    for o in out:  # 나스닥 평가액은 천 달러 단위 (주당 $1 미만으로 나오면 ×1000) · 2026-11-24
+        if o["value"] and o["shares"] and o["value"] / o["shares"] < 1:
+            o["value"] *= 1000
     return d, out
 
 
