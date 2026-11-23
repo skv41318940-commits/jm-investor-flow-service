@@ -16463,7 +16463,7 @@ def _kis_daily_candles(code: str, start: str, end: str, market: str = "J") -> li
     """🛟 한투 일봉 (KRX가 막히거나 점검일 때 대신) — 100개씩 이어 받기 (2026-10-31)"""
     s_ymd, e_ymd = start.replace("-", ""), end.replace("-", "")
     out, cur = {}, e_ymd
-    for _ in range(16):  # 100봉씩 최대 1,600봉 (역배정초 볼린저 300용 약 4년)
+    for _ in range(34):  # 100봉씩 최대 3,400봉 (2026-11-23: 주봉·월봉 10년 + 볼린저 300 여유)
         j = kis_get("/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice", "FHKST03010100",
                     {"FID_COND_MRKT_DIV_CODE": market, "FID_INPUT_ISCD": code, "FID_INPUT_DATE_1": s_ymd,
                      "FID_INPUT_DATE_2": cur, "FID_PERIOD_DIV_CODE": "D", "FID_ORG_ADJ_PRC": "0"})
