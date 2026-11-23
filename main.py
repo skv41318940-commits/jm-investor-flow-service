@@ -15998,6 +15998,121 @@ def _foreign_cum(code: str, st: str) -> dict:
     return out
 
 
+# 🏠 주인 찾기 (2026-11-23 JM) — 10년 동안 "누가 모았나"
+#   ① 주체별 월별 순매수 (KRX 공식 · 안 되면 한투) → 누적 곡선 + 10·5·3·1년 합계
+#   ② DART 5% 대량보유 공시 이력 (국민연금 · 운용사 등이 언제 몇 % 늘리고 줄였나)
+#   ③ 월말 종가 (주가와 겹쳐 보기)
+_owner_mem: dict = {}
+
+
+def _owner_inst_daily(code: str, s_ymd: str, e_ymd: str) -> dict:
+    """{YYYYMMDD: {주체: 억}} — KRX 한 번에 (실패하면 한투로 30일씩 거꾸로)"""
+    out: dict = {}
+    try:
+        df = _krx_df(stock.get_market_trading_value_by_date, s_ymd, e_ymd, code, detail=True)
+        if df is not None and not df.empty:
+            for idx, row in df.iterrows():
+                d = idx.strftime("%Y%m%d")
+                out[d] = {k: float(row.get(k, 0) or 0) / 1e8 for k in INST_TYPE_COLUMNS}
+            return out
+    except Exception as e:
+        print(f"[owner] KRX 실패 → 한투로: {e}")
+    t0, cur = time.time(), e_ymd
+    keys_map = None
+    while time.time() - t0 < 45:
+        rs = _kis_inst_rows(code, cur)
+        if not rs:
+            break
+        if keys_map is None:
+            ks = set(rs[0].keys())
+            keys_map = {}
+            for inst, prefixes in _KIS_INST_MAP.items():
+                k = next((f"{p}{suf}" for p in prefixes for suf in ("_ntby_tr_pbmn", "_ntby_pbmn") if f"{p}{suf}" in ks), None)
+                if k:
+                    keys_map[inst] = k
+        for r in rs:
+            d = r["stck_bsop_date"]
+            if d >= s_ymd and d not in out:
+                out[d] = {inst: float(str(r.get(k) or 0).replace(",", "") or 0) / 100 for inst, k in keys_map.items()}
+        oldest = min(r["stck_bsop_date"] for r in rs)
+        if oldest <= s_ymd:
+            break
+        cur = (datetime.strptime(oldest, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+        time.sleep(0.06)
+    return out
+
+
+@app.get("/api/owner-history")
+def owner_history(code: str, years: int = 10, fresh: int = 0):
+    code = (code or "").strip()
+    years = max(1, min(15, int(years or 10)))
+    key = f"owner:{code}:{years}"
+    hit = _owner_mem.get(key)
+    if hit and not fresh and time.time() - hit[0] < 12 * 3600:
+        return hit[1]
+    if not fresh:
+        try:
+            row = supabase.table("brief_cache").select("data,updated_at").eq("key", key).limit(1).execute().data
+            if row and row[0].get("data", {}).get("day") == now_kst().strftime("%Y-%m-%d"):
+                _owner_mem[key] = (time.time(), row[0]["data"])
+                return row[0]["data"]
+        except Exception:
+            pass
+    now = now_kst()
+    e_ymd = _krx_ready_end(now.strftime("%Y%m%d"), 16)
+    s_ymd = (now - timedelta(days=int(years * 365.25))).strftime("%Y%m%d")
+    res: dict = {"ok": True, "code": code, "years": years, "day": now.strftime("%Y-%m-%d"), "from": s_ymd, "to": e_ymd}
+    # ① 주체별 월별
+    daily = _owner_inst_daily(code, s_ymd, e_ymd)
+    months: dict = {}
+    for d in sorted(daily):
+        m = f"{d[:4]}-{d[4:6]}"
+        mm = months.setdefault(m, {})
+        for k, v in daily[d].items():
+            mm[k] = mm.get(k, 0.0) + v
+    mlist = sorted(months)
+    insts = [k for k in INST_TYPE_COLUMNS if k != "기타외국인" and any(months[m].get(k) for m in mlist)]
+    res["months"] = mlist
+    res["inst"] = {k: [round(months[m].get(k, 0.0), 1) for m in mlist] for k in insts}
+    res["daily_from"] = min(daily) if daily else None
+    sums = {}
+    for yy in (10, 5, 3, 1):
+        cut = (now - timedelta(days=int(yy * 365.25))).strftime("%Y%m%d")
+        if yy <= years:
+            sums[str(yy)] = {k: round(sum(v.get(k, 0.0) for d, v in daily.items() if d >= cut), 1) for k in insts}
+    res["sums"] = sums
+    # ③ 월말 종가
+    try:
+        cs = _kis_daily_candles(code, f"{s_ymd[:4]}-{s_ymd[4:6]}-{s_ymd[6:]}", f"{e_ymd[:4]}-{e_ymd[4:6]}-{e_ymd[6:]}", "J")
+        mc = {}
+        for c in cs:
+            mc[c["date"][:7]] = c["close"]
+        res["price"] = [mc.get(m) for m in mlist]
+    except Exception as e:
+        res["price"] = []
+        res["price_error"] = str(e)
+    # ② DART 대량보유 (5%) 이력
+    try:
+        corp = _dart_corp_code(code)
+        if corp:
+            j = requests.get("https://opendart.fss.or.kr/api/majorstock.json", params={"crtfc_key": DART_API_KEY, "corp_code": corp}, timeout=20).json()
+            major = []
+            for x in j.get("list") or []:
+                _rd = str(x.get("rcept_dt") or "").replace(".", "-"); _rd = f"{_rd[:4]}-{_rd[4:6]}-{_rd[6:8]}" if len(_rd) == 8 and _rd.isdigit() else _rd
+                major.append({"date": _rd, "who": (x.get("repror") or "").strip(), "rt": x.get("stkrt"), "rt_chg": x.get("stkrt_irds"),
+                              "qty": x.get("stkqy"), "why": (x.get("report_resn") or "").strip()[:80], "rcept_no": x.get("rcept_no")})
+            major.sort(key=lambda x: x.get("date") or "", reverse=True)
+            res["major"] = major[:60]
+    except Exception as e:
+        res["major_error"] = str(e)
+    _owner_mem[key] = (time.time(), res)
+    try:
+        supabase.table("brief_cache").upsert({"key": key, "data": res, "updated_at": now.isoformat()}).execute()
+    except Exception:
+        pass
+    return res
+
+
 # 🏦 주체별 순매수 5·20·60·120일 한 표 (2026-11-23 JM) — 한투 종목별 투자자 일별 (공식 수급) · PC 필요 없음
 _invp_cache: dict = {}
 
