@@ -11422,13 +11422,24 @@ def _minute_day_cached(code: str, day: str, market: str = "J") -> dict:
                 pass
         out = None
         if day == today:
-            # 2026-11-24: 일별분봉(FHKST03010230)은 통합(UN)이면 1~2개만 줌 → 오늘은 당일분봉(FHKST03010200) 페이지 이어붙이기로
+            # 2026-11-24 JM: 한투 통합(UN) 분봉은 값이 엉망(전일 종가로 평평 · 1~2개만) → 직접 합침
+            #   09:00~15:30 = KRX 정규장(J) · 그 밖(08:00~08:50 프리 · 15:31~20:00 애프터) = NXT(NX) 체결 있는 봉만
+            #   → 프리장 거래가 없는 종목(HPSP 등)은 프리 봉이 아예 없음 (사부님 OPEN BOOK과 같게)
             try:
-                cs, ld, _pg, _cp, _w = fetch_minute_candles_paginated(code, "UN")
-                if ld == day.replace("-", "") and cs:
-                    out = {"ok": True, "code": code, "date": day, "candles": cs}
+                j = _minute_day_cached(code, day, "J")
+                reg = [c for c in (j.get("candles") or []) if "09:00" <= c["time"] <= "15:30"] if j.get("ok") else []
+                ext = []
+                try:
+                    cs, ld, _pg, _cp, _w = fetch_minute_candles_paginated(code, "NX", "08:00")
+                    if ld == day.replace("-", ""):
+                        ext = [c for c in cs if (c["time"] < "09:00" or c["time"] > "15:30") and (c.get("volume") or 0) > 0 and c.get("close")]
+                except Exception as e:
+                    print(f"[minute NX today] {code} NXT 분봉 없음/실패: {e}")
+                merged = sorted(reg + ext, key=lambda c: c["time"])
+                if merged:
+                    out = {"ok": True, "code": code, "date": day, "candles": merged, "nxt": bool(ext)}
             except Exception as e:
-                print(f"[minute UN today] {code} 당일분봉 실패: {e}")
+                print(f"[minute AL today] {code} 합치기 실패: {e}")
         if out is None:
             out = stock_minute_by_date_endpoint(code, day, market)
         if day < today and (not out.get("ok") or len(out.get("candles") or []) < 30):
@@ -11438,7 +11449,7 @@ def _minute_day_cached(code: str, day: str, market: str = "J") -> dict:
                 out = {**j, "src": "krx_only"}
         elif out.get("ok") and out.get("candles"):
             out = {**out, "src": "al"}
-            if day == today and now_kst().strftime("%H:%M") >= "20:05" and len(out["candles"]) >= 300:
+            if day == today and now_kst().strftime("%H:%M") >= "20:05" and len(out["candles"]) >= 200:
                 _save_al_day(code, day, out["candles"])
         if out.get("ok") and out.get("candles"):
             _minute_mem[key] = (time.time(), out)
@@ -11511,7 +11522,7 @@ def _run_al_minute_save():
         for c in todo:
             try:
                 out = _minute_day_cached(c, day, "UN")
-                if out.get("ok") and out.get("src") == "al" and len(out.get("candles") or []) >= 300:
+                if out.get("ok") and out.get("src") == "al" and len(out.get("candles") or []) >= 200:
                     _save_al_day(c, day, out["candles"])
                     ok += 1
                 time.sleep(0.2)
