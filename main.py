@@ -11435,10 +11435,12 @@ def _minute_day_cached(code: str, day: str, market: str = "J") -> dict:
                         cs, ld, _pg, _cp, _w = fetch_minute_candles_paginated(code, mk_, "08:00")
                         if ld == day.replace("-", ""):
                             ext = [c for c in cs if (c["time"] < "09:00" or c["time"] > "15:30") and (c.get("volume") or 0) > 0 and c.get("close")]
-                        _nx_debug[code] = {"mk": mk_, "date": ld, "rows": len(cs), "ext": len(ext),
-                                           "first": cs[0] if cs else None, "last": cs[-1] if cs else None, "warn": _w}
+                        pick = [c for c in cs if c["time"] in ("08:00", "08:30", "08:49", "09:30", "15:20", "15:40", "16:00", "16:30", "17:00", "18:00", "19:00")]
+                        _nx_debug.setdefault(code, {})[mk_] = {"date": ld, "rows": len(cs), "ext": len(ext),
+                                                               "vol_rows": sum(1 for c in cs if (c.get("volume") or 0) > 0),
+                                                               "sample": pick, "last": cs[-1] if cs else None, "warn": _w}
                     except Exception as e:
-                        _nx_debug[code] = {"mk": mk_, "error": str(e)}
+                        _nx_debug.setdefault(code, {})[mk_] = {"error": str(e)}
                         print(f"[minute {mk_} today] {code} 분봉 없음/실패: {e}")
                     if ext:
                         break
