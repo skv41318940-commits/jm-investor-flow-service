@@ -11429,12 +11429,19 @@ def _minute_day_cached(code: str, day: str, market: str = "J") -> dict:
                 j = _minute_day_cached(code, day, "J")
                 reg = [c for c in (j.get("candles") or []) if "09:00" <= c["time"] <= "15:30"] if j.get("ok") else []
                 ext = []
-                try:
-                    cs, ld, _pg, _cp, _w = fetch_minute_candles_paginated(code, "NX", "08:00")
-                    if ld == day.replace("-", ""):
-                        ext = [c for c in cs if (c["time"] < "09:00" or c["time"] > "15:30") and (c.get("volume") or 0) > 0 and c.get("close")]
-                except Exception as e:
-                    print(f"[minute NX today] {code} NXT 분봉 없음/실패: {e}")
+                # NXT(NX) → 안 되면 통합(UN)에서 정규장 밖 + 체결 있는 봉만 (2026-11-24: HPSP 애프터가 안 나와서 예비로)
+                for mk_ in ("NX", "UN"):
+                    try:
+                        cs, ld, _pg, _cp, _w = fetch_minute_candles_paginated(code, mk_, "08:00")
+                        if ld == day.replace("-", ""):
+                            ext = [c for c in cs if (c["time"] < "09:00" or c["time"] > "15:30") and (c.get("volume") or 0) > 0 and c.get("close")]
+                        _nx_debug[code] = {"mk": mk_, "date": ld, "rows": len(cs), "ext": len(ext),
+                                           "first": cs[0] if cs else None, "last": cs[-1] if cs else None, "warn": _w}
+                    except Exception as e:
+                        _nx_debug[code] = {"mk": mk_, "error": str(e)}
+                        print(f"[minute {mk_} today] {code} 분봉 없음/실패: {e}")
+                    if ext:
+                        break
                 merged = sorted(reg + ext, key=lambda c: c["time"])
                 if merged:
                     out = {"ok": True, "code": code, "date": day, "candles": merged, "nxt": bool(ext)}
@@ -11486,6 +11493,13 @@ def _minute_day_cached(code: str, day: str, market: str = "J") -> dict:
 
 
 _al_viewed: dict = {}  # 통합 분봉을 본 종목 → 그날 20시 뒤 보관 대상
+_nx_debug: dict = {}  # 🔍 프리·애프터 분봉 받기 결과 (종목별 마지막 시도)
+
+
+@app.get("/api/debug-nx")
+def debug_nx_endpoint(code: str):
+    """🔍 프리·애프터(NXT) 분봉이 왜 안 나오는지 — 데이 트레이딩 [통합]을 한 번 연 뒤 보기"""
+    return {"ok": True, "code": code, "last_try": _nx_debug.get(code)}
 
 
 def _save_al_day(code: str, day: str, candles: list):
