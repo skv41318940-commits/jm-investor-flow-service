@@ -2798,6 +2798,7 @@ async def _daily_jobs_worker():
         ("swing_after_close", _run_swing_after_close, ()),
         ("theme_index", _run_theme_index_job, ()),
         ("inst_prefetch", _run_inst_prefetch, ()),
+        ("al_minute_save", _run_al_minute_save, ()),  # 🌙 20:06 통합(프리·애프터) 분봉 보관 (2026-11-24)
         # ("weekly_review", _run_weekly_review, ()),  # 🛑 금요일 밤 주간 리포트도 끔 (2026-11-07 JM: 주말 리포트 필요 없음)
         ("krx_map", _run_krx_map_job, ()),
         ("new_listing", _run_new_listing_job, ()),
@@ -11407,8 +11408,38 @@ def _minute_day_cached(code: str, day: str, market: str = "J") -> dict:
     hit = _minute_mem.get(key)
     if hit and ((day < today and (market != "J" or _minute_complete(hit[1].get("candles") or []))) or time.time() - hit[0] < 60):
         return hit[1]
-    if market != "J":  # 🌙 통합은 DB 보관 없이 메모리에만
-        out = stock_minute_by_date_endpoint(code, day, market)
+    if market != "J":  # 🌙 통합 (08:00~20:00 · NXT 프리·애프터 포함)
+        # 2026-11-24 JM: 한투는 지난 날짜 통합 분봉을 거의 안 줌 → 그날 20시 뒤에 받은 걸 DB에 보관해서 다음 날부터 씀
+        _al_viewed[code] = time.time()
+        if day < today:
+            try:
+                r = supabase.table("minute_candles_cache").select("candles").eq("code", f"{code}@UN").eq("day", day).limit(1).execute().data
+                if r and r[0]["candles"]:
+                    out = {"ok": True, "candles": r[0]["candles"], "cached": True, "src": "al"}
+                    _minute_mem[key] = (time.time(), out)
+                    return out
+            except Exception:
+                pass
+        out = None
+        if day == today:
+            # 2026-11-24: 일별분봉(FHKST03010230)은 통합(UN)이면 1~2개만 줌 → 오늘은 당일분봉(FHKST03010200) 페이지 이어붙이기로
+            try:
+                cs, ld, _pg, _cp, _w = fetch_minute_candles_paginated(code, "UN")
+                if ld == day.replace("-", "") and cs:
+                    out = {"ok": True, "code": code, "date": day, "candles": cs}
+            except Exception as e:
+                print(f"[minute UN today] {code} 당일분봉 실패: {e}")
+        if out is None:
+            out = stock_minute_by_date_endpoint(code, day, market)
+        if day < today and (not out.get("ok") or len(out.get("candles") or []) < 30):
+            # 보관 안 된 지난 날짜 → 정규장(09:00~15:30)이라도 보여줌 (프리·애프터는 비어 있음)
+            j = _minute_day_cached(code, day, "J")
+            if j.get("ok") and j.get("candles"):
+                out = {**j, "src": "krx_only"}
+        elif out.get("ok") and out.get("candles"):
+            out = {**out, "src": "al"}
+            if day == today and now_kst().strftime("%H:%M") >= "20:05" and len(out["candles"]) >= 300:
+                _save_al_day(code, day, out["candles"])
         if out.get("ok") and out.get("candles"):
             _minute_mem[key] = (time.time(), out)
         return out
@@ -11443,6 +11474,55 @@ def _minute_day_cached(code: str, day: str, market: str = "J") -> dict:
     return out
 
 
+_al_viewed: dict = {}  # 통합 분봉을 본 종목 → 그날 20시 뒤 보관 대상
+
+
+def _save_al_day(code: str, day: str, candles: list):
+    try:
+        supabase.table("minute_candles_cache").upsert({"code": f"{code}@UN", "day": day, "candles": candles}).execute()
+    except Exception as e:
+        print(f"[al_save] {code} {day} 보관 실패: {e}")
+
+
+def _run_al_minute_save():
+    """🌙 20:06~20:50 하루 한 번 — 관심종목·검색기·오늘 통합으로 본 종목의 통합(08~20) 1분봉을 DB에 보관
+    (한투는 다음 날부터 지난 날짜 통합 분봉을 안 줘서 → 이렇게 모아둬야 어제 애프터·오늘 프리 세력평단을 이어서 볼 수 있음 · 2026-11-24)"""
+    now = now_kst()
+    if now.weekday() >= 5 or not ("20:06" <= now.strftime("%H:%M") <= "20:50"):
+        return
+    day = now.strftime("%Y-%m-%d")
+    if _brief_already_sent("job_al_minute_save", day):
+        return
+    _mark_brief_sent("job_al_minute_save", day)
+    codes = list(_al_viewed.keys())
+    try:
+        codes += [r["code"] for r in supabase.table("jm_watchlist").select("code").limit(300).execute().data or []]
+        codes += [r["code"] for r in supabase.table("watchlist").select("code").limit(200).execute().data or []]
+    except Exception:
+        pass
+    d = _crab_pc.get("data") or {}
+    for k in ("big", "kkot", "yeok", "newvol"):
+        codes += [x["code"] for x in d.get(k, []) or []]
+        codes += [x["code"] for x in d.get(f"{k}_removed", []) or []]
+    todo = [c for c in dict.fromkeys(codes) if c][:200]
+
+    def work():
+        ok = 0
+        for c in todo:
+            try:
+                out = _minute_day_cached(c, day, "UN")
+                if out.get("ok") and out.get("src") == "al" and len(out.get("candles") or []) >= 300:
+                    _save_al_day(c, day, out["candles"])
+                    ok += 1
+                time.sleep(0.2)
+            except Exception:
+                pass
+        print(f"[al_save] {day} 통합 분봉 {ok}/{len(todo)}종목 보관")
+        _al_viewed.clear()
+
+    threading.Thread(target=work, daemon=True).start()
+
+
 @app.get("/api/stock-minute-multi")
 def stock_minute_multi_endpoint(code: str, days: int = 5, end: str = "", start: str = "", mode: str = "krx"):
     """여러 날 1분봉 — start~end(YYYY-MM-DD, end 비우면 오늘) 또는 end까지 최근 N거래일. 최대 10거래일 (2026-10-26)"""
@@ -11470,7 +11550,7 @@ def stock_minute_multi_endpoint(code: str, days: int = 5, end: str = "", start: 
     out = []
     for dd, r in zip(days, results):
         if r.get("ok") and r.get("candles"):
-            out.append({"date": dd, "candles": r["candles"]})
+            out.append({"date": dd, "candles": r["candles"], "src": r.get("src") or ("al" if mode == "al" else "krx")})
     return {"ok": bool(out), "code": code, "days": out, "mode": "al" if mode == "al" else "krx", "source": "한투",
             "error": None if out else "분봉 데이터가 없어요 (휴장일이거나 너무 오래된 날짜)"}
 
