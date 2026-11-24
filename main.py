@@ -16605,6 +16605,110 @@ def _foreign_cum(code: str, st: str) -> dict:
     return out
 
 
+# 💣 종목별 반대매매 위험선 (2026-11-24 JM) — 한투 신용잔고 일별추이(FHPST04760000)
+#   매일 신규 신용(주수)을 그날 종가에 산 걸로 보고, 상환은 오래된 것부터 빠진다고 가정(FIFO)
+#   → 남아있는 신용 물량의 가격대(로트) · 평단 · 잔고율. 위험선 계산은 화면에서 (보증금률 선택)
+_credit_mem: dict = {}
+_credit_dbg: dict = {}
+
+
+def _credit_rows(code: str, pages: int = 7) -> list:
+    rows: dict = {}
+    d = now_kst()
+    ymd = d.strftime("%Y%m%d")
+    for _ in range(pages):
+        j = kis_get("/uapi/domestic-stock/v1/quotations/daily-credit-balance", "FHPST04760000",
+                    {"fid_cond_mrkt_div_code": "J", "fid_cond_scr_div_code": "20476", "fid_input_iscd": code, "fid_input_date_1": ymd})
+        out = j.get("output") or j.get("output1") or []
+        if isinstance(out, dict):
+            out = [out]
+        if not rows:
+            _credit_dbg[code] = {"rt_cd": j.get("rt_cd"), "msg": j.get("msg1"), "sample": out[:2]}
+        new = 0
+        for r in out:
+            dd = str(r.get("deal_date") or "")
+            if len(dd) != 8 or dd in rows:
+                continue
+            def f(k, r=r):
+                v = _num(r.get(k))
+                return v if v is not None and v == v else 0.0
+            rows[dd] = {"date": f"{dd[:4]}-{dd[4:6]}-{dd[6:]}", "stlm": str(r.get("stlm_date") or ""),
+                        "close": f("stck_prpr"), "new": f("whol_loan_new_stcn"), "rdmp": f("whol_loan_rdmp_stcn"),
+                        "rmnd": f("whol_loan_rmnd_stcn"), "amt": f("whol_loan_rmnd_amt"), "rate": f("whol_loan_rmnd_rate"), "gvrt": f("whol_loan_gvrt")}
+            new += 1
+        if not new:
+            break
+        oldest = min(str(r.get("stlm_date") or r.get("deal_date") or "99999999") for r in out)
+        try:
+            ymd = (datetime.strptime(oldest[:8], "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+        except ValueError:
+            break
+        time.sleep(0.12)
+    return [rows[k] for k in sorted(rows)]
+
+
+@app.get("/api/credit-risk")
+def credit_risk(code: str, fresh: int = 0):
+    """💣 종목 신용 물량의 가격대(FIFO 로트)·평단·잔고율 → 화면에서 반대매매 위험선 계산"""
+    code = (code or "").strip()
+    hit = _credit_mem.get(code)
+    if hit and not fresh and time.time() - hit[0] < 3 * 3600:
+        return hit[1]
+    try:
+        rows = [r for r in _credit_rows(code) if r["close"] > 0]
+    except Exception as e:
+        return {"ok": False, "error": f"신용잔고 조회 실패: {e}", "debug": _credit_dbg.get(code)}
+    if len(rows) < 5:
+        return {"ok": False, "error": "신용잔고 자료가 없어요 (신용 불가 종목이거나 한투 응답 없음)", "debug": _credit_dbg.get(code)}
+    # FIFO 로트
+    lots: list = [[rows[0]["date"], rows[0]["close"], max(0.0, rows[0]["rmnd"]), True]]  # [날짜, 가격, 주수, 시작물량(원가 모름)]
+    for r in rows[1:]:
+        if r["new"] > 0:
+            lots.append([r["date"], r["close"], r["new"], False])
+        out = r["rdmp"]
+        while out > 0 and lots:
+            take = min(out, lots[0][2])
+            lots[0][2] -= take
+            out -= take
+            if lots[0][2] <= 1e-6:
+                lots.pop(0)
+        # 공시 잔고와 맞추기 (차이는 최근 로트에서 가감)
+        diff = r["rmnd"] - sum(l[2] for l in lots)
+        if diff > 0:
+            lots.append([r["date"], r["close"], diff, False])
+        else:
+            k = len(lots) - 1
+            while diff < 0 and k >= 0:
+                take = min(-diff, lots[k][2])
+                lots[k][2] -= take
+                diff += take
+                k -= 1
+            lots = [l for l in lots if l[2] > 1e-6]
+    tot = sum(l[2] for l in lots)
+    avg = sum(l[1] * l[2] for l in lots) / tot if tot else None
+    seed = sum(l[2] for l in lots if l[3])
+    last = rows[-1]
+    out = {"ok": True, "code": code, "asof": last["date"], "close": last["close"],
+           "rmnd": last["rmnd"], "rate": last["rate"], "gvrt": last["gvrt"],
+           "avg": round(avg, 1) if avg else None, "seed_pct": round(seed / tot * 100, 1) if tot else None,
+           "lots": [{"date": l[0], "price": l[1], "qty": round(l[2])} for l in lots],
+           "series": [{"date": r["date"], "close": r["close"], "rmnd": r["rmnd"], "rate": r["rate"], "new": r["new"], "rdmp": r["rdmp"]} for r in rows],
+           "from": rows[0]["date"], "at": now_kst().strftime("%Y-%m-%d %H:%M")}
+    _credit_mem[code] = (time.time(), out)
+    return out
+
+
+@app.get("/api/debug-credit")
+def debug_credit(code: str = "005930"):
+    try:
+        j = kis_get("/uapi/domestic-stock/v1/quotations/daily-credit-balance", "FHPST04760000",
+                    {"fid_cond_mrkt_div_code": "J", "fid_cond_scr_div_code": "20476", "fid_input_iscd": code, "fid_input_date_1": now_kst().strftime("%Y%m%d")})
+        o = j.get("output") or j.get("output1") or []
+        return {"rt_cd": j.get("rt_cd"), "msg": j.get("msg1"), "n": len(o) if isinstance(o, list) else 1, "keys": list(j.keys()), "head": o[:3] if isinstance(o, list) else o}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # 🏠 주인 찾기 (2026-11-23 JM) — 10년 동안 "누가 모았나"
 #   ① 주체별 월별 순매수 (KRX 공식 · 안 되면 한투) → 누적 곡선 + 10·5·3·1년 합계
 #   ② DART 5% 대량보유 공시 이력 (국민연금 · 운용사 등이 언제 몇 % 늘리고 줄였나)
