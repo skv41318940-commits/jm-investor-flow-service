@@ -11411,6 +11411,11 @@ def _minute_day_cached(code: str, day: str, market: str = "J") -> dict:
     if market != "J":  # 🌙 통합 (08:00~20:00 · NXT 프리·애프터 포함)
         # 2026-11-24 JM: 한투는 지난 날짜 통합 분봉을 거의 안 줌 → 그날 20시 뒤에 받은 걸 DB에 보관해서 다음 날부터 씀
         _al_viewed[code] = time.time()
+        k = _kal.get((code, day))  # 🌙 키움 통합 분봉 (PC) 이 있으면 제일 먼저 — 사부님과 같은 데이터
+        if k and (day < today or time.time() - k[0] < 90):
+            out = {"ok": True, "code": code, "date": day, "candles": k[1], "src": "al", "via": "kiwoom"}
+            _minute_mem[key] = (time.time(), out)
+            return out
         if day < today:
             try:
                 r = supabase.table("minute_candles_cache").select("candles").eq("code", f"{code}@UN").eq("day", day).limit(1).execute().data
@@ -11458,7 +11463,8 @@ def _minute_day_cached(code: str, day: str, market: str = "J") -> dict:
                 out = {**j, "src": "krx_only"}
         elif out.get("ok") and out.get("candles"):
             out = {**out, "src": "al"}
-            if day == today and now_kst().strftime("%H:%M") >= "20:05" and len(out["candles"]) >= 200:
+            # 한투로 합친 건 NXT 봉이 실제로 있을 때만 보관 (정규장만이면 보관 X → 키움으로 다시 받을 수 있게)
+            if day == today and now_kst().strftime("%H:%M") >= "20:05" and len(out["candles"]) >= 200 and out.get("nxt"):
                 _save_al_day(code, day, out["candles"])
         if out.get("ok") and out.get("candles"):
             _minute_mem[key] = (time.time(), out)
@@ -11537,8 +11543,12 @@ def _run_al_minute_save():
         ok = 0
         for c in todo:
             try:
+                _kiwoom_minute_al(c, [day], wait=15)  # 🌙 키움(PC) 먼저 — 받으면 결과 처리에서 바로 DB 보관
+                if (c, day) in _kal:
+                    ok += 1
+                    continue
                 out = _minute_day_cached(c, day, "UN")
-                if out.get("ok") and out.get("src") == "al" and len(out.get("candles") or []) >= 200:
+                if out.get("ok") and out.get("src") == "al" and out.get("nxt") and len(out.get("candles") or []) >= 200:
                     _save_al_day(c, day, out["candles"])
                     ok += 1
                 time.sleep(0.2)
@@ -11548,6 +11558,45 @@ def _run_al_minute_save():
         _al_viewed.clear()
 
     threading.Thread(target=work, daemon=True).start()
+
+
+_kal: dict = {}  # 🌙 키움 통합 1분봉: (code, day) → (받은 시각, candles)
+
+
+def _kiwoom_minute_al(code: str, days: list, wait: int = 25):
+    """🌙 PC(키움)에 통합 1분봉(종목코드_AL)을 맡기고 기다림 (2026-11-24 JM: 한투 NXT 분봉이 종목마다 비어서)
+    지난 날짜는 DB(code@UN)에 있으면 안 물어봄 · 오늘은 60초마다 새로 · PC가 꺼져 있으면 그냥 넘어감(한투로)"""
+    today = now_kst().strftime("%Y-%m-%d")
+    need = []
+    past = [d for d in days if d < today and (code, d) not in _kal]
+    have = set()
+    if past:
+        try:
+            rows = supabase.table("minute_candles_cache").select("day").eq("code", f"{code}@UN").in_("day", past).execute().data or []
+            have = {r_["day"] for r_ in rows}
+        except Exception:
+            pass
+    for d in days:
+        if d == today:
+            k = _kal.get((code, d))
+            if not k or time.time() - k[0] > 60:
+                need.append(d)
+        elif d not in have and (code, d) not in _kal:
+            need.append(d)
+    if not need or time.time() - _bpc["alive_at"] > 30:
+        return
+    # 몇 쪽 받을지: 가장 오래된 필요 날짜까지 (통합 하루 ≈ 720봉, 한 쪽 900봉)
+    n_days = sum(1 for d in days if d >= min(need))
+    pages = 1 if need == [today] else min(12, int(n_days * 720 / 900) + 2)
+    asked = time.time()
+    with _bpc_lock:
+        if not any(t.get("kind") == "minute_al" and t.get("code") == code for t in _bpc["tasks"]):
+            _bpc["tasks"].append({"kind": "minute_al", "code": code, "pages": pages, "suffix": "_AL"})
+    while time.time() - asked < wait:
+        r_ = _pc_task_results.get("minute_al")
+        if r_ and r_.get("got", 0) > asked and r_.get("code") == code:
+            break
+        time.sleep(0.7)
 
 
 @app.get("/api/stock-minute-multi")
@@ -11571,6 +11620,11 @@ def stock_minute_multi_endpoint(code: str, days: int = 5, end: str = "", start: 
         dates.reverse()
     import concurrent.futures as cf
     days = [d.strftime("%Y-%m-%d") for d in dates]
+    if mode == "al":  # 🌙 키움 통합 분봉 먼저 (PC 켜져 있을 때) — 2026-11-24
+        try:
+            _kiwoom_minute_al(code, days)
+        except Exception as e:
+            print(f"[minute_al] {code} 키움 요청 실패: {e}")
     with cf.ThreadPoolExecutor(max_workers=4) as ex:  # 날짜별로 동시에 (한투 초당 제한 안쪽)
         mk = "UN" if mode == "al" else "J"  # 🔀 2026-11-07
         results = list(ex.map(lambda dd: _minute_day_cached(code, dd, mk), days))
@@ -16262,6 +16316,21 @@ def _kiwoom_daily_al(codes: list, wait: int = 90, krx_only: bool = False, suffix
 @app.post("/api/pc-task/result")
 def pc_task_result(payload: dict):
     kind = payload.get("kind") or "unknown"
+    if kind == "minute_al":  # 🌙 키움 통합 1분봉 (2026-11-24) — 날짜별 보관, 지난 날짜·20:05 뒤 오늘은 DB에도
+        code_ = payload.get("code") or ""
+        today_ = now_kst().strftime("%Y-%m-%d")
+        for d, cs in (payload.get("days") or {}).items():
+            if not cs:
+                continue
+            _kal[(code_, d)] = (time.time(), cs)
+            for k_ in [(code_, d, "UN")]:
+                _minute_mem.pop(k_, None)
+            if d < today_ or now_kst().strftime("%H:%M") >= "20:05":
+                if len(cs) >= 200:
+                    _save_al_day(code_, d, cs)
+        if len(_kal) > 4000:
+            _kal.clear()
+        payload = {k: v for k, v in payload.items() if k != "days"}
     if kind == "minute":  # ⏱ 3분봉 보관 (2026-11-12) — 큰 데이터라 결과 기록엔 개수만
         for code, rows in (payload.get("data") or {}).items():
             if rows:
