@@ -8676,6 +8676,132 @@ def market_sentiment_endpoint():
         return {"ok": False, "error": str(e)}
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 🧍 개인 종합 분석 (2026-11-24 JM) — 개인 평단 · 개인 매물대 · 개인 손익 · 🌡 심리 점수
+#   개인 평단 = 매일 개인 순매수(원)를 그날 지수 종가에 산 것으로 보고 '평균단가법'으로 쌓음
+#     (사면 평단 섞임 · 팔면 평단 그대로 수량만 줄임) → 지수로 환산한 개인 평단 (추정)
+#   매물대 = 지수 가격대별 개인 순매수 합 (+면 개인이 그 가격에 쌓아둔 물량 = 본전 매물)
+#   심리 점수 0(공포)~100(과열) = 최근 1년 안에서 위치(백분위) 평균
+#     예탁금 20일 증감 · 신용잔고 · 신용/예탁 비율 · 개인 손익 · 개인 20일 순매수 · 반대매매 비중(거꾸로)
+# ══════════════════════════════════════════════════════════════════════════
+_rpsych_cache = {"at": 0.0, "data": None}
+
+
+def _yahoo_index_daily(sym: str, rng: str = "2y") -> dict:
+    r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{requests.utils.quote(sym)}",
+                     params={"range": rng, "interval": "1d"}, headers={"User-Agent": "Mozilla/5.0"}, timeout=12).json()["chart"]["result"][0]
+    out = {}
+    for t, c in zip(r.get("timestamp") or [], r["indicators"]["quote"][0].get("close") or []):
+        if c:
+            out[datetime.fromtimestamp(t + 9 * 3600, tz=timezone.utc).strftime("%Y-%m-%d")] = float(c)
+    return out
+
+
+def _pctile(vals: list, v) -> float | None:
+    xs = [x for x in vals if x is not None]
+    if v is None or len(xs) < 20:
+        return None
+    return round(sum(1 for x in xs if x <= v) / len(xs) * 100, 1)
+
+
+def _retail_market(market: str, idx: dict, days: int) -> dict:
+    today = now_kst()
+    df = _market_flow_df((today - timedelta(days=int(days * 1.6) + 10)).strftime("%Y%m%d"), today.strftime("%Y%m%d"), market)
+    if df is None or df.empty:
+        raise ValueError(f"{market} 개인 순매수를 못 받음")
+    rows = []
+    for date_idx, row in df.iterrows():
+        d = date_idx.strftime("%Y-%m-%d")
+        c = idx.get(d)
+        if not c:
+            continue
+        rows.append({"date": d, "close": c, "ind": _pick(row, "개인") / 1e8,
+                     "frg": (_pick(row, "외국인합계") or _pick(row, "외국인")) / 1e8,
+                     "ins": (_pick(row, "기관합계") if "기관합계" in row.index else sum(_pick(row, x) for x in ("금융투자", "보험", "투신", "사모", "은행", "기타금융", "연기금"))) / 1e8})
+    rows = rows[-days:]
+    # 평균단가법 (단위: 억원 · 수량 = 억원/지수)
+    units = cost = 0.0
+    hist = []
+    for r in rows:
+        q = r["ind"] / r["close"]
+        if q >= 0:
+            units += q
+            cost += r["ind"]
+        else:
+            if units > 0:
+                avg = cost / units
+                sell = min(-q, units)
+                units -= sell
+                cost -= sell * avg
+        avg = cost / units if units > 1e-9 else None
+        hist.append({"date": r["date"], "close": round(r["close"], 2), "ind": round(r["ind"], 1), "frg": round(r["frg"], 1), "ins": round(r["ins"], 1),
+                     "avg": round(avg, 2) if avg else None, "pnl": round((r["close"] / avg - 1) * 100, 2) if avg else None,
+                     "hold": round(cost, 0)})
+    # 매물대 (24칸)
+    closes = [r["close"] for r in rows]
+    lo, hi = min(closes), max(closes)
+    n = 24
+    step = (hi - lo) / n or 1
+    bins = [{"from": round(lo + i * step, 1), "to": round(lo + (i + 1) * step, 1), "net": 0.0} for i in range(n)]
+    for r in rows:
+        k = min(n - 1, int((r["close"] - lo) / step))
+        bins[k]["net"] += r["ind"]
+    for b in bins:
+        b["net"] = round(b["net"], 0)
+    last = hist[-1]
+    ind20 = sum(r["ind"] for r in rows[-20:])
+    ind20_hist = [sum(x["ind"] for x in rows[max(0, i - 19):i + 1]) for i in range(len(rows))]
+    return {"market": market, "last": last, "hist": hist, "bins": bins, "ind20": round(ind20, 0),
+            "ind20_pct": _pctile(ind20_hist, ind20), "pnl_pct": _pctile([h["pnl"] for h in hist], last["pnl"])}
+
+
+@app.get("/api/retail-psych")
+def retail_psych_endpoint(days: int = 250, fresh: int = 0):
+    """🧍 개인 종합 분석 — 코스피·코스닥 개인 평단·손익·매물대 + 🌡 심리 점수 (최근 days 거래일)"""
+    c = _rpsych_cache
+    if c["data"] and time.time() - c["at"] < 1800 and not fresh:
+        return c["data"]
+    out = {"ok": True, "markets": {}, "errors": {}}
+    for market, sym in (("KOSPI", "^KS11"), ("KOSDAQ", "^KQ11")):
+        try:
+            out["markets"][market] = _retail_market(market, _yahoo_index_daily(sym), max(60, min(int(days), 500)))
+        except Exception as e:
+            out["errors"][market] = str(e)
+    # 🌡 심리 점수
+    try:
+        srows = (fetch_market_sentiment() or {}).get("rows") or []
+    except Exception:
+        srows = []
+    comp = []
+    dep = [r.get("deposit") for r in srows]
+    cre = [r.get("credit") for r in srows]
+    if len([x for x in dep if x]) > 25:
+        chg = [(dep[i] / dep[i - 20] - 1) * 100 if dep[i] and dep[i - 20] else None for i in range(20, len(dep))]
+        comp.append({"key": "deposit20", "label": "💰 예탁금 20일 증감", "value": round(chg[-1], 2) if chg and chg[-1] is not None else None,
+                     "score": _pctile(chg, chg[-1] if chg else None), "unit": "%"})
+    if cre and cre[-1]:
+        comp.append({"key": "credit", "label": "💳 신용잔고", "value": cre[-1], "score": _pctile(cre, cre[-1]), "unit": "억"})
+        ratio = [(c_ / d_ * 100) if c_ and d_ else None for c_, d_ in zip(cre, dep)]
+        comp.append({"key": "credit_ratio", "label": "⚖️ 신용/예탁 비율", "value": round(ratio[-1], 1) if ratio[-1] else None,
+                     "score": _pctile(ratio, ratio[-1]), "unit": "%"})
+    fr = [r.get("forced_ratio") for r in srows]
+    if fr and fr[-1] is not None:
+        p = _pctile(fr, fr[-1])
+        comp.append({"key": "forced", "label": "💣 반대매매 비중 (높을수록 공포)", "value": fr[-1], "score": (100 - p) if p is not None else None, "unit": "%"})
+    for mk, m in out["markets"].items():
+        comp.append({"key": f"pnl_{mk}", "label": f"🧍 {mk} 개인 손익", "value": m["last"]["pnl"], "score": m["pnl_pct"], "unit": "%"})
+        comp.append({"key": f"buy20_{mk}", "label": f"🛒 {mk} 개인 20일 순매수", "value": m["ind20"], "score": m["ind20_pct"], "unit": "억"})
+    sc = [x["score"] for x in comp if x.get("score") is not None]
+    score = round(sum(sc) / len(sc)) if sc else None
+    out["score"] = score
+    out["zone"] = None if score is None else ("😱 극단 공포" if score < 20 else "😨 공포" if score < 40 else "😐 중립" if score < 60 else "😊 탐욕" if score < 80 else "🔥 극단 과열")
+    out["components"] = comp
+    out["at"] = now_kst().strftime("%Y-%m-%d %H:%M")
+    if out["markets"]:
+        c.update({"at": time.time(), "data": out})
+    return out
+
+
 @app.get("/api/market-sentiment-debug")
 def market_sentiment_debug():
     out = {}
