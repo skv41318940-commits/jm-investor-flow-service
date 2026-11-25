@@ -8755,6 +8755,168 @@ def _retail_market(market: str, idx: dict, days: int) -> dict:
             "ind20_pct": _pctile(ind20_hist, ind20), "pnl_pct": _pctile([h["pnl"] for h in hist], last["pnl"])}
 
 
+# 🇰🇷 대한민국 국부 실시간 추정 (2026-11-25 JM) — 매크로 › 심리 탭
+#   기준점 = 한국은행 2025년 국민대차대조표(잠정, 2026-07-22): 국민순자산 2경4,561조 · 가계순자산 1경4,200조
+#   지금 추정 = 기준점 × (주택가격지수 변화 · 코스피/코스닥 변화) + 순대외금융자산(최신 분기 × 환율)
+NW_BASE = {
+    "date": "2025-12-31", "national": 24561.0, "realestate": 17836.0, "land": 12660.0, "building": 5176.0,
+    "netfin": 1272.0, "nfa_usd": 9042.0, "house_mcap": 7710.0,
+    "hh": 14200.0, "hh_house": 0.504, "hh_nonhouse": 0.230, "hh_cash": 0.189, "hh_ins": 0.133, "hh_eq": 0.115,
+    "pop": 14200.0e12 / 2.7475e8,  # 1인당 2억7,475만원 → 인구 약 5,168만
+}
+# 순대외금융자산(억달러) 발표치 — ECOS 자동 조회 실패 시 사용
+NW_NFA_FALLBACK = [("2025-12-31", 9042.0), ("2026-06-30", 640.0), ("2026-09-30", 3448.0)]
+_nw_mem: dict = {}
+_nw_dbg: dict = {}
+
+
+def _ecos_tables() -> list:
+    def raw():
+        if not ECOS_API_KEY:
+            return []
+        out = []
+        for a in range(1, 20001, 5000):
+            j = requests.get(f"https://ecos.bok.or.kr/api/StatisticTableList/{ECOS_API_KEY}/json/kr/{a}/{a + 4999}", timeout=20).json()
+            rows = (j.get("StatisticTableList") or {}).get("row") or []
+            out += rows
+            if len(rows) < 5000:
+                break
+        return out
+    return _macro_cached("ecos:tables", raw, 7 * 86400)
+
+
+def _ecos_items(stat: str) -> list:
+    def raw():
+        j = requests.get(f"https://ecos.bok.or.kr/api/StatisticItemList/{ECOS_API_KEY}/json/kr/1/2000/{stat}", timeout=20).json()
+        return (j.get("StatisticItemList") or {}).get("row") or []
+    return _macro_cached(f"ecos:items:{stat}", raw, 7 * 86400)
+
+
+def _ecos_find(table_kw: list, item_kw: list, cycle: str, prefer: list = ()) -> tuple | None:
+    """ECOS 통계표·항목을 이름으로 찾기 (코드가 바뀌어도 동작)"""
+    tabs = [t for t in _ecos_tables() if all(k in (t.get("STAT_NAME") or "") for k in table_kw) and t.get("SRCH_YN") == "Y"]
+    tabs.sort(key=lambda t: (0 if any(p in t.get("STAT_NAME", "") for p in prefer) else 1, len(t.get("STAT_NAME", ""))))
+    for t in tabs[:6]:
+        for it in _ecos_items(t["STAT_CODE"]):
+            nm = it.get("ITEM_NAME") or ""
+            if it.get("CYCLE") == cycle and all(k in nm for k in item_kw):
+                return t["STAT_CODE"], it["ITEM_CODE"], t["STAT_NAME"], nm, it.get("UNIT_NAME")
+    return None
+
+
+def _ecos_series(stat: str, cycle: str, item: str, start: str) -> list:
+    def raw():
+        end = now_kst().strftime("%Y%m" if cycle == "M" else "%Y")
+        b = end if cycle == "M" else f"{end}Q4"
+        a = start if cycle == "M" else f"{start[:4]}Q1"
+        j = requests.get(f"https://ecos.bok.or.kr/api/StatisticSearch/{ECOS_API_KEY}/json/kr/1/500/{stat}/{cycle}/{a}/{b}/{item}", timeout=20).json()
+        out = []
+        for x in (j.get("StatisticSearch") or {}).get("row") or []:
+            t = x.get("TIME", "")
+            try:
+                if cycle == "Q":
+                    q = int(t[-1]); d = f"{t[:4]}-{q * 3:02d}-{[31, 30, 30, 31][q - 1]}"
+                else:
+                    d = f"{t[:4]}-{t[4:6]}-01"
+                out.append((d, float(x["DATA_VALUE"])))
+            except Exception:
+                pass
+        return sorted(out)
+    return _macro_cached(f"ecos:ser:{stat}:{item}:{cycle}:{start}", raw)
+
+
+def _nw_house_ratio() -> tuple:
+    """주택매매가격지수 (최신 / 2025-12) — 한국부동산원 우선"""
+    try:
+        f = _ecos_find(["주택매매가격지수"], ["전국"], "M", prefer=["부동산원"])
+        _nw_dbg["house_find"] = f
+        if f:
+            ser = _ecos_series(f[0], "M", f[1], "202501")
+            base = next((v for d, v in ser if d.startswith("2025-12")), None)
+            if base and ser:
+                return ser[-1][1] / base, ser[-1][0][:7], f"ECOS {f[2]} · {f[3]}", [(d, v / base) for d, v in ser if d >= "2025-12"]
+    except Exception as e:
+        _nw_dbg["house_err"] = str(e)
+    return 1.0, None, "주택가격지수 못 받음 → 2025년 말 값 유지", []
+
+
+def _nw_nfa() -> tuple:
+    """순대외금융자산(억달러) 분기 시계열"""
+    try:
+        f = _ecos_find(["국제투자대조표"], ["순"], "Q")
+        _nw_dbg["nfa_find"] = f
+        if f:
+            ser = _ecos_series(f[0], "Q", f[1], "2024")
+            unit = (f[4] or "")
+            k = 0.01 if "백만" in unit else (1.0 if "억" in unit else 0.01)
+            ser = [(d, v * k) for d, v in ser]
+            if ser and abs(dict(ser).get("2025-12-31", NW_BASE["nfa_usd"]) - NW_BASE["nfa_usd"]) < 3000:
+                return ser, f"ECOS {f[2]} · {f[3]}"
+    except Exception as e:
+        _nw_dbg["nfa_err"] = str(e)
+    return NW_NFA_FALLBACK, "한국은행 발표치 (2025말 · 26년 2·3분기)"
+
+
+@app.get("/api/national-wealth")
+def national_wealth(fresh: int = 0):
+    """🇰🇷 대한민국 국부(국민순자산)·가계순자산 실시간 추정"""
+    hit = _nw_mem.get("v")
+    if hit and not fresh and time.time() - hit[0] < 3 * 3600:
+        return hit[1]
+    B = NW_BASE
+    try:
+        ks = _yahoo_index_daily("^KS11", "2y"); kq = _yahoo_index_daily("^KQ11", "2y"); fx = _yahoo_index_daily("KRW=X", "2y")
+    except Exception as e:
+        return {"ok": False, "error": f"시장 데이터 실패: {e}"}
+    def at(d: dict, day: str):
+        ks_ = sorted(k for k in d if k <= day)
+        return d[ks_[-1]] if ks_ else None
+    b0 = B["date"]
+    ks0, kq0, fx0 = at(ks, b0), at(kq, b0), at(fx, b0)
+    hr, h_asof, h_src, h_ser = _nw_house_ratio()
+    nfa_ser, nfa_src = _nw_nfa()
+    other = B["national"] - B["realestate"] - B["netfin"]  # 설비·지식재산·재고 등 (연 1회 갱신)
+    k_nf = B["netfin"] / (B["nfa_usd"] * fx0 / 1e4) if fx0 else 1.0
+
+    def est(day: str, house_r: float, nfa_usd: float, fxv: float) -> dict:
+        eq_r = 0.8 * at(ks, day) / ks0 + 0.2 * at(kq, day) / kq0
+        re_ = B["realestate"] * house_r
+        nf = nfa_usd * fxv / 1e4 * k_nf  # 억달러 × 원 → 조 (2025말 국민대차대조표 순금융자산에 맞춤)
+        nat = re_ + nf + other
+        hh = B["hh"] * (1 + B["hh_house"] * (house_r - 1) + B["hh_nonhouse"] * (house_r - 1) + B["hh_eq"] * (eq_r - 1))
+        return {"national": round(nat, 1), "realestate": round(re_, 1), "netfin": round(nf, 1), "other": round(other, 1),
+                "hh": round(hh, 1), "hh_eq": round(B["hh"] * B["hh_eq"] * eq_r, 1), "eq_r": round(eq_r, 4)}
+
+    today = max(ks)
+    nfa_now = nfa_ser[-1]
+    cur = est(today, hr, nfa_now[1], at(fx, today))
+    # 시계열 (일별 · 주택은 월 · 순대외는 분기 계단)
+    series = []
+    for d in sorted(k for k in ks if k >= b0):
+        h = next((v for dd, v in reversed(h_ser) if dd <= d), 1.0) if h_ser else hr
+        n = next((v for dd, v in reversed(nfa_ser) if dd <= d), nfa_ser[0][1])
+        f_ = at(fx, d)
+        if f_ and at(kq, d):
+            e = est(d, h, n, f_)
+            series.append({"date": d, "national": e["national"], "hh": e["hh"]})
+    out = {"ok": True, "at": now_kst().strftime("%Y-%m-%d %H:%M"), "asof": today,
+           "base": {"date": b0, "national": B["national"], "realestate": B["realestate"], "netfin": B["netfin"], "other": round(other, 1),
+                    "hh": B["hh"], "per_capita": round(B["hh"] * 1e12 / B["pop"] / 1e4), "nfa_usd": B["nfa_usd"], "house_mcap": B["house_mcap"]},
+           "now": cur, "per_capita": round(cur["hh"] * 1e12 / B["pop"] / 1e4),
+           "inputs": {"kospi": round(at(ks, today), 2), "kospi0": round(ks0, 2), "kosdaq": round(at(kq, today), 2), "kosdaq0": round(kq0, 2),
+                      "fx": round(at(fx, today), 1), "fx0": round(fx0, 1), "house_r": round(hr, 4), "house_asof": h_asof, "house_src": h_src,
+                      "nfa_usd": nfa_now[1], "nfa_asof": nfa_now[0], "nfa_src": nfa_src, "nfa_hist": nfa_ser[-6:]},
+           "series": series}
+    _nw_mem["v"] = (time.time(), out)
+    return out
+
+
+@app.get("/api/debug-national-wealth")
+def debug_national_wealth():
+    _nw_house_ratio(); _nw_nfa()
+    return {"ecos_key": bool(ECOS_API_KEY), **{k: (list(v) if isinstance(v, tuple) else v) for k, v in _nw_dbg.items()}}
+
+
 @app.get("/api/retail-psych")
 def retail_psych_endpoint(days: int = 250, fresh: int = 0):
     """🧍 개인 종합 분석 — 코스피·코스닥 개인 평단·손익·매물대 + 🌡 심리 점수 (최근 days 거래일)"""
