@@ -12751,6 +12751,13 @@ def _fed_outlook() -> dict:
         p3 = _zq_price(y3, m3)
         if p3:
             out["futures_3m"] = {"implied": round(100 - p3, 3), "chg_bp": round((100 - p3 - effr) * 100, 1), "month": f"{y3}-{m3:02d}"}
+    # 연준 총자산 추세 (13주 = 약 3개월) — 한 주 변동은 잡음이라 추세로 QT 여부 판단
+    try:
+        w = _fred_obs("WALCL", 20)
+        if len(w) >= 14:
+            out["walcl_13w"] = {"now": round(w[0][1] / 1e6, 3), "ago": round(w[13][1] / 1e6, 3), "chg_bn": round((w[0][1] - w[13][1]) / 1e3, 1), "from": w[13][0]}
+    except Exception:
+        pass
     # 2년물 기준 (선물 실패 대비)
     dgs2, _ = last("DGS2")
     if dgs2 is not None and effr is not None:
