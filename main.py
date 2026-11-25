@@ -12421,7 +12421,7 @@ MACRO_IND = [
      "연준이 가진 국채·MBS 등 전체 자산", "줄어들면 QT = 시중 돈 회수(긴축) · 늘면 돈 풀기"),
     ("fed", "rrp", "역레포 잔액", "fred", "RRPONTSYD", "scale:1", "십억달러", "매일",
      "갈 곳 없는 돈이 연준에 하룻밤 맡겨진 금액", "줄어들수록 시중 여유 자금이 줄어드는 중"),
-    ("fed", "reserves", "은행 지급준비금", "fred", "WRESBAL", "scale:1000", "조달러", "매주",
+    ("fed", "reserves", "은행 지급준비금", "fred", "WRESBAL", "scale:1000000", "조달러", "매주",
      "은행들이 연준에 쌓아둔 돈", "너무 줄면 단기 자금시장이 경색 → 연준이 QT를 멈추는 신호"),
 
     ("infl", "core_pce", "근원 PCE (전년비)", "fred", "PCEPILFE", "yoy", "%", "매월 말",
@@ -12493,6 +12493,16 @@ MACRO_IND = [
     ("kr", "export", "한국 수출 (전년비)", "fred", "XTEXVA01KRM667S", "yoy", "%", "매월 (1~2달 늦음)",
      "한국 상품 수출액 증가율", "세계 경기 바로미터 · 빠른 숫자는 매월 1일 수출입 발표"),
 
+    ("commod", "wti", "원유 WTI", "yahoo", "CL=F", "level", "달러", "실시간",
+     "미국 원유 기준가 (배럴당)", "오르면 휘발유·물가 ↑ → 연준 부담 · 70달러 아래면 물가 안정 쪽"),
+    ("commod", "brent", "브렌트유", "yahoo", "BZ=F", "level", "달러", "실시간",
+     "세계 원유 기준가 (중동·유럽)", "한국 수입 물가·무역수지·정유·항공에 직결"),
+    ("commod", "gold", "금", "yahoo", "GC=F", "level", "달러", "실시간",
+     "안전자산 · 실물 화폐 (온스당)", "실질금리 ↓ · 달러 약세 · 불안할 때 ↑"),
+    ("commod", "silver", "은", "yahoo", "SI=F", "level", "달러", "실시간",
+     "귀금속 + 산업용(태양광) 반반", "금보다 출렁임이 큼 · 경기와 불안을 같이 탐"),
+    ("commod", "copper", "구리", "yahoo", "HG=F", "level", "달러", "실시간",
+     "전선·전력망·전기차 금속 (파운드당)", "오르면 세계 경기 회복 신호 (닥터 코퍼) · 전력·전선주"),
     ("commod", "ng", "천연가스 (헨리허브)", "yahoo", "NG=F", "level", "달러", "실시간",
      "미국 천연가스 가격", "겨울 난방·전력 수요 · 오르면 에너지 물가 ↑"),
     ("commod", "rbob", "휘발유", "yahoo", "RB=F", "level", "달러", "실시간",
@@ -12507,7 +12517,7 @@ MACRO_IND = [
      "자동차 배기 정화 (러시아 비중 큼)", "러시아 제재 뉴스에 민감"),
 ]
 MACRO_GROUPS = {"fed": "🏛 연준 정책", "infl": "💹 물가", "job": "👷 고용", "growth": "📈 성장",
-                "risk": "🚦 경기·위험 신호", "kr": "🇰🇷 한국 매크로", "commod": "🛢 에너지·금속 추가"}
+                "risk": "🚦 경기·위험 신호", "kr": "🇰🇷 한국 매크로", "commod": "🛢 에너지·금속"}
 _macro_ind_cache = {"at": 0.0, "data": None, "busy": False}
 
 
@@ -12630,6 +12640,7 @@ def _macro_transform(obs: list, tf: str):
 def _macro_ind_build() -> dict:
     out = []
     vals = {}
+    prev_range = ""
     for grp, key, name, src, sid, tf, unit, freq, meaning, read in MACRO_IND:
         v = pv = d = None
         note = ""
@@ -12641,8 +12652,10 @@ def _macro_ind_build() -> dict:
                 if lo and hi:
                     v, d = hi[0][1], hi[0][0]
                     prev_hi = next((x[1] for x in hi if x[1] != hi[0][1]), hi[0][1])
+                    prev_lo = next((x[1] for x in lo if x[1] != lo[0][1]), lo[0][1])
                     pv = prev_hi
                     note = f"{lo[0][1]:.2f}~{hi[0][1]:.2f}%"
+                    prev_range = f"{prev_lo:.2f}~{prev_hi:.2f}%"
             elif src == "ecos":
                 if not ECOS_API_KEY:
                     note = "ECOS 키 필요"
@@ -12672,12 +12685,144 @@ def _macro_ind_build() -> dict:
         vals[key] = v
         out.append({"group": grp, "key": key, "name": name, "value": None if v is None else round(v, 4),
                     "prev": None if pv is None else round(pv, 4), "display": note if (key == "fed_rate" and note) else _macro_fmt(v, unit),
-                    "prev_display": _macro_fmt(pv, unit) if pv is not None else "",
+                    "prev_display": (prev_range if (key == "fed_rate" and prev_range) else _macro_fmt(pv, unit)) if pv is not None else "",
                     "chg": None if (v is None or pv is None) else round(v - pv, 4),
                     "date": d, "unit": unit, "freq": freq, "meaning": meaning, "read": read,
                     "note": "" if key == "fed_rate" else note, "source": src})
+    try:
+        fed = _fed_outlook()
+    except Exception as e:
+        fed = {"error": str(e)[:80]}
     return {"ok": True, "at": now_kst().strftime("%Y-%m-%d %H:%M"), "groups": MACRO_GROUPS, "items": out,
-            "ecos": bool(ECOS_API_KEY)}
+            "ecos": bool(ECOS_API_KEY), "fed": fed}
+
+
+# 🏛 연준 전망 (2026-11-25 JM) — 다음 FOMC 금리 예상 · 금리 통로(범위·IORB·EFFR) · 연준 점도표(SEP) · GDPNow
+FOMC_DATES = ["2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17", "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09"]
+_ZQ_MON = "FGHJKMNQUVXZ"
+
+
+def _zq_price(y: int, m: int):
+    """30일 연방기금 선물 (야후 ZQ{월}{연}.CBT) → 가격 · 실패 시 None"""
+    sym = f"ZQ{_ZQ_MON[m - 1]}{str(y)[2:]}.CBT"
+    try:
+        q = _macro_quote(sym)
+        return q["price"] if q.get("ok") and 90 < q["price"] < 100 else None
+    except Exception:
+        return None
+
+
+def _fed_outlook() -> dict:
+    def last(sid):
+        o = _fred_obs(sid, 10)
+        return (o[0][1], o[0][0]) if o else (None, None)
+    lo, d = last("DFEDTARL"); hi, _ = last("DFEDTARU")
+    effr, effr_d = last("EFFR"); iorb, _ = last("IORB"); rrp, _ = last("RRPONTSYAWARD"); sofr, _ = last("SOFR")
+    out = {"corridor": {"lower": lo, "upper": hi, "effr": effr, "effr_date": effr_d, "iorb": iorb, "rrp": rrp, "sofr": sofr}}
+    today = now_kst().strftime("%Y-%m-%d")
+    nxt = next((x for x in FOMC_DATES if x >= today), None)
+    out["next_meeting"] = nxt
+    # 선물로 다음 회의 뒤 금리 예상 (회의 다음 달 선물 = 회의 뒤 금리 평균)
+    if nxt and effr is not None:
+        y, m = int(nxt[:4]), int(nxt[5:7])
+        y2, m2 = (y + 1, 1) if m == 12 else (y, m + 1)
+        p = _zq_price(y2, m2)
+        if p:
+            implied = 100 - p
+            chg = (implied - effr) * 100  # bp
+            steps = chg / 25
+            k = int(steps // 1) if steps >= 0 else -int((-steps) // 1)
+            frac = abs(steps - k)
+            sign = 1 if chg >= 0 else -1
+            probs = {}
+            base = abs(k)
+            probs[base] = round((1 - frac) * 100, 1)
+            probs[base + 1] = round(frac * 100, 1)
+            scen = []
+            for n_, pr in sorted(probs.items()):
+                if pr <= 0.5:
+                    continue
+                label = "동결" if n_ == 0 else f"{'+' if sign > 0 else '-'}{n_ * 25}bp {'인상' if sign > 0 else '인하'}"
+                scen.append({"label": label, "prob": pr, "upper": round((hi or 0) + sign * n_ * 0.25, 2)})
+            out["futures"] = {"implied": round(implied, 3), "chg_bp": round(chg, 1), "scenarios": scen,
+                              "contract": f"ZQ{_ZQ_MON[m2 - 1]}{str(y2)[2:]}", "src": "CME 30일 연방기금 선물 (야후)"}
+        # 3개월 뒤까지 누적
+        y3, m3 = (y + (m + 3 - 1) // 12, (m + 3 - 1) % 12 + 1)
+        p3 = _zq_price(y3, m3)
+        if p3:
+            out["futures_3m"] = {"implied": round(100 - p3, 3), "chg_bp": round((100 - p3 - effr) * 100, 1), "month": f"{y3}-{m3:02d}"}
+    # 2년물 기준 (선물 실패 대비)
+    dgs2, _ = last("DGS2")
+    if dgs2 is not None and effr is not None:
+        out["dgs2_gap_bp"] = round((dgs2 - effr) * 100, 1)
+    # 연준 점도표 중간값 (FRED SEP)
+    sep = {}
+    for k_, sid in (("rate", "FEDTARMD"), ("pce", "PCECTPIMD"), ("core_pce", "JCXFEMD"), ("unrate", "UNRATEMD"), ("gdp", "GDPC1MD")):
+        try:
+            ob = _fred_obs(sid, 12)
+            sep[k_] = {o[0][:4]: o[1] for o in sorted(ob)}
+        except Exception:
+            pass
+    out["sep"] = sep
+    try:
+        g = _fred_obs("GDPNOW", 5)
+        if g:
+            out["gdpnow"] = {"value": g[0][1], "date": g[0][0]}
+    except Exception:
+        pass
+    return out
+
+
+def _macro_series(obs_asc: list, tf: str) -> list:
+    """오래된 순 [(date, v)] → 지표 변환 적용 시계열"""
+    if tf == "level" or tf.startswith("scale:"):
+        k = float(tf.split(":")[1]) if tf.startswith("scale:") else 1.0
+        return [(d, v / k) for d, v in obs_asc]
+    if tf == "diff":
+        return [(obs_asc[i][0], obs_asc[i][1] - obs_asc[i - 1][1]) for i in range(1, len(obs_asc))]
+    if tf == "mom":
+        return [(obs_asc[i][0], (obs_asc[i][1] / obs_asc[i - 1][1] - 1) * 100) for i in range(1, len(obs_asc)) if obs_asc[i - 1][1]]
+    if tf == "yoy":
+        lag = 12
+        if len(obs_asc) > 2:
+            try:
+                if (datetime.strptime(obs_asc[1][0], "%Y-%m-%d") - datetime.strptime(obs_asc[0][0], "%Y-%m-%d")).days > 80:
+                    lag = 4
+            except Exception:
+                pass
+        return [(obs_asc[i][0], (obs_asc[i][1] / obs_asc[i - lag][1] - 1) * 100) for i in range(lag, len(obs_asc)) if obs_asc[i - lag][1]]
+    return []
+
+
+@app.get("/api/macro-history")
+def macro_history(key: str):
+    """📈 매크로 지표 차트용 시계열 (최근 몇 년)"""
+    row = next((r for r in MACRO_IND if r[1] == key), None)
+    if not row:
+        return {"ok": False, "error": "없는 지표"}
+    grp, key, name, src, sid, tf, unit, freq, meaning, read = row
+    ck = f"hist:{key}"
+    def build():
+        if src == "fred":
+            n = 900 if freq in ("매일",) else 200
+            return _macro_series(sorted(_fred_obs_raw(sid, n)), tf)
+        if src == "fed_range":
+            return sorted(_fred_obs_raw("DFEDTARU", 1500))
+        if src == "yahoo":
+            return sorted(_yahoo_index_daily(sid, "2y").items())
+        if src == "ratio":
+            a, b = _yahoo_index_daily(sid[0], "2y"), _yahoo_index_daily(sid[1], "2y")
+            return [(d, a[d] / b[d]) for d in sorted(a) if d in b and b[d]]
+        if src == "nyfed":
+            return _macro_series(sorted(_gscpi_obs())[-120:], tf)
+        if src == "ecos" and ECOS_API_KEY:
+            return _macro_series(sorted(_ecos_obs(*sid)), tf)
+        return []
+    try:
+        ser = _macro_cached(ck, build, 3600 if src in ("yahoo", "ratio") else 21600)
+    except Exception as e:
+        return {"ok": False, "error": f"받기 실패: {str(e)[:80]}"}
+    return {"ok": True, "key": key, "name": name, "unit": unit, "series": [{"date": d, "value": round(v, 4)} for d, v in ser if v == v]}
 
 
 @app.get("/api/macro-indicators")
