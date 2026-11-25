@@ -12693,8 +12693,12 @@ def _macro_ind_build() -> dict:
         fed = _fed_outlook()
     except Exception as e:
         fed = {"error": str(e)[:80]}
+    try:
+        krc = _kr_corridor()
+    except Exception as e:
+        krc = {"error": str(e)[:80]}
     return {"ok": True, "at": now_kst().strftime("%Y-%m-%d %H:%M"), "groups": MACRO_GROUPS, "items": out,
-            "ecos": bool(ECOS_API_KEY), "fed": fed}
+            "ecos": bool(ECOS_API_KEY), "fed": fed, "krc": krc}
 
 
 # 🏛 연준 전망 (2026-11-25 JM) — 다음 FOMC 금리 예상 · 금리 통로(범위·IORB·EFFR) · 연준 점도표(SEP) · GDPNow
@@ -12777,6 +12781,50 @@ def _fed_outlook() -> dict:
             out["gdpnow"] = {"value": g[0][1], "date": g[0][0]}
     except Exception:
         pass
+    return out
+
+
+# 🇰🇷 한국판 금리 통로 (2026-11-25 JM) — 자금조정예금(바닥) · 콜금리 · 기준금리 · 자금조정대출(천장) + 금통위 일정
+BOK_DATES = ["2026-10-22", "2026-11-26"]  # 금통위 통화정책방향 회의 (확인된 날짜만)
+
+
+def _ecos_pick(stat: str, must: list, prefer: list = ()) -> tuple | None:
+    try:
+        its = [it for it in _ecos_items(stat) if all(k in (it.get("ITEM_NAME") or "") for k in must) and it.get("CYCLE") == "D"]
+    except Exception:
+        return None
+    its.sort(key=lambda it: (0 if any(p in it.get("ITEM_NAME", "") for p in prefer) else 1, len(it.get("ITEM_NAME", ""))))
+    return (its[0]["ITEM_CODE"], its[0]["ITEM_NAME"]) if its else None
+
+
+def _kr_corridor() -> dict:
+    if not ECOS_API_KEY:
+        return {"error": "ECOS 키 필요"}
+    out: dict = {"dbg": {}}
+    def lastv(stat, item):
+        o = _ecos_obs(stat, "D", item)
+        return (o[0][1], o[0][0], o[1][1] if len(o) > 1 else None) if o else (None, None, None)
+    base, bd, _ = lastv("722Y001", "0101000")
+    out["base"], out["base_date"] = base, bd
+    for k, must, pref in (("dep", ["자금조정", "예금"], []), ("loan", ["자금조정", "대출"], [])):
+        f = _ecos_pick("722Y001", must, pref)
+        out["dbg"][k] = f
+        if f:
+            v, d, _ = lastv("722Y001", f[0])
+            out[k] = v
+    for k, must, pref in (("call", ["콜금리"], ["전체"]), ("kofr", ["KOFR"], []), ("rp", ["RP"], ["7일"])):
+        f = _ecos_pick("817Y002", must, pref)
+        out["dbg"][k] = f
+        if f:
+            v, d, pv = lastv("817Y002", f[0])
+            out[k], out[k + "_date"], out[k + "_prev"] = v, d, pv
+    if base is not None:
+        if out.get("dep") is None:
+            out["dep"], out["dep_est"] = base - 1.0, True
+        if out.get("loan") is None:
+            out["loan"], out["loan_est"] = base + 1.0, True
+    today = now_kst().strftime("%Y-%m-%d")
+    out["next_mpc"] = next((x for x in BOK_DATES if x >= today), None)
     return out
 
 
@@ -16961,10 +17009,27 @@ def _credit_rows(code: str, pages: int = 7) -> list:
     return [rows[k] for k in sorted(rows)]
 
 
+_credit_live: dict = {}
+
+
 @app.get("/api/credit-risk")
 def credit_risk(code: str, fresh: int = 0):
-    """💣 종목 신용 물량의 가격대(FIFO 로트)·평단·잔고율 → 화면에서 반대매매 위험선 계산"""
+    """💣 종목 신용 물량의 가격대(FIFO 로트)·평단·잔고율 → 화면에서 반대매매 위험선 계산
+    신용잔고는 2~3영업일 늦게 나오지만, 위험 계산용 현재가는 실시간(30초)으로 붙여줌 (2026-11-25 JM)"""
     code = (code or "").strip()
+    base = _credit_risk_base(code, fresh)
+    if not base.get("ok"):
+        return base
+    lv = _credit_live.get(code)
+    if not lv or time.time() - lv[0] > 30:
+        p = _kis_current_price(code)
+        lv = (time.time(), p) if p else (lv or (0, None))
+        _credit_live[code] = lv
+    return {**base, "live": lv[1], "live_at": datetime.fromtimestamp(lv[0], tz=timezone.utc).astimezone(KST).strftime("%H:%M:%S") if lv[1] else None,
+            "today": now_kst().strftime("%Y-%m-%d")}
+
+
+def _credit_risk_base(code: str, fresh: int = 0) -> dict:
     hit = _credit_mem.get(code)
     if hit and not fresh and time.time() - hit[0] < 3 * 3600:
         return hit[1]
