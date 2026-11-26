@@ -8826,18 +8826,79 @@ def _ecos_series(stat: str, cycle: str, item: str, start: str) -> list:
 
 
 def _nw_house_ratio() -> tuple:
-    """주택매매가격지수 (최신 / 2025-12) — 한국부동산원 우선"""
-    try:
-        f = _ecos_find(["주택매매가격지수"], ["전국"], "M", prefer=["부동산원"])
-        _nw_dbg["house_find"] = f
-        if f:
+    """주택매매가격지수 (최신 / 2025-12) — ① ECOS(여러 이름으로 탐색) → ② 🤖 OpenAI 웹검색 (2026-11-25) → ③ 유지"""
+    tries = [(["주택매매가격지수"], ["전국"]), (["주택매매가격지수"], ["총지수"]), (["주택가격지수"], ["전국"]),
+             (["매매가격지수"], ["전국"]), (["아파트매매가격지수"], ["전국"])]
+    _nw_dbg["house_tries"] = []
+    for tk, ik in tries:
+        try:
+            f = _ecos_find(tk, ik, "M", prefer=["부동산원", "종합"])
+            _nw_dbg["house_tries"].append([tk[0], ik[0], list(f) if f else None])
+            if not f:
+                continue
             ser = _ecos_series(f[0], "M", f[1], "202501")
             base = next((v for d, v in ser if d.startswith("2025-12")), None)
             if base and ser:
                 return ser[-1][1] / base, ser[-1][0][:7], f"ECOS {f[2]} · {f[3]}", [(d, v / base) for d, v in ser if d >= "2025-12"]
-    except Exception as e:
-        _nw_dbg["house_err"] = str(e)
+        except Exception as e:
+            _nw_dbg["house_err"] = str(e)[:200]
+    ai = _ai_house_change()
+    if ai:
+        r = 1 + ai["pct"] / 100
+        return r, ai.get("asof"), f"🤖 AI 웹검색 ({ai.get('src') or '출처 확인 필요'}) — 확인용 추정", [(f"{ai['asof']}-01", r)] if ai.get("asof") else []
     return 1.0, None, "주택가격지수 못 받음 → 2025년 말 값 유지", []
+
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+
+
+def _ai_ask_json(prompt: str, ttl: int = 86400) -> dict | None:
+    """🤖 OpenAI(웹검색) 로 숫자 하나 찾아오기 — 결과는 JSON만, 하루 캐시. 키 없으면 None"""
+    if not OPENAI_API_KEY:
+        _nw_dbg["ai"] = "OPENAI_API_KEY 없음"
+        return None
+    def raw():
+        last_err = ""
+        for tool in ("web_search", "web_search_preview"):
+            try:
+                r = requests.post("https://api.openai.com/v1/responses", timeout=60,
+                                  headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                                  json={"model": OPENAI_MODEL, "tools": [{"type": tool}], "input": prompt})
+                j = r.json()
+                if r.status_code != 200:
+                    last_err = str(j.get("error", j))[:200]
+                    continue
+                txt = j.get("output_text") or ""
+                if not txt:
+                    for o in j.get("output", []):
+                        for c in o.get("content", []) or []:
+                            if c.get("type") in ("output_text", "text"):
+                                txt += c.get("text", "")
+                m = re.search(r"\{.*\}", txt, re.S)
+                if m:
+                    return json.loads(m.group(0))
+                last_err = "JSON 없음: " + txt[:120]
+            except Exception as e:
+                last_err = str(e)[:200]
+        _nw_dbg["ai_err"] = last_err
+        return None
+    return _macro_cached("ai:" + str(abs(hash(prompt))), raw, ttl)
+
+
+def _ai_house_change() -> dict | None:
+    j = _ai_ask_json(
+        "한국부동산원 '전국 주택종합 매매가격지수'의 가장 최근 월간 발표를 웹에서 찾아서, 2025년 12월 대비 누적 변동률(%)을 알려줘. "
+        "발표 자료나 기사에 나온 숫자만 쓰고 추정하지 마. 반드시 JSON 한 줄만 출력: "
+        '{"asof":"YYYY-MM","pct":숫자,"src":"출처 이름","url":"출처 링크"}')
+    try:
+        if j and abs(float(j.get("pct"))) < 20 and re.match(r"^20\d\d-\d\d$", str(j.get("asof", ""))):
+            _nw_dbg["ai_house"] = j
+            return {"pct": float(j["pct"]), "asof": j["asof"], "src": j.get("src"), "url": j.get("url")}
+    except Exception:
+        pass
+    _nw_dbg["ai_house_bad"] = j
+    return None
 
 
 def _nw_nfa() -> tuple:
@@ -10200,6 +10261,180 @@ def us_stock_detail_endpoint(symbol: str):
         out["news_error"] = str(e)
     _us_detail_cache[symbol] = (time.time(), out)
     return out
+
+# ══════════════════════════════════════════════════════════════════════════
+# 🔎 해외 종목 한눈에 (2026-11-26 JM) — 국내 종목 상세처럼: ① 재무지표 ② 동종업계 ③ 컨센서스·지분 ④ 섹터·테마
+#   PER/PBR/ROE는 SEC 'frames'(모든 상장사 같은 분기 숫자를 한 번에) + 나스닥 시가총액으로 계산 → 업종 비교가 공정함
+# ══════════════════════════════════════════════════════════════════════════
+_sec_frames_mem: dict = {}
+_us_insight_cache: dict = {}
+US_THEMES = {
+    "AI 반도체": ["NVDA", "AMD", "AVGO", "MRVL", "ARM", "TSM", "INTC", "QCOM", "ALAB", "CRDO"],
+    "HBM·메모리": ["MU", "WDC", "STX", "SNDK"],
+    "반도체 장비": ["AMAT", "LRCX", "KLAC", "ASML", "TER", "ONTO", "ENTG", "AMKR"],
+    "AI 데이터센터·서버": ["SMCI", "DELL", "HPE", "ANET", "VRT", "CLS", "CIEN", "COHR", "LITE"],
+    "전력·원전": ["CEG", "VST", "NRG", "GEV", "SMR", "OKLO", "CCJ", "LEU", "BWXT", "TLN", "ETN", "PWR"],
+    "클라우드·소프트웨어 AI": ["MSFT", "GOOGL", "GOOG", "AMZN", "ORCL", "CRM", "NOW", "PLTR", "SNOW", "MDB", "DDOG"],
+    "빅테크(M7)": ["AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "NVDA", "TSLA"],
+    "사이버보안": ["CRWD", "PANW", "ZS", "FTNT", "NET", "OKTA", "S"],
+    "양자컴퓨터": ["IONQ", "RGTI", "QBTS", "QUBT", "IBM"],
+    "로봇·자율주행": ["TSLA", "ISRG", "SYM", "TER", "MBLY", "RR"],
+    "우주·방산": ["RKLB", "ASTS", "LUNR", "LMT", "NOC", "RTX", "GD", "LHX", "PL", "KTOS"],
+    "비만치료제·바이오": ["LLY", "NVO", "VKTX", "AMGN", "REGN", "VRTX"],
+    "전기차·배터리": ["TSLA", "RIVN", "LCID", "ALB", "QS", "ENVX"],
+    "가상자산": ["COIN", "MSTR", "MARA", "RIOT", "HOOD", "CLSK", "IREN", "CIFR"],
+    "핀테크·결제": ["V", "MA", "PYPL", "SQ", "XYZ", "AFRM", "SOFI", "HOOD"],
+    "소비·리테일": ["WMT", "COST", "TGT", "HD", "LOW", "AMZN", "NKE", "SBUX", "MCD"],
+    "금융·은행": ["JPM", "BAC", "WFC", "C", "GS", "MS", "SCHW", "BLK"],
+    "에너지·석유": ["XOM", "CVX", "COP", "OXY", "SLB", "EOG"],
+    "통신·미디어": ["NFLX", "DIS", "T", "VZ", "TMUS", "SPOT", "RBLX"],
+}
+
+
+def _sec_frame(concept: str, unit: str, period: str, taxonomy: str = "us-gaap") -> dict:
+    """SEC frames: 한 분기의 모든 회사 값 {cik(int): 값} (하루 저장)"""
+    k = f"{taxonomy}/{concept}/{unit}/{period}"
+    c = _sec_frames_mem.get(k)
+    if c and time.time() - c[0] < 86400:
+        return c[1]
+    try:
+        r = requests.get(f"https://data.sec.gov/api/xbrl/frames/{k}.json", headers=SEC_HEADERS, timeout=30)
+        data = {int(x["cik"]): float(x["val"]) for x in (r.json().get("data") or [])} if r.status_code == 200 else {}
+    except Exception as e:
+        print(f"[sec-frame] {k} 실패: {e}")
+        data = {}
+    _sec_frames_mem[k] = (time.time(), data)
+    return data
+
+
+def _cy_quarters_back(n: int) -> list:
+    """오늘 기준 끝난 분기부터 거꾸로 n개 ['CY2026Q3', 'CY2026Q2', ...]"""
+    d = now_kst()
+    y, q = d.year, (d.month - 1) // 3  # 지금 분기 이전 = 끝난 분기
+    if q == 0:
+        y, q = y - 1, 4
+    out = []
+    for _ in range(n):
+        out.append(f"CY{y}Q{q}")
+        q -= 1
+        if q == 0:
+            y, q = y - 1, 4
+    return out
+
+
+def _sec_fundamentals_all() -> dict:
+    """모든 상장사 {cik: {"equity", "net_ttm", "asof"}} — 최근 분기 자본 + 최근 4분기 순이익 합"""
+    c = _sec_frames_mem.get("__all__")
+    if c and time.time() - c[0] < 86400:
+        return c[1]
+    qs = _cy_quarters_back(6)  # 최신부터
+    eq = [_sec_frame("StockholdersEquity", "USD", q + "I") for q in qs[:3]]
+    ni = {q: _sec_frame("NetIncomeLoss", "USD", q) for q in qs[:5]}
+    out = {}
+    ciks = set().union(*[set(e) for e in eq])
+    for cik in ciks:
+        e = next(((x[cik], qs[i]) for i, x in enumerate(eq) if cik in x), None)
+        net = None
+        for st in (0, 1):  # 최신 4분기, 없으면 한 분기 앞 4분기
+            win = qs[st:st + 4]
+            if all(cik in ni[w] for w in win):
+                net = sum(ni[w][cik] for w in win)
+                break
+        out[cik] = {"equity": e[0] if e else None, "eq_q": e[1] if e else None, "net_ttm": net}
+    _sec_frames_mem["__all__"] = (time.time(), out)
+    return out
+
+
+def _us_metrics(row: dict, fa: dict) -> dict:
+    cap, price = row.get("cap") or 0, row.get("price") or 0
+    eq, net = (fa or {}).get("equity"), (fa or {}).get("net_ttm")
+    sh = cap / price if cap and price else None
+    m = {"symbol": row["symbol"], "name": row.get("name"), "cap": cap, "price": price, "net_ttm": net, "equity": eq,
+         "per": round(cap / net, 1) if net and net > 0 and cap else None,
+         "pbr": round(cap / eq, 2) if eq and eq > 0 and cap else None,
+         "roe": round(net / eq * 100, 1) if net is not None and eq and eq > 0 else None,
+         "eps": round(net / sh, 2) if net is not None and sh else None,
+         "bps": round(eq / sh, 2) if eq and sh else None,
+         "profit": None if net is None else ("흑자" if net > 0 else "적자")}
+    return m
+
+
+def _median(xs):
+    xs = sorted(x for x in xs if x is not None)
+    if not xs:
+        return None
+    n = len(xs)
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+
+
+@app.get("/api/us-stock-insight")
+def us_stock_insight(symbol: str):
+    """🔎 해외 종목 한눈에: 재무지표 · 동종업계 · 컨센서스·지분 · 섹터·테마"""
+    sym = (symbol or "").strip().upper()
+    c = _us_insight_cache.get(sym)
+    if c and time.time() - c[0] < 1800:
+        return c[1]
+    out: dict = {"ok": True, "symbol": sym}
+    rows = fetch_us_screener()
+    me = next((r for r in rows if r["symbol"] == sym), None)
+    try:
+        fa_all = _sec_fundamentals_all()
+        _sec_cik_of("AAPL")
+        cikmap = _sec_cik["map"]
+    except Exception as e:
+        fa_all, cikmap = {}, {}
+        out["sec_error"] = str(e)[:120]
+    fa_of = lambda s_: fa_all.get(int(cikmap[s_.replace(".", "-")])) if s_.replace(".", "-") in cikmap else None
+    # ① 재무지표
+    if me:
+        m = _us_metrics(me, fa_of(sym))
+        try:
+            closes = list(_yahoo_index_daily(sym, "1y").values())
+            if closes:
+                m["hi52"], m["lo52"] = round(max(closes), 2), round(min(closes), 2)
+        except Exception:
+            pass
+        m["eq_q"] = (fa_of(sym) or {}).get("eq_q")
+        out["metrics"] = m
+        out["sector"], out["industry"] = me.get("sector"), me.get("industry")
+        # ② 동종업계 (같은 industry)
+        peers = [r for r in rows if r.get("industry") and r["industry"] == me.get("industry") and r.get("cap")]
+        pm = [_us_metrics(r, fa_of(r["symbol"])) for r in peers]
+        out["industry_stat"] = {"count": len(pm), "per": _median([x["per"] for x in pm]), "pbr": _median([x["pbr"] for x in pm]),
+                                "roe": _median([x["roe"] for x in pm]), "profit": sum(1 for x in pm if x["profit"] == "흑자"),
+                                "known": sum(1 for x in pm if x["profit"])}
+        pm.sort(key=lambda x: -(x["cap"] or 0))
+        top = pm[:15]
+        if not any(x["symbol"] == sym for x in top):
+            top.append(m)
+        out["peers"] = top
+    else:
+        out["metrics_error"] = "나스닥 종목 목록에서 못 찾음 (미국 상장 보통주만 지원)"
+    # ③ 컨센서스 · 지분
+    try:
+        t = _nq_get(f"analyst/{sym}/targetprice")
+        co = t.get("consensusOverview") or {}
+        b, h, s_ = (_nq_num(co.get("buy")) or 0), (_nq_num(co.get("hold")) or 0), (_nq_num(co.get("sell")) or 0)
+        n = b + h + s_
+        score = (b - s_) / n if n else None
+        out["consensus"] = {"target": _nq_num(co.get("priceTarget")), "high": _nq_num(co.get("highPriceTarget")), "low": _nq_num(co.get("lowPriceTarget")),
+                            "buy": b, "hold": h, "sell": s_, "analysts": n,
+                            "opinion": None if score is None else ("적극 매수" if score > 0.7 else "매수" if score > 0.3 else "중립" if score > -0.3 else "매도")}
+    except Exception as e:
+        out["consensus_error"] = str(e)[:120]
+    try:
+        _, hold = _nq_holders(sym, "TOTAL", "marketValue", "DESC", 8)
+        sh_out = (me["cap"] / me["price"]) if me and me.get("price") else None
+        for o in hold:
+            o["pct"] = round(o["shares"] / sh_out * 100, 2) if sh_out and o.get("shares") else None
+        out["holders"] = hold
+    except Exception as e:
+        out["holders_error"] = str(e)[:120]
+    # ④ 섹터 · 테마
+    out["themes"] = [k for k, v in US_THEMES.items() if sym in v]
+    _us_insight_cache[sym] = (time.time(), out)
+    return out
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # 🏠 미국판 주인 찾기 · 종합 분석 (2026-11-24 JM) — 국내 종목분석 "주인 찾기 · 주체별"을 미국 자료로
