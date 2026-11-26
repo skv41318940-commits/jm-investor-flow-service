@@ -8826,10 +8826,13 @@ def _ecos_series(stat: str, cycle: str, item: str, start: str) -> list:
 
 
 def _nw_house_ratio() -> tuple:
-    """주택매매가격지수 (최신 / 2025-12) — ① ECOS(여러 이름으로 탐색) → ② 🤖 OpenAI 웹검색 (2026-11-25) → ③ 유지"""
+    """주택매매가격지수 (최신 / 2025-12) — ⓪ 🏠 R-ONE(한국부동산원) → ① ECOS → ② 🤖 OpenAI 웹검색 → ③ 유지"""
     tries = [(["주택매매가격지수"], ["전국"]), (["주택매매가격지수"], ["총지수"]), (["주택가격지수"], ["전국"]),
              (["매매가격지수"], ["전국"]), (["아파트매매가격지수"], ["전국"])]
     _nw_dbg["house_tries"] = []
+    r1 = _rone_house_ratio()
+    if r1:
+        return r1
     for tk, ik in tries:
         try:
             f = _ecos_find(tk, ik, "M", prefer=["부동산원", "종합"])
@@ -8847,6 +8850,116 @@ def _nw_house_ratio() -> tuple:
         r = 1 + ai["pct"] / 100
         return r, ai.get("asof"), f"🤖 AI 웹검색 ({ai.get('src') or '출처 확인 필요'}) — 확인용 추정", [(f"{ai['asof']}-01", r)] if ai.get("asof") else []
     return 1.0, None, "주택가격지수 못 받음 → 2025년 말 값 유지", []
+
+
+# ───────── 🏠 R-ONE (한국부동산원 부동산통계 Open API) — 2026-11-27 ─────────
+RONE_API_KEY = next((os.getenv(k) for k in ("RONE_API_KEY", "R_ONE_API_KEY", "RONE_KEY", "REB_API_KEY", "R_ONE_KEY") if os.getenv(k)), "")
+RONE_BASE = "https://www.reb.or.kr/r-one/openapi"
+# 이름으로 못 찾을 때 쓰는 알려진 표 (월간 지역별 매매지수): 공동주택통합 · 아파트
+RONE_FALLBACK = [("A_2024_00176", "(월) 지역별 매매지수_공동주택통합"), ("A_2024_00178", "(월) 지역별 매매지수_아파트")]
+
+
+def _rone_rows(j) -> list:
+    """R-ONE 응답에서 row 리스트 꺼내기 (json 구조가 [{head},{row}] 형태)"""
+    out = []
+    def walk(x):
+        if isinstance(x, dict):
+            if "row" in x and isinstance(x["row"], list):
+                out.extend(r for r in x["row"] if isinstance(r, dict))
+            for v in x.values():
+                if isinstance(v, (dict, list)):
+                    walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+    walk(j)
+    return out
+
+
+def _rone_get(svc: str, **params) -> list:
+    q = {"KEY": RONE_API_KEY, "Type": "json", "pIndex": 1, "pSize": 1000, **params}
+    r = requests.get(f"{RONE_BASE}/{svc}", params=q, timeout=25)
+    try:
+        j = r.json()
+    except Exception:
+        _nw_dbg["rone_raw"] = r.text[:300]
+        return []
+    rows = _rone_rows(j)
+    if not rows:
+        _nw_dbg["rone_raw"] = str(j)[:300]
+    return rows
+
+
+def _rone_tables() -> list:
+    """R-ONE 전체 통계표 목록 (약 770개) — 1주 캐시"""
+    def raw():
+        out = []
+        for page in range(1, 4):
+            rows = _rone_get("SttsApiTbl.do", pIndex=page)
+            out += rows
+            if len(rows) < 1000:
+                break
+        return out
+    return _macro_cached("rone:tables", raw, 7 * 86400)
+
+
+def _rone_find_tables(words: list) -> list:
+    res = []
+    for t in _rone_tables():
+        nm = str(t.get("STATBL_NM") or "")
+        if all(w in nm for w in words):
+            res.append({"id": t.get("STATBL_ID"), "name": nm, "cycle": t.get("DTACYCLE_CD") or t.get("DTACYCLE_NM")})
+    return res
+
+
+def _rone_house_ratio():
+    """전국 주택종합 매매가격지수 (월) — 최신 / 2025-12"""
+    if not RONE_API_KEY:
+        _nw_dbg["rone"] = "RONE_API_KEY 없음"
+        return None
+    try:
+        cands = []
+        for words in (["(월)", "매매", "지수", "주택종합"], ["(월)", "매매", "지수", "공동주택통합"], ["(월)", "매매", "지수", "아파트"]):
+            f = [t for t in _rone_find_tables(words) if "지역별" in t["name"]] or _rone_find_tables(words)
+            cands += [(t["id"], t["name"]) for t in f[:2]]
+        cands += RONE_FALLBACK
+        _nw_dbg["rone_cands"] = cands[:8]
+        for sid, nm in cands:
+            def raw(sid=sid):
+                rows = _rone_get("SttsApiTblData.do", STATBL_ID=sid, DTACYCLE_CD="MM", CLS_ID="500001", START_WRTTIME="202512")
+                ser = {}
+                for x in rows:
+                    t = str(x.get("WRTTIME_IDTFR_ID") or "")
+                    v = x.get("DTA_VAL")
+                    itm = str(x.get("ITM_NM") or "")
+                    if len(t) >= 6 and v not in (None, "") and ("변동" not in itm):
+                        try:
+                            ser[f"{t[:4]}-{t[4:6]}-01"] = float(v)
+                        except Exception:
+                            pass
+                return sorted(ser.items())
+            ser = _macro_cached(f"rone:ser:{sid}", raw, 86400)
+            base = next((v for d, v in ser if d.startswith("2025-12")), None)
+            if base and ser:
+                _nw_dbg["rone"] = {"id": sid, "name": nm, "last": ser[-1]}
+                return ser[-1][1] / base, ser[-1][0][:7], f"🏠 R-ONE {nm}", [(d, v / base) for d, v in ser if d >= "2025-12"]
+        _nw_dbg["rone"] = "표는 찾았는데 값 없음"
+    except Exception as e:
+        _nw_dbg["rone_err"] = str(e)[:200]
+    return None
+
+
+@app.get("/api/debug-rone")
+def debug_rone(q: str = "매매,지수", sid: str = "", cls: str = "500001", start: str = "202512"):
+    """🏠 R-ONE 통계표 찾기 — ?q=매매,지수,주택종합  /  값 보기 ?sid=A_2024_00176"""
+    if not RONE_API_KEY:
+        return {"ok": False, "msg": "Render 환경변수 RONE_API_KEY 없음"}
+    if sid:
+        rows = _rone_get("SttsApiTblData.do", STATBL_ID=sid, DTACYCLE_CD="MM", CLS_ID=cls, START_WRTTIME=start)
+        return {"ok": True, "sid": sid, "n": len(rows), "rows": rows[:40], "raw": _nw_dbg.get("rone_raw")}
+    words = [w.strip() for w in q.split(",") if w.strip()]
+    tabs = _rone_tables()
+    return {"ok": True, "total_tables": len(tabs), "found": _rone_find_tables(words)[:80], "raw": None if tabs else _nw_dbg.get("rone_raw")}
 
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -10085,13 +10198,89 @@ def _us_live_pct(syms: list) -> dict:
     return out
 
 
+_us_ext_cache: dict = {}  # sym → (at, dict)
+
+
+def _us_ext_quotes(syms: list, ttl: int = 75) -> dict:
+    """🇺🇸 프리·정규·애프터 포함 실시간 시세 (2026-11-27 JM) — 야후 1일·5분봉(includePrePost)
+    price = 지금 가장 최근 체결(프리/애프터 포함) · pct = 전일 정규장 종가 대비 (프리·애프터 포함)
+    reg_pct = 정규장 등락 · ext_pct = 정규장 종가 대비 프리/애프터 추가 등락 · sess = pre/reg/post/closed · t = 마지막 체결 시각(epoch)"""
+    now = time.time()
+    out, need = {}, []
+    for s_ in dict.fromkeys(syms):
+        c = _us_ext_cache.get(s_)
+        if c and now - c[0] < ttl:
+            out[s_] = c[1]
+        else:
+            need.append(s_)
+
+    def one(sym):
+        try:
+            r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{requests.utils.quote(sym.replace('/', '-'))}",
+                             params={"range": "1d", "interval": "5m", "includePrePost": "true"},
+                             headers={"User-Agent": "Mozilla/5.0"}, timeout=8).json()["chart"]["result"][0]
+            meta = r.get("meta") or {}
+            per = meta.get("currentTradingPeriod") or {}
+            reg_s, reg_e = (per.get("regular") or {}).get("start"), (per.get("regular") or {}).get("end")
+            pre_s, post_e = (per.get("pre") or {}).get("start"), (per.get("post") or {}).get("end")
+            q = (r.get("indicators") or {}).get("quote", [{}])[0]
+            ts = r.get("timestamp") or []
+            cl = q.get("close") or []
+            pts = [(t, cl[i]) for i, t in enumerate(ts) if i < len(cl) and cl[i] is not None]
+            prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+            regp = meta.get("regularMarketPrice")
+            if not prev or not (pts or regp):
+                return sym, None
+            last_t, last = pts[-1] if pts else (meta.get("regularMarketTime"), regp)
+            n = time.time()
+            sess = "pre" if (pre_s and reg_s and pre_s <= n < reg_s) else "reg" if (reg_s and reg_e and reg_s <= n < reg_e) else \
+                "post" if (reg_e and post_e and reg_e <= n < post_e) else "closed"
+            reg_pts = [c for t, c in pts if reg_s and reg_e and reg_s <= t < reg_e]
+            reg_close = reg_pts[-1] if reg_pts else None
+            if sess == "pre" or reg_close is None:  # 프리장: 오늘 정규장 아직 없음 → 기준 = 전일 종가
+                base_reg, reg_pct = prev, 0.0
+            else:
+                base_reg = regp or reg_close
+                reg_pct = (base_reg / prev - 1) * 100
+            return sym, {"price": round(last, 4), "pct": round((last / prev - 1) * 100, 2), "reg_pct": round(reg_pct, 2),
+                         "ext_pct": round((last / base_reg - 1) * 100, 2) if base_reg else 0.0,
+                         "prev": prev, "sess": sess, "t": last_t, "vol": meta.get("regularMarketVolume") or 0}
+        except Exception:
+            return sym, None
+
+    if need:
+        with ThreadPoolExecutor(max_workers=24) as ex:
+            for sym, d in ex.map(one, need):
+                if d:
+                    _us_ext_cache[sym] = (now, d)
+                    out[sym] = d
+    return out
+
+
+def _us_asof(qs: dict) -> dict:
+    """기준 시각 (미국 동부 · 한국) + 장 구분"""
+    from zoneinfo import ZoneInfo
+    ts = [d["t"] for d in qs.values() if d and d.get("t")]
+    sess = [d["sess"] for d in qs.values() if d and d.get("sess")]
+    if not ts:
+        return {}
+    t = sorted(ts)[int(len(ts) * 0.9)] if len(ts) > 3 else max(ts)  # 이상하게 늦은 몇 개 무시
+    dt = datetime.fromtimestamp(t, ZoneInfo("America/New_York"))
+    s_ = max(set(sess), key=sess.count) if sess else ""
+    return {"et": dt.strftime("%m-%d %H:%M"), "kst": dt.astimezone(ZoneInfo("Asia/Seoul")).strftime("%m-%d %H:%M"),
+            "sess": s_, "sess_kr": {"pre": "🌅 프리장", "reg": "🔔 정규장", "post": "🌙 애프터", "closed": "⏸ 장 마감"}.get(s_, "")}
+
+
 @app.get("/api/us-market-map")
 def us_market_map_endpoint(top: int = 300):
     """미국 시장 지도 — 시가총액 상위 N개를 섹터별로 (등락률·시총·거래대금)"""
     rows = sorted([r for r in fetch_us_screener() if r["cap"] > 0], key=lambda r: -r["cap"])[: max(50, min(top, 600))]
-    try:  # 등락률·가격을 야후 실시간 값으로 덮어쓰기 (원본 rows는 건드리지 않게 복사)
-        live = _us_live_pct([r["symbol"] for r in rows])
-        rows = [dict(r, price=live[r["symbol"]][0], pct=round(live[r["symbol"]][1], 2)) if r["symbol"] in live else r for r in rows]
+    asof = {}
+    try:  # 🇺🇸 2026-11-27: 프리·애프터 포함 실시간 (전일 종가 대비) — 원본 rows는 건드리지 않게 복사
+        live = _us_ext_quotes([r["symbol"] for r in rows])
+        asof = _us_asof(live)
+        rows = [dict(r, price=live[r["symbol"]]["price"], pct=live[r["symbol"]]["pct"], reg_pct=live[r["symbol"]]["reg_pct"],
+                     ext_pct=live[r["symbol"]]["ext_pct"]) if r["symbol"] in live else r for r in rows]
     except Exception as e:
         print(f"[us-market-map] 야후 보정 실패: {e}")
     sectors = {}
@@ -10102,16 +10291,37 @@ def us_market_map_endpoint(top: int = 300):
         cap = sum(i["cap"] for i in items)
         out.append({"sector": sec, "cap": cap, "pct": round(sum(i["pct"] * i["cap"] for i in items) / cap, 2) if cap else 0,
                     "value": sum(i["value"] for i in items), "stocks": items})
-    return {"ok": bool(out), "sectors": sorted(out, key=lambda x: -x["cap"]), "count": len(rows)}
+    return {"ok": bool(out), "sectors": sorted(out, key=lambda x: -x["cap"]), "count": len(rows), "asof": asof}
 
 
 @app.get("/api/us-ranking")
-def us_ranking_endpoint(sort: str = "value", min_cap_b: float = 1.0, min_price: float = 1.0, limit: int = 30, sector: str = ""):
+def us_ranking_endpoint(sort: str = "value", min_cap_b: float = 1.0, min_price: float = 1.0, limit: int = 30, sector: str = "", live: int = 0):
     """미국 랭킹 — sort: value(거래대금)/gainers/losers/cap/volume · 시총 하한(억달러 아닌 10억달러 B 단위)·가격 하한"""
     rows = [r for r in fetch_us_screener() if r["cap"] >= min_cap_b * 1e9 and r["price"] >= min_price and (not sector or r["sector"] == sector)]
     key = {"value": lambda r: -r["value"], "gainers": lambda r: -r["pct"], "losers": lambda r: r["pct"],
            "cap": lambda r: -r["cap"], "volume": lambda r: -r["volume"]}.get(sort, lambda r: -r["value"])
-    return {"ok": True, "sort": sort, "rows": sorted(rows, key=key)[: max(10, min(limit, 100))], "total": len(rows)}
+    asof = {}
+    if live:  # 🇺🇸 2026-11-27: 후보(시총·거래대금·등락 상위)만 야후 실시간(프리·애프터 포함)으로 다시 계산해서 정렬
+        cand = {}
+        for k2 in (lambda r: -r["cap"], lambda r: -r["value"], lambda r: -r["pct"], lambda r: r["pct"]):
+            for r in sorted(rows, key=k2)[:150]:
+                cand[r["symbol"]] = r
+        try:
+            q = _us_ext_quotes(list(cand))
+            asof = _us_asof(q)
+            orig, rows = rows, []
+            for sym, r in cand.items():
+                d = q.get(sym)
+                if not d:
+                    continue
+                vol = d.get("vol") or r["volume"]
+                rows.append(dict(r, price=d["price"], pct=d["pct"], reg_pct=d["reg_pct"], ext_pct=d["ext_pct"], volume=vol,
+                                 value=round(d["price"] * vol)))
+            if len(rows) < 20:  # 야후가 막혔으면 원래 스크리너 값으로
+                rows = orig
+        except Exception as e:
+            print(f"[us-ranking] 실시간 실패: {e}")
+    return {"ok": True, "sort": sort, "rows": sorted(rows, key=key)[: max(10, min(limit, 100))], "total": len(rows), "asof": asof}
 
 
 # 섹터 ETF 자금 흐름 — 오늘 거래대금이 최근 20일 평균보다 얼마나 많은지 + 등락 (돈이 어느 섹터로 가나)
@@ -10126,9 +10336,13 @@ _etf_flow_cache = {"at": 0.0, "data": None}
 @app.get("/api/us-sector-flow")
 def us_sector_flow_endpoint():
     c = _etf_flow_cache
-    if c["data"] and time.time() - c["at"] < 600:
+    if c["data"] and time.time() - c["at"] < 60:  # 2026-11-27: 10분 → 1분 (실시간)
         return c["data"]
     out, errs = [], []
+    try:
+        ext = _us_ext_quotes([x for x, _ in US_SECTOR_ETFS], ttl=55)
+    except Exception:
+        ext = {}
     for sym, kr in US_SECTOR_ETFS:
         try:
             # ⚠️ 2026-11-22: range=1mo 로 받으면 14개 전부 실패 → 시작~끝(period1/2) 방식으로 (global-ohlcv와 같음)
@@ -10142,14 +10356,19 @@ def us_sector_flow_endpoint():
                 continue
             vals = [cl * v for cl, v in pts]
             today_v, avg20 = vals[-1], sum(vals[:-1]) / max(1, len(vals) - 1)
-            out.append({"symbol": sym, "name": kr, "price": round(pts[-1][0], 2), "pct": round((pts[-1][0] / pts[-2][0] - 1) * 100, 2),
+            e = ext.get(sym) or {}
+            last = e.get("price") or pts[-1][0]
+            # 프리장이면 일봉 마지막 = 어제 → 어제 거래대금으로 비교하면 안 됨 (오늘 정규장 거래 전)
+            out.append({"symbol": sym, "name": kr, "price": round(last, 2),
+                        "pct": e["pct"] if e else round((pts[-1][0] / pts[-2][0] - 1) * 100, 2),
+                        "reg_pct": e.get("reg_pct"), "ext_pct": e.get("ext_pct"),
                         "value": round(today_v), "ratio": round(today_v / avg20, 2) if avg20 else None,
-                        "pct5": round((pts[-1][0] / pts[-6][0] - 1) * 100, 2) if len(pts) >= 6 else None})
+                        "pct5": round((last / pts[-6][0] - 1) * 100, 2) if len(pts) >= 6 else None})
         except Exception as e:
             print(f"[sector-flow] {sym} 실패: {e}")
             errs.append(f"{sym}: {str(e)[:80]}")
         time.sleep(0.1)
-    data = {"ok": bool(out), "rows": sorted(out, key=lambda x: -(x["pct"] or 0)), "errors": errs[:3]}
+    data = {"ok": bool(out), "rows": sorted(out, key=lambda x: -(x["pct"] or 0)), "errors": errs[:3], "asof": _us_asof(ext) if ext else {}}
     if out:
         c.update({"at": time.time(), "data": data})
     return data
