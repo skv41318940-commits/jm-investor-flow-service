@@ -11435,6 +11435,7 @@ NEWS_COUNTRIES = {
     "cn": {"name": "🇨🇳 중국", "hl": "zh-CN", "gl": "CN", "ceid": "CN:zh-Hans"},
     "me": {"name": "🇸🇦 중동(아랍)", "hl": "ar", "gl": "SA", "ceid": "SA:ar"},
     "es": {"name": "🇪🇸 스페인어권", "hl": "es", "gl": "ES", "ceid": "ES:es"},
+    "fr": {"name": "🇫🇷 프랑스", "hl": "fr", "gl": "FR", "ceid": "FR:fr"},  # 2026-11-28 JM: 프랑스어 추가 (JM 뉴스에도 자동 포함)
 }
 NEWS_TOPICS = {"top": None, "world": "WORLD", "nation": "NATION", "business": "BUSINESS", "technology": "TECHNOLOGY",
                "science": "SCIENCE", "health": "HEALTH", "sports": "SPORTS", "entertainment": "ENTERTAINMENT"}
@@ -11443,7 +11444,7 @@ _ko_cache: dict = {}
 
 
 _gtx_block = {"until": 0.0}
-_LANG_MYMEMORY = {"en": "en", "ru": "ru", "ja": "ja", "zh": "zh-CN", "zh-CN": "zh-CN", "ar": "ar", "es": "es", "en-US": "en"}
+_LANG_MYMEMORY = {"en": "en", "ru": "ru", "ja": "ja", "zh": "zh-CN", "zh-CN": "zh-CN", "ar": "ar", "es": "es", "fr": "fr", "en-US": "en"}
 
 
 def _gtx_one_batch(texts: list):
